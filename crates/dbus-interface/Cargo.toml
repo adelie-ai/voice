@@ -1,0 +1,12 @@
+[package]
+name = "adele-voice-dbus-interface"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+adele-voice-core.workspace = true
+anyhow.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+zbus.workspace = true

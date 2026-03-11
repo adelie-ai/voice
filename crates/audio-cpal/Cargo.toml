@@ -1,0 +1,13 @@
+[package]
+name = "adele-voice-audio-cpal"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+adele-voice-core.workspace = true
+anyhow.workspace = true
+cpal = "0.15"
+ringbuf = "0.4"
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true

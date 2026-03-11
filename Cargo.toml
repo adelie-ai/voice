@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/audio-cpal",
+    "crates/wake-rustpotter",
+    "crates/vad-silero",
+    "crates/stt-whisper",
+    "crates/tts-piper",
+    "crates/assistant-dbus",
+    "crates/dbus-interface",
+    "crates/daemon",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
+adele-voice-core = { path = "crates/core" }
+adele-voice-audio-cpal = { path = "crates/audio-cpal" }
+adele-voice-wake-rustpotter = { path = "crates/wake-rustpotter" }
+adele-voice-vad-silero = { path = "crates/vad-silero" }
+adele-voice-stt-whisper = { path = "crates/stt-whisper" }
+adele-voice-tts-piper = { path = "crates/tts-piper" }
+adele-voice-assistant-dbus = { path = "crates/assistant-dbus" }
+adele-voice-dbus-interface = { path = "crates/dbus-interface" }

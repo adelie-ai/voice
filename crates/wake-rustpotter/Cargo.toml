@@ -1,0 +1,15 @@
+[package]
+name = "adele-voice-wake-rustpotter"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+adele-voice-core.workspace = true
+anyhow.workspace = true
+rustpotter = "3"
+tracing.workspace = true
+
+# Pin half to avoid rand 0.8/0.9 conflict in candle-core
+[dependencies.half]
+version = ">=2.1, <2.5"

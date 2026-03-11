@@ -1,0 +1,16 @@
+[Unit]
+Description=Adele Voice Assistant
+After=graphical-session.target
+Requires=dbus.socket
+After=dbus.socket
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/adele-voice
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=graphical-session.target

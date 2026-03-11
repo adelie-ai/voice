@@ -1,0 +1,25 @@
+[package]
+name = "adele-voice"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "adele-voice"
+path = "src/main.rs"
+
+[dependencies]
+adele-voice-core.workspace = true
+adele-voice-audio-cpal.workspace = true
+adele-voice-wake-rustpotter.workspace = true
+adele-voice-vad-silero.workspace = true
+adele-voice-stt-whisper.workspace = true
+adele-voice-tts-piper.workspace = true
+adele-voice-assistant-dbus.workspace = true
+adele-voice-dbus-interface.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
