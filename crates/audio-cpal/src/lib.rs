@@ -1,2 +1,5 @@
-// Audio I/O adapter using cpal + ringbuf.
-// Implementation will be added in Phase 2.
+mod sink;
+mod source;
+
+pub use sink::CpalAudioSink;
+pub use source::CpalAudioSource;

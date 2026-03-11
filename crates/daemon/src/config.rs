@@ -30,6 +30,7 @@ pub struct WakeWordConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct VadConfig {
+    pub model_path: PathBuf,
     pub speech_threshold: f32,
     pub silence_duration_ms: u64,
 }
@@ -88,7 +89,9 @@ impl Default for WakeWordConfig {
 
 impl Default for VadConfig {
     fn default() -> Self {
+        let data_dir = dirs_path("adele-voice/models");
         Self {
+            model_path: data_dir.join("silero_vad.onnx"),
             speech_threshold: 0.5,
             silence_duration_ms: 800,
         }
