@@ -13,7 +13,7 @@ pub struct WhisperStt {
 impl WhisperStt {
     pub fn new(model_path: &Path, language: &str) -> Result<Self, VoiceError> {
         let ctx = WhisperContext::new_with_params(
-            &model_path.to_string_lossy(),
+            model_path,
             WhisperContextParameters::default(),
         )
         .map_err(|e| VoiceError::Stt(format!("failed to load whisper model: {e}")))?;
@@ -56,14 +56,14 @@ impl SpeechToText for WhisperStt {
             .full(params, samples)
             .map_err(|e| VoiceError::Stt(format!("whisper inference failed: {e}")))?;
 
-        let num_segments = state
-            .full_n_segments()
-            .map_err(|e| VoiceError::Stt(format!("failed to get segment count: {e}")))?;
+        let num_segments = state.full_n_segments();
 
         let mut text = String::new();
         for i in 0..num_segments {
-            if let Ok(segment) = state.full_get_segment_text(i) {
-                text.push_str(&segment);
+            if let Some(segment) = state.get_segment(i) {
+                if let Ok(s) = segment.to_str() {
+                    text.push_str(s);
+                }
             }
         }
 

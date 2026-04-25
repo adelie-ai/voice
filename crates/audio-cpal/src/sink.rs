@@ -5,7 +5,7 @@ use adele_voice_core::VoiceError;
 use adele_voice_core::domain::{CHANNELS, SAMPLE_RATE};
 use adele_voice_core::ports::audio::AudioSink;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleRate, StreamConfig};
+use cpal::StreamConfig;
 use ringbuf::HeapRb;
 use ringbuf::traits::{Producer, Split};
 
@@ -85,7 +85,7 @@ impl CpalAudioSink {
 
                 let config = StreamConfig {
                     channels: CHANNELS,
-                    sample_rate: SampleRate(SAMPLE_RATE),
+                    sample_rate: SAMPLE_RATE,
                     buffer_size: cpal::BufferSize::Default,
                 };
 

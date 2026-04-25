@@ -7,5 +7,5 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 adele-voice-core.workspace = true
 anyhow.workspace = true
-whisper-rs = "0.13"
+whisper-rs = "0.16"
 tracing.workspace = true
