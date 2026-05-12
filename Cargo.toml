@@ -21,6 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+dirs = "6"
 
 adele-voice-core = { path = "crates/core" }
 adele-voice-audio-cpal = { path = "crates/audio-cpal" }

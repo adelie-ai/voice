@@ -127,22 +127,14 @@ impl Default for AssistantConfig {
 }
 
 fn dirs_path(suffix: &str) -> PathBuf {
-    std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".local/share")
-        })
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(suffix)
 }
 
 fn config_path() -> PathBuf {
-    std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            PathBuf::from(home).join(".config")
-        })
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join("adele-voice/config.toml")
 }
 
