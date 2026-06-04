@@ -13,6 +13,13 @@ pub struct SileroVad {
     h: Vec<f32>,
     /// Cell state for the LSTM — shape [2, 1, 64], flattened.
     c: Vec<f32>,
+    /// Accumulates incoming samples until a full VAD_CHUNK_SIZE frame is
+    /// available — Silero is only reliable on exact 512-sample frames, but the
+    /// audio source delivers ~20ms (~320-sample) chunks.
+    buffer: Vec<f32>,
+    /// Most recent frame probability, returned for calls that don't complete a
+    /// new frame so the score stays sticky between the small audio chunks.
+    last_prob: f32,
 }
 
 const STATE_SHAPE: [i64; 3] = [2, 1, 64];
@@ -33,16 +40,20 @@ impl SileroVad {
             session,
             h: vec![0.0; STATE_SIZE],
             c: vec![0.0; STATE_SIZE],
+            buffer: Vec::with_capacity(VAD_CHUNK_SIZE * 2),
+            last_prob: 0.0,
         })
     }
 }
 
-impl VoiceActivityDetector for SileroVad {
-    fn speech_probability(&mut self, samples: &[f32]) -> Result<f32, VoiceError> {
+impl SileroVad {
+    /// Run the model on exactly one frame, advancing the LSTM state, and
+    /// return its speech probability.
+    fn run_frame(&mut self, frame: &[f32]) -> Result<f32, VoiceError> {
         let map_err = |e| VoiceError::Vad(format!("VAD inference failed: {e}"));
 
-        let input = Tensor::from_array(([1i64, samples.len() as i64], samples.to_vec()))
-            .map_err(map_err)?;
+        let input =
+            Tensor::from_array(([1i64, frame.len() as i64], frame.to_vec())).map_err(map_err)?;
         let sr = Tensor::from_array(([1i64], vec![16000i64])).map_err(map_err)?;
         let h = Tensor::from_array((STATE_SHAPE.to_vec(), self.h.clone())).map_err(map_err)?;
         let c = Tensor::from_array((STATE_SHAPE.to_vec(), self.c.clone())).map_err(map_err)?;
@@ -79,9 +90,25 @@ impl VoiceActivityDetector for SileroVad {
 
         Ok(prob)
     }
+}
+
+impl VoiceActivityDetector for SileroVad {
+    fn speech_probability(&mut self, samples: &[f32]) -> Result<f32, VoiceError> {
+        // Buffer into exact VAD_CHUNK_SIZE frames before running the model;
+        // Silero's score is unreliable on other sizes. Keep the last score so
+        // the value is sticky across the small chunks that don't fill a frame.
+        self.buffer.extend_from_slice(samples);
+        while self.buffer.len() >= VAD_CHUNK_SIZE {
+            let frame: Vec<f32> = self.buffer.drain(..VAD_CHUNK_SIZE).collect();
+            self.last_prob = self.run_frame(&frame)?;
+        }
+        Ok(self.last_prob)
+    }
 
     fn reset(&mut self) {
         self.h.fill(0.0);
         self.c.fill(0.0);
+        self.buffer.clear();
+        self.last_prob = 0.0;
     }
 }

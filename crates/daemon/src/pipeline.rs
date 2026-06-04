@@ -337,21 +337,37 @@ where
                                 self.speak_sentence(&sentence).await?;
                             }
                         }
-                        Some(AssistantEvent::Complete { request_id: rid, .. }) if rid == request_id => {
-                            // Flush remaining text
+                        Some(AssistantEvent::Complete { request_id: rid, full_response }) if rid == request_id => {
                             if sentence_buf.has_content() {
                                 let remaining = sentence_buf.flush();
                                 if !remaining.is_empty() {
                                     self.speak_sentence(&remaining).await?;
                                 }
+                            } else if first_chunk && !full_response.trim().is_empty() {
+                                // Nothing was streamed as chunks — e.g. a
+                                // tool-using reply delivered as one final block.
+                                // Speak the full response instead of dropping it.
+                                self.set_state(State::Speaking);
+                                let sentences = sentence_buf.push(&full_response);
+                                for sentence in sentences {
+                                    self.speak_sentence(&sentence).await?;
+                                }
+                                let remaining = sentence_buf.flush();
+                                if !remaining.is_empty() {
+                                    self.speak_sentence(&remaining).await?;
+                                }
                             }
+                            tracing::info!(streamed = !first_chunk, "assistant response complete");
                             break;
                         }
                         Some(AssistantEvent::Error { request_id: rid, error }) if rid == request_id => {
                             tracing::error!(error = %error, "assistant response error");
                             break;
                         }
-                        None => break,
+                        None => {
+                            tracing::warn!("assistant signal stream closed before completion");
+                            break;
+                        }
                         _ => {} // Ignore events for other requests
                     }
                 }
