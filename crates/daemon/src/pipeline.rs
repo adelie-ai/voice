@@ -152,25 +152,26 @@ where
 
                             if prob >= self.speech_threshold {
                                 last_speech_at = Some(Instant::now());
-                            } else if let Some(last) = last_speech_at {
-                                if last.elapsed() >= self.silence_duration && speech_buffer.len() > 800 {
-                                    // Silence detected after speech
-                                    tracing::info!(
-                                        samples = speech_buffer.len(),
-                                        "silence detected, transitioning to processing"
-                                    );
-                                    if let Some(new_state) = state.transition(&StateEvent::SilenceDetected) {
-                                        state = new_state;
-                                        self.set_state(state);
+                            } else if let Some(last) = last_speech_at
+                                && last.elapsed() >= self.silence_duration
+                                && speech_buffer.len() > 800
+                            {
+                                // Silence detected after speech
+                                tracing::info!(
+                                    samples = speech_buffer.len(),
+                                    "silence detected, transitioning to processing"
+                                );
+                                if let Some(new_state) = state.transition(&StateEvent::SilenceDetected) {
+                                    state = new_state;
+                                    self.set_state(state);
 
-                                        // Spawn transcription + response pipeline
-                                        let samples = std::mem::take(&mut speech_buffer);
-                                        self.process_utterance(samples).await?;
+                                    // Spawn transcription + response pipeline
+                                    let samples = std::mem::take(&mut speech_buffer);
+                                    self.process_utterance(samples).await?;
 
-                                        // After processing completes, return to idle
-                                        state = State::Idle;
-                                        self.set_state(state);
-                                    }
+                                    // After processing completes, return to idle
+                                    state = State::Idle;
+                                    self.set_state(state);
                                 }
                             }
                         }
@@ -189,12 +190,13 @@ where
                                     last_speech_at = Some(Instant::now());
                                     self.vad.reset();
                                 }
-                            } else if !self.sink.is_playing() {
+                            } else if !self.sink.is_playing()
+                                && let Some(new_state) =
+                                    state.transition(&StateEvent::PlaybackComplete)
+                            {
                                 // Playback finished naturally
-                                if let Some(new_state) = state.transition(&StateEvent::PlaybackComplete) {
-                                    state = new_state;
-                                    self.set_state(state);
-                                }
+                                state = new_state;
+                                self.set_state(state);
                             }
                         }
 

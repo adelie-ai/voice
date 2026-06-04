@@ -15,8 +15,8 @@ pub struct SileroVad {
     c: Vec<f32>,
 }
 
-const STATE_SIZE: usize = 2 * 1 * 64;
 const STATE_SHAPE: [i64; 3] = [2, 1, 64];
+const STATE_SIZE: usize = (STATE_SHAPE[0] * STATE_SHAPE[1] * STATE_SHAPE[2]) as usize;
 
 impl SileroVad {
     pub fn new(model_path: &Path) -> Result<Self, VoiceError> {
@@ -64,17 +64,17 @@ impl VoiceActivityDetector for SileroVad {
             .map(|(_, data)| data.first().copied().unwrap_or(0.0))?;
 
         // Output "hn": new hidden state [2, 1, 64]
-        if let Ok((_, data)) = outputs["hn"].try_extract_tensor::<f32>() {
-            if data.len() == STATE_SIZE {
-                self.h.copy_from_slice(data);
-            }
+        if let Ok((_, data)) = outputs["hn"].try_extract_tensor::<f32>()
+            && data.len() == STATE_SIZE
+        {
+            self.h.copy_from_slice(data);
         }
 
         // Output "cn": new cell state [2, 1, 64]
-        if let Ok((_, data)) = outputs["cn"].try_extract_tensor::<f32>() {
-            if data.len() == STATE_SIZE {
-                self.c.copy_from_slice(data);
-            }
+        if let Ok((_, data)) = outputs["cn"].try_extract_tensor::<f32>()
+            && data.len() == STATE_SIZE
+        {
+            self.c.copy_from_slice(data);
         }
 
         Ok(prob)

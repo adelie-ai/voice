@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub audio: AudioConfig,
@@ -53,19 +53,6 @@ pub struct TtsConfig {
 #[serde(default)]
 pub struct AssistantConfig {
     pub conversation_title: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            audio: AudioConfig::default(),
-            wake_word: WakeWordConfig::default(),
-            vad: VadConfig::default(),
-            stt: SttConfig::default(),
-            tts: TtsConfig::default(),
-            assistant: AssistantConfig::default(),
-        }
-    }
 }
 
 impl Default for AudioConfig {
