@@ -48,17 +48,20 @@ async fn main() -> Result<()> {
     let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel(1);
     let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
 
-    // Text-to-speech service backing SayText/SynthesizeText. Uses its own
-    // Piper instance (Piper is stateless) and shares the audio sink with the
-    // conversation pipeline, so all playback serializes through the sink.
+    // Text-to-speech service backing SayText/SynthesizeText and voice
+    // selection. Shares the pipeline's Piper instance (PiperTts clones share
+    // the active-voice state, so SetVoice affects both) and the audio sink.
     let (tts_tx, tts_rx) = tokio::sync::mpsc::channel::<TtsCommand>(16);
-    let tts_service = Arc::new(PiperTts::new(
-        &config.tts.piper_binary,
-        &config.tts.model_path,
-    ));
+    let models_dir = config
+        .tts
+        .model_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_default();
     tokio::spawn(tts_service::run_tts_service(
-        tts_service,
+        Arc::new(tts.clone()),
         Arc::clone(&sink),
+        models_dir,
         tts_rx,
     ));
 
