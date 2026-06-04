@@ -36,6 +36,7 @@ where
     speech_threshold: f32,
     conversation_mode: bool,
     followup_timeout: Duration,
+    idle_exit_timeout: Option<Duration>,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -64,6 +65,7 @@ where
         speech_threshold: f32,
         conversation_mode: bool,
         followup_timeout: Duration,
+        idle_exit_timeout: Option<Duration>,
     ) -> Self {
         Self {
             wake,
@@ -83,6 +85,7 @@ where
             speech_threshold,
             conversation_mode,
             followup_timeout,
+            idle_exit_timeout,
         }
     }
 
@@ -102,6 +105,9 @@ where
         // In conversation mode, set after a reply while awaiting a follow-up
         // turn; elapsing it with no speech ends the conversation.
         let mut followup_deadline: Option<Instant> = None;
+        // For idle-exit (#5): time of the last activity other than idle-while-
+        // wake-disabled.
+        let mut last_activity = Instant::now();
 
         loop {
             tokio::select! {
@@ -132,16 +138,28 @@ where
 
                 // Process audio chunks
                 Some(chunk) = audio_rx.recv() => {
+                    // `enabled` governs only always-on wake-word listening:
+                    // push-to-talk (and SayText) must work even when "Hey
+                    // Adele" is off, so the gate is scoped to the Idle state
+                    // rather than the whole handler (#3).
+                    if state == State::Idle && !*self.enabled_rx.borrow() {
+                        // Idle-exit (#5): with wake listening off and nothing
+                        // playing, exit after the configured idle window so
+                        // D-Bus activation can restart the daemon on demand.
+                        if let Some(timeout) = self.idle_exit_timeout
+                            && last_activity.elapsed() >= timeout
+                            && !self.sink.is_playing()
+                        {
+                            tracing::info!(
+                                "idle-exit: wake word disabled and idle, exiting for on-demand activation"
+                            );
+                            break;
+                        }
+                        continue;
+                    }
+                    last_activity = Instant::now();
                     match state {
                         State::Idle => {
-                            // `enabled` governs only always-on wake-word
-                            // listening. Push-to-talk (and SayText) must work
-                            // even when "Hey Adele" is off, so the gate lives
-                            // here in the Idle branch rather than around the
-                            // whole audio handler (#3).
-                            if !*self.enabled_rx.borrow() {
-                                continue;
-                            }
                             // Feed to wake word detector
                             if self.wake.detect(&chunk)? {
                                 tracing::info!("wake word detected");
@@ -484,6 +502,7 @@ mod tests {
         wake_detects: bool,
         conversation_mode: bool,
         followup_timeout: Duration,
+        idle_exit_timeout: Option<Duration>,
         vad: Vec<f32>,
     }
     impl Default for Cfg {
@@ -493,6 +512,7 @@ mod tests {
                 wake_detects: false,
                 conversation_mode: false,
                 followup_timeout: Duration::from_millis(50),
+                idle_exit_timeout: None,
                 vad: vec![0.9],
             }
         }
@@ -531,6 +551,7 @@ mod tests {
             0.5,
             cfg.conversation_mode,
             cfg.followup_timeout,
+            cfg.idle_exit_timeout,
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;
@@ -738,5 +759,43 @@ mod tests {
         .await;
         h.handle.abort();
         assert!(idle.is_ok(), "non-conversation mode must return to Idle");
+    }
+
+    #[tokio::test]
+    async fn idle_exits_when_wake_disabled_and_idle() {
+        // #5: with wake listening off and an idle-exit timeout configured, the
+        // daemon exits after the idle window so D-Bus activation can restart it.
+        let h = spawn_pipeline(Cfg {
+            enabled: false,
+            idle_exit_timeout: Some(Duration::from_millis(80)),
+            ..Default::default()
+        });
+        // Stay idle past the window, then one chunk trips the idle-exit check.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+        let exited = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
+        assert!(
+            exited.is_ok(),
+            "daemon should idle-exit when wake disabled and idle past the timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_idle_exit_while_wake_enabled() {
+        // Guard: wake listening on means always-on — never idle-exit.
+        let h = spawn_pipeline(Cfg {
+            enabled: true,
+            idle_exit_timeout: Some(Duration::from_millis(40)),
+            ..Default::default()
+        });
+        for _ in 0..5 {
+            h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let exited = tokio::time::timeout(Duration::from_millis(100), h.handle).await;
+        assert!(
+            exited.is_err(),
+            "must not idle-exit while wake word is enabled"
+        );
     }
 }

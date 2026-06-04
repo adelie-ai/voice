@@ -1,0 +1,9 @@
+[D-BUS Service]
+# Session-bus activation for the voice daemon. Install to
+# ~/.local/share/dbus-1/services/ so a call to org.desktopAssistant.Voice
+# starts it on demand. Activation is delegated to the systemd user unit;
+# Exec is only a fallback if systemd is unavailable (adjust the path if you
+# did not `cargo install` to ~/.cargo/bin).
+Name=org.desktopAssistant.Voice
+SystemdService=adele-voice.service
+Exec=/bin/false
