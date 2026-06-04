@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::{CHANNELS, SAMPLE_RATE};
 use adele_voice_core::ports::audio::AudioSink;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Producer, Split};
 
@@ -40,7 +40,11 @@ impl CpalAudioSink {
 
         host.output_devices()
             .map_err(|e| VoiceError::Audio(format!("failed to enumerate output devices: {e}")))?
-            .find(|d| d.name().map(|n| n.contains(name)).unwrap_or(false))
+            .find(|d| {
+                d.description()
+                    .map(|desc| desc.name().contains(name))
+                    .unwrap_or(false)
+            })
             .ok_or_else(|| VoiceError::Audio(format!("output device '{name}' not found")))
     }
 
@@ -80,7 +84,10 @@ impl CpalAudioSink {
                     }
                 };
 
-                let dev_name = device.name().unwrap_or_else(|_| "unknown".into());
+                let dev_name = device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "unknown".into());
                 tracing::info!(device = %dev_name, "opening output device");
 
                 let config = StreamConfig {

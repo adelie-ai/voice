@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::{CHANNELS, SAMPLE_RATE};
 use adele_voice_core::ports::audio::AudioSource;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Producer, Split};
 use tokio::sync::mpsc;
@@ -40,7 +40,11 @@ impl CpalAudioSource {
 
         host.input_devices()
             .map_err(|e| VoiceError::Audio(format!("failed to enumerate input devices: {e}")))?
-            .find(|d| d.name().map(|n| n.contains(name)).unwrap_or(false))
+            .find(|d| {
+                d.description()
+                    .map(|desc| desc.name().contains(name))
+                    .unwrap_or(false)
+            })
             .ok_or_else(|| VoiceError::Audio(format!("input device '{name}' not found")))
     }
 }
@@ -70,7 +74,10 @@ impl AudioSource for CpalAudioSource {
                     }
                 };
 
-                let dev_name = device.name().unwrap_or_else(|_| "unknown".into());
+                let dev_name = device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "unknown".into());
                 tracing::info!(device = %dev_name, "opening input device");
 
                 let config = StreamConfig {
@@ -123,10 +130,8 @@ impl AudioSource for CpalAudioSource {
                     std::thread::sleep(std::time::Duration::from_millis(20));
 
                     let popped = consumer.pop_slice(&mut chunk_buf);
-                    if popped > 0 {
-                        if tx.blocking_send(chunk_buf[..popped].to_vec()).is_err() {
-                            break; // receiver dropped
-                        }
+                    if popped > 0 && tx.blocking_send(chunk_buf[..popped].to_vec()).is_err() {
+                        break; // receiver dropped
                     }
                 }
 

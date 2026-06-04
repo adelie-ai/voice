@@ -29,10 +29,11 @@ impl SentenceBuffer {
 
     /// Check if the timeout has expired and flush the remaining buffer as a sentence.
     pub fn flush_if_timeout(&mut self) -> Option<String> {
-        if let Some(last) = self.last_chunk_at {
-            if last.elapsed() >= self.timeout && !self.buffer.trim().is_empty() {
-                return Some(self.flush());
-            }
+        if let Some(last) = self.last_chunk_at
+            && last.elapsed() >= self.timeout
+            && !self.buffer.trim().is_empty()
+        {
+            return Some(self.flush());
         }
         None
     }
