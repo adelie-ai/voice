@@ -76,6 +76,8 @@ async fn main() -> Result<()> {
         config.assistant.conversation_title,
         Duration::from_millis(config.vad.silence_duration_ms),
         config.vad.speech_threshold,
+        config.assistant.conversation_mode,
+        Duration::from_millis(config.assistant.followup_timeout_ms),
     );
 
     tokio::select! {

@@ -34,6 +34,8 @@ where
     conversation_title: String,
     silence_duration: Duration,
     speech_threshold: f32,
+    conversation_mode: bool,
+    followup_timeout: Duration,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -60,6 +62,8 @@ where
         conversation_title: String,
         silence_duration: Duration,
         speech_threshold: f32,
+        conversation_mode: bool,
+        followup_timeout: Duration,
     ) -> Self {
         Self {
             wake,
@@ -77,6 +81,8 @@ where
             conversation_title,
             silence_duration,
             speech_threshold,
+            conversation_mode,
+            followup_timeout,
         }
     }
 
@@ -93,6 +99,9 @@ where
 
         let mut speech_buffer: Vec<f32> = Vec::new();
         let mut last_speech_at: Option<Instant> = None;
+        // In conversation mode, set after a reply while awaiting a follow-up
+        // turn; elapsing it with no speech ends the conversation.
+        let mut followup_deadline: Option<Instant> = None;
 
         loop {
             tokio::select! {
@@ -106,6 +115,7 @@ where
                         self.set_state(state);
                         speech_buffer.clear();
                         last_speech_at = Some(Instant::now());
+                        followup_deadline = None;
                         self.vad.reset();
                         tracing::info!("push-to-talk activated");
                     }
@@ -140,6 +150,7 @@ where
                                     self.set_state(state);
                                     speech_buffer.clear();
                                     last_speech_at = Some(Instant::now());
+                                    followup_deadline = None;
                                     self.vad.reset();
                                 }
                             }
@@ -152,6 +163,7 @@ where
 
                             if prob >= self.speech_threshold {
                                 last_speech_at = Some(Instant::now());
+                                followup_deadline = None; // speech began; cancel follow-up timeout
                             } else if let Some(last) = last_speech_at
                                 && last.elapsed() >= self.silence_duration
                                 && speech_buffer.len() > 800
@@ -169,10 +181,40 @@ where
                                     let samples = std::mem::take(&mut speech_buffer);
                                     self.process_utterance(samples).await?;
 
-                                    // After processing completes, return to idle
-                                    state = State::Idle;
-                                    self.set_state(state);
+                                    if self.conversation_mode {
+                                        // Re-open the mic for a follow-up turn:
+                                        // wait for the reply to finish playing,
+                                        // then drop any audio captured during
+                                        // playback (echo) before listening again.
+                                        while self.sink.is_playing() {
+                                            tokio::time::sleep(Duration::from_millis(50)).await;
+                                        }
+                                        while audio_rx.try_recv().is_ok() {}
+                                        state = State::Listening;
+                                        self.set_state(state);
+                                        speech_buffer.clear();
+                                        last_speech_at = None;
+                                        followup_deadline =
+                                            Some(Instant::now() + self.followup_timeout);
+                                        self.vad.reset();
+                                    } else {
+                                        // Single-shot: back to wake-word idle.
+                                        state = State::Idle;
+                                        self.set_state(state);
+                                    }
                                 }
+                            } else if let Some(deadline) = followup_deadline
+                                && Instant::now() >= deadline
+                            {
+                                // No follow-up speech within the timeout: end
+                                // the conversation, return to wake-word idle.
+                                tracing::info!("conversation follow-up timed out");
+                                state = State::Idle;
+                                self.set_state(state);
+                                self.conversation_id = None;
+                                speech_buffer.clear();
+                                last_speech_at = None;
+                                followup_deadline = None;
                             }
                         }
 
@@ -437,9 +479,28 @@ mod tests {
         handle: tokio::task::JoinHandle<()>,
     }
 
-    fn spawn_pipeline(enabled: bool, wake_detects: bool) -> Harness {
+    struct Cfg {
+        enabled: bool,
+        wake_detects: bool,
+        conversation_mode: bool,
+        followup_timeout: Duration,
+        vad: Vec<f32>,
+    }
+    impl Default for Cfg {
+        fn default() -> Self {
+            Self {
+                enabled: true,
+                wake_detects: false,
+                conversation_mode: false,
+                followup_timeout: Duration::from_millis(50),
+                vad: vec![0.9],
+            }
+        }
+    }
+
+    fn spawn_pipeline(cfg: Cfg) -> Harness {
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(64);
-        let (enabled_tx, enabled_rx) = watch::channel(enabled);
+        let (enabled_tx, enabled_rx) = watch::channel(cfg.enabled);
         let (ptt_tx, ptt_rx) = mpsc::channel(1);
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let (state_tx, state_rx) = watch::channel(State::Idle);
@@ -447,10 +508,10 @@ mod tests {
 
         let pipeline = Pipeline::new(
             FakeWake {
-                detects: wake_detects,
+                detects: cfg.wake_detects,
             },
             FakeVad {
-                probs: StdMutex::new(VecDeque::from(vec![0.9])),
+                probs: StdMutex::new(VecDeque::from(cfg.vad)),
             },
             FakeStt { hit: hit_tx },
             FakeTts,
@@ -468,6 +529,8 @@ mod tests {
             "test".to_string(),
             Duration::from_millis(0),
             0.5,
+            cfg.conversation_mode,
+            cfg.followup_timeout,
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;
@@ -495,7 +558,10 @@ mod tests {
         // #3: wake word OFF, but an explicit push-to-talk must still capture
         // and transcribe. Pre-fix this times out — chunks were dropped by the
         // top-level enable gate before reaching the Listening state.
-        let mut h = spawn_pipeline(false, false);
+        let mut h = spawn_pipeline(Cfg {
+            enabled: false,
+            ..Default::default()
+        });
 
         h.ptt_tx.send(()).await.unwrap();
         tokio::time::timeout(
@@ -521,7 +587,11 @@ mod tests {
     async fn wake_word_ignored_when_disabled() {
         // Regression guard: an always-firing detector must not trigger
         // Listening while wake-word listening is disabled.
-        let h = spawn_pipeline(false, true);
+        let h = spawn_pipeline(Cfg {
+            enabled: false,
+            wake_detects: true,
+            ..Default::default()
+        });
         send_chunk(&h).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let state = *h.state_rx.borrow();
@@ -536,7 +606,10 @@ mod tests {
     #[tokio::test]
     async fn wake_word_triggers_listening_when_enabled() {
         // Regression guard: with wake enabled, detection moves to Listening.
-        let mut h = spawn_pipeline(true, true);
+        let mut h = spawn_pipeline(Cfg {
+            wake_detects: true,
+            ..Default::default()
+        });
         send_chunk(&h).await;
         let reached = tokio::time::timeout(
             Duration::from_secs(2),
@@ -548,5 +621,122 @@ mod tests {
             reached.is_ok(),
             "wake word must enter Listening when enabled"
         );
+    }
+
+    #[tokio::test]
+    async fn conversation_mode_relistens_after_response() {
+        // #6: in conversation mode, after replying the pipeline re-opens the
+        // mic for a follow-up turn instead of returning to wake-word idle.
+        let mut h = spawn_pipeline(Cfg {
+            conversation_mode: true,
+            followup_timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+        h.ptt_tx.send(()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process turn 1
+        tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv())
+            .await
+            .expect("turn 1 should transcribe")
+            .unwrap();
+
+        // After the reply, conversation mode returns to Listening (not Idle).
+        let relisten = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await;
+        h.handle.abort();
+        assert!(
+            relisten.is_ok(),
+            "conversation mode must re-open the mic for a follow-up turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_mode_times_out_to_idle() {
+        // #6: with no follow-up speech, the conversation ends after the
+        // follow-up timeout and the pipeline returns to wake-word idle.
+        let mut h = spawn_pipeline(Cfg {
+            conversation_mode: true,
+            followup_timeout: Duration::from_millis(100),
+            ..Default::default()
+        });
+        h.ptt_tx.send(()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process turn 1
+        tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv())
+            .await
+            .expect("turn 1 should transcribe")
+            .unwrap();
+        // Wait for the follow-up re-listen.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("re-listen")
+        .unwrap();
+
+        // No follow-up speech: wait past the timeout, then one silence chunk
+        // trips the deadline check.
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        send_chunk(&h).await; // VAD script exhausted -> 0.0 (silence)
+
+        let idle = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await;
+        h.handle.abort();
+        assert!(
+            idle.is_ok(),
+            "conversation must return to Idle after the follow-up timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_conversation_mode_returns_to_idle() {
+        // Regression guard: without conversation mode, a reply returns to Idle.
+        let mut h = spawn_pipeline(Cfg::default());
+        h.ptt_tx.send(()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process
+        tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv())
+            .await
+            .expect("should transcribe")
+            .unwrap();
+
+        let idle = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await;
+        h.handle.abort();
+        assert!(idle.is_ok(), "non-conversation mode must return to Idle");
     }
 }

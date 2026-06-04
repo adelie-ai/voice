@@ -53,6 +53,12 @@ pub struct TtsConfig {
 #[serde(default)]
 pub struct AssistantConfig {
     pub conversation_title: String,
+    /// When true, after replying the daemon re-opens the mic for a follow-up
+    /// turn instead of returning to wake-word idle, until `followup_timeout_ms`
+    /// of silence elapses.
+    pub conversation_mode: bool,
+    /// How long to wait (ms) for follow-up speech before ending a conversation.
+    pub followup_timeout_ms: u64,
 }
 
 impl Default for AudioConfig {
@@ -109,6 +115,8 @@ impl Default for AssistantConfig {
     fn default() -> Self {
         Self {
             conversation_title: "Voice Conversation".into(),
+            conversation_mode: false,
+            followup_timeout_ms: 8000,
         }
     }
 }
