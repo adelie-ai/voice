@@ -11,6 +11,16 @@ use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
 use tokio::sync::{mpsc, watch};
 
+/// Compose the prompt sent to the assistant: when a spoken-response hint is
+/// configured, prepend it so the reply stays short and conversational.
+fn compose_prompt(hint: &str, transcript: &str) -> String {
+    if hint.trim().is_empty() {
+        transcript.to_string()
+    } else {
+        format!("{hint}\n\n{transcript}")
+    }
+}
+
 pub struct Pipeline<W, V, S, T, A>
 where
     W: WakeWordDetector + 'static,
@@ -37,6 +47,7 @@ where
     conversation_mode: bool,
     followup_timeout: Duration,
     idle_exit_timeout: Option<Duration>,
+    spoken_response_hint: String,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -66,6 +77,7 @@ where
         conversation_mode: bool,
         followup_timeout: Duration,
         idle_exit_timeout: Option<Duration>,
+        spoken_response_hint: String,
     ) -> Self {
         Self {
             wake,
@@ -86,6 +98,7 @@ where
             conversation_mode,
             followup_timeout,
             idle_exit_timeout,
+            spoken_response_hint,
         }
     }
 
@@ -297,10 +310,12 @@ where
         // Subscribe to response signals
         let mut signal_rx = self.assistant.subscribe().await?;
 
-        // Send prompt
+        // Send prompt, prefixed with the spoken-response hint so the reply
+        // stays short and conversational for read-aloud.
+        let prompt = compose_prompt(&self.spoken_response_hint, &transcript.text);
         let request_id = self
             .assistant
-            .send_prompt(&conversation_id, &transcript.text)
+            .send_prompt(&conversation_id, &prompt)
             .await?;
 
         // Stream response through sentence buffer → TTS → speaker
@@ -371,6 +386,20 @@ mod tests {
     use adele_voice_core::domain::Transcript;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn compose_prompt_prepends_hint() {
+        assert_eq!(
+            compose_prompt("Be brief.", "what's the weather?"),
+            "Be brief.\n\nwhat's the weather?"
+        );
+    }
+
+    #[test]
+    fn compose_prompt_empty_hint_is_bare_transcript() {
+        assert_eq!(compose_prompt("", "hello"), "hello");
+        assert_eq!(compose_prompt("   ", "hello"), "hello");
+    }
 
     struct FakeWake {
         detects: bool,
@@ -503,6 +532,7 @@ mod tests {
         conversation_mode: bool,
         followup_timeout: Duration,
         idle_exit_timeout: Option<Duration>,
+        spoken_response_hint: String,
         vad: Vec<f32>,
     }
     impl Default for Cfg {
@@ -513,6 +543,7 @@ mod tests {
                 conversation_mode: false,
                 followup_timeout: Duration::from_millis(50),
                 idle_exit_timeout: None,
+                spoken_response_hint: String::new(),
                 vad: vec![0.9],
             }
         }
@@ -552,6 +583,7 @@ mod tests {
             cfg.conversation_mode,
             cfg.followup_timeout,
             cfg.idle_exit_timeout,
+            cfg.spoken_response_hint,
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;

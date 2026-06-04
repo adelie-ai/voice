@@ -63,6 +63,9 @@ pub struct AssistantConfig {
     pub conversation_mode: bool,
     /// How long to wait (ms) for follow-up speech before ending a conversation.
     pub followup_timeout_ms: u64,
+    /// Instruction prepended to each spoken prompt so the assistant keeps
+    /// replies short, conversational, and read-aloud friendly. Empty disables.
+    pub spoken_response_hint: String,
 }
 
 impl Default for AudioConfig {
@@ -121,6 +124,7 @@ impl Default for AssistantConfig {
             conversation_title: "Voice Conversation".into(),
             conversation_mode: false,
             followup_timeout_ms: 8000,
+            spoken_response_hint: "You are Adele, responding by voice — the user's message was transcribed from speech, so expect occasional recognition errors — use your judgment, and if anything seems garbled or like a non-sequitur, briefly lead with how you understood it (e.g. open with 'it sounds like you asked about X') so the user can catch a mishearing, then answer; ask a short clarifying question only if you truly cannot tell. Your reply will be read aloud, so keep it brief, conversational, and relevant, never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points and then ask whether they'd like the details. If they ask for more, you may expand but stay under about ten sentences (roughly a 30-second read). Let the user lead — invite follow-up questions and let them steer the conversation. Avoid markdown, lists, code blocks, and emoji.".into(),
         }
     }
 }
