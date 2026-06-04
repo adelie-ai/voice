@@ -105,6 +105,7 @@ async fn main() -> Result<()> {
         Duration::from_millis(config.assistant.followup_timeout_ms),
         (config.idle_exit_timeout_ms > 0)
             .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
+        config.assistant.spoken_response_hint,
     );
 
     tokio::select! {
