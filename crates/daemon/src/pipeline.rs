@@ -133,10 +133,13 @@ where
                         state = State::Listening;
                         self.set_state(state);
                         speech_buffer.clear();
-                        last_speech_at = Some(Instant::now());
-                        followup_deadline = None;
+                        // Wait (lead-in) for speech to start rather than cutting
+                        // on the silence timer from the moment of the press; only
+                        // cut after speech-then-silence, or if the lead-in elapses.
+                        last_speech_at = None;
+                        followup_deadline = Some(Instant::now() + self.followup_timeout);
                         self.vad.reset();
-                        tracing::info!("push-to-talk activated");
+                        tracing::info!("push-to-talk activated, waiting for speech");
                     }
                 }
 
@@ -180,8 +183,8 @@ where
                                     state = new_state;
                                     self.set_state(state);
                                     speech_buffer.clear();
-                                    last_speech_at = Some(Instant::now());
-                                    followup_deadline = None;
+                                    last_speech_at = None;
+                                    followup_deadline = Some(Instant::now() + self.followup_timeout);
                                     self.vad.reset();
                                 }
                             }
@@ -193,6 +196,9 @@ where
                             speech_buffer.extend_from_slice(&chunk);
 
                             if prob >= self.speech_threshold {
+                                if last_speech_at.is_none() {
+                                    tracing::info!(prob, "speech detected, recording");
+                                }
                                 last_speech_at = Some(Instant::now());
                                 followup_deadline = None; // speech began; cancel follow-up timeout
                             } else if let Some(last) = last_speech_at
