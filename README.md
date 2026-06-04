@@ -99,6 +99,8 @@ $EDITOR ~/.config/adele-voice/config.toml  # optional; sensible defaults if abse
 
 The desktop-assistant daemon must be running and exposing `org.desktopAssistant.Conversations` for prompts to be answered.
 
+**Running as a service.** `systemd/adele-voice.service` is D-Bus-activatable (`Type=dbus`): once installed it starts on demand when anything calls `org.desktopAssistant.Voice`, and also at login. Make it on-demand-only with `systemctl --user disable adele-voice`, or turn it off entirely with `systemctl --user mask adele-voice` (after which calls fail cleanly — the service simply isn't there). Set `idle_exit_timeout_ms` in the config to have the daemon exit when idle (wake word off, nothing playing) so it isn't resident between uses — activation restarts it on the next call. The session activation file is `systemd/dbus-1/org.desktopAssistant.Voice.service` (install to `~/.local/share/dbus-1/services/`).
+
 ## Status
 
 Early but functional: the full pipeline (wake → VAD → STT → assistant → streamed TTS, with barge-in and push-to-talk) is implemented. Active work is tracked on the [Adelie AI Roadmap](https://github.com/orgs/adelie-ai/projects) board — provisioning, the "Enable 'Hey Adele'" / record controls in the clients, on-demand activation, a `SayText` accessibility service, continuous conversation, and TTS voice selection.

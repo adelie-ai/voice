@@ -11,6 +11,10 @@ pub struct Config {
     pub stt: SttConfig,
     pub tts: TtsConfig,
     pub assistant: AssistantConfig,
+    /// Exit after this many ms idle (wake word off and nothing playing) so the
+    /// daemon isn't resident when unused; D-Bus activation restarts it on
+    /// demand. 0 (the default) keeps it always-on.
+    pub idle_exit_timeout_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]

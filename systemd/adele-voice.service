@@ -6,7 +6,12 @@ After=dbus.socket
 PartOf=graphical-session.target
 
 [Service]
-Type=simple
+# D-Bus-activatable (Type=dbus): started on demand when something calls
+# org.desktopAssistant.Voice, and — via [Install] below — also at login.
+# Make it on-demand-only with `systemctl --user disable adele-voice`, or
+# turn it off entirely with `systemctl --user mask adele-voice`.
+Type=dbus
+BusName=org.desktopAssistant.Voice
 ExecStart=%h/.cargo/bin/adele-voice
 Restart=on-failure
 RestartSec=5

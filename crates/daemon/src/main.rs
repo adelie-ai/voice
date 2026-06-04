@@ -100,6 +100,8 @@ async fn main() -> Result<()> {
         config.vad.speech_threshold,
         config.assistant.conversation_mode,
         Duration::from_millis(config.assistant.followup_timeout_ms),
+        (config.idle_exit_timeout_ms > 0)
+            .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
     );
 
     tokio::select! {
