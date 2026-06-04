@@ -295,3 +295,252 @@ where
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Pipeline tests with fake adapters. Focus: #3 — the `enabled` flag must
+    //! gate ONLY always-on wake-word detection, so an explicit push-to-talk
+    //! still captures and transcribes an utterance while "Hey Adele" is off.
+    use super::*;
+    use adele_voice_core::domain::Transcript;
+    use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
+
+    struct FakeWake {
+        detects: bool,
+    }
+    impl WakeWordDetector for FakeWake {
+        fn detect(&mut self, _samples: &[f32]) -> Result<bool, adele_voice_core::VoiceError> {
+            Ok(self.detects)
+        }
+    }
+
+    /// VAD that returns scripted probabilities, then 0.0 once the script is
+    /// exhausted — so one "speech" chunk followed by anything reads as
+    /// speech-then-silence.
+    struct FakeVad {
+        probs: StdMutex<VecDeque<f32>>,
+    }
+    impl VoiceActivityDetector for FakeVad {
+        fn speech_probability(
+            &mut self,
+            _samples: &[f32],
+        ) -> Result<f32, adele_voice_core::VoiceError> {
+            Ok(self.probs.lock().unwrap().pop_front().unwrap_or(0.0))
+        }
+        fn reset(&mut self) {}
+    }
+
+    /// STT that signals when it runs (proving audio reached transcription) and
+    /// returns a non-empty transcript so the response cycle proceeds.
+    struct FakeStt {
+        hit: mpsc::UnboundedSender<()>,
+    }
+    impl SpeechToText for FakeStt {
+        async fn transcribe(
+            &self,
+            _samples: &[f32],
+        ) -> Result<Transcript, adele_voice_core::VoiceError> {
+            let _ = self.hit.send(());
+            Ok(Transcript {
+                text: "hello".to_string(),
+            })
+        }
+    }
+
+    struct FakeTts;
+    impl TextToSpeech for FakeTts {
+        async fn synthesize(&self, _text: &str) -> Result<Vec<f32>, adele_voice_core::VoiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Assistant that completes immediately: `subscribe` hands back a receiver
+    /// and `send_prompt` pushes a matching `Complete` so `process_utterance`
+    /// returns without hanging.
+    struct FakeAssistant {
+        tx: StdMutex<Option<mpsc::UnboundedSender<AssistantEvent>>>,
+    }
+    impl AssistantGateway for FakeAssistant {
+        async fn create_conversation(
+            &self,
+            _title: &str,
+        ) -> Result<String, adele_voice_core::VoiceError> {
+            Ok("conv".to_string())
+        }
+        async fn send_prompt(
+            &self,
+            _conversation_id: &str,
+            _prompt: &str,
+        ) -> Result<String, adele_voice_core::VoiceError> {
+            let request_id = "req".to_string();
+            if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                let _ = tx.send(AssistantEvent::Complete {
+                    request_id: request_id.clone(),
+                    full_response: "hello".to_string(),
+                });
+            }
+            Ok(request_id)
+        }
+        async fn subscribe(
+            &self,
+        ) -> Result<mpsc::UnboundedReceiver<AssistantEvent>, adele_voice_core::VoiceError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *self.tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        }
+    }
+
+    /// Audio source whose receiver is driven by the test via `audio_tx`.
+    struct FakeSource {
+        rx: StdMutex<Option<mpsc::Receiver<Vec<f32>>>>,
+    }
+    impl AudioSource for FakeSource {
+        fn start(&self) -> Result<mpsc::Receiver<Vec<f32>>, adele_voice_core::VoiceError> {
+            self.rx
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| adele_voice_core::VoiceError::Audio("already started".to_string()))
+        }
+        fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            Ok(())
+        }
+    }
+
+    struct FakeSink;
+    impl AudioSink for FakeSink {
+        fn play(&self, _samples: Vec<f32>) -> Result<(), adele_voice_core::VoiceError> {
+            Ok(())
+        }
+        fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            Ok(())
+        }
+        fn is_playing(&self) -> bool {
+            false
+        }
+    }
+
+    struct Harness {
+        audio_tx: mpsc::Sender<Vec<f32>>,
+        ptt_tx: mpsc::Sender<()>,
+        _enabled_tx: watch::Sender<bool>,
+        _stop_tx: mpsc::Sender<()>,
+        state_rx: watch::Receiver<State>,
+        transcribe_rx: mpsc::UnboundedReceiver<()>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    fn spawn_pipeline(enabled: bool, wake_detects: bool) -> Harness {
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(64);
+        let (enabled_tx, enabled_rx) = watch::channel(enabled);
+        let (ptt_tx, ptt_rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        let (state_tx, state_rx) = watch::channel(State::Idle);
+        let (hit_tx, transcribe_rx) = mpsc::unbounded_channel();
+
+        let pipeline = Pipeline::new(
+            FakeWake {
+                detects: wake_detects,
+            },
+            FakeVad {
+                probs: StdMutex::new(VecDeque::from(vec![0.9])),
+            },
+            FakeStt { hit: hit_tx },
+            FakeTts,
+            FakeAssistant {
+                tx: StdMutex::new(None),
+            },
+            Arc::new(FakeSource {
+                rx: StdMutex::new(Some(audio_rx)),
+            }),
+            Arc::new(FakeSink),
+            state_tx,
+            enabled_rx,
+            ptt_rx,
+            stop_rx,
+            "test".to_string(),
+            Duration::from_millis(0),
+            0.5,
+        );
+        let handle = tokio::spawn(async move {
+            let _ = pipeline.run().await;
+        });
+        Harness {
+            audio_tx,
+            ptt_tx,
+            _enabled_tx: enabled_tx,
+            _stop_tx: stop_tx,
+            state_rx,
+            transcribe_rx,
+            handle,
+        }
+    }
+
+    /// Each chunk is 1000 samples (> the 800-sample floor for closing an
+    /// utterance). With a zero silence-duration, one speech chunk (VAD 0.9)
+    /// then one silence chunk (VAD 0.0) closes the utterance.
+    async fn send_chunk(h: &Harness) {
+        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn push_to_talk_transcribes_even_when_wake_disabled() {
+        // #3: wake word OFF, but an explicit push-to-talk must still capture
+        // and transcribe. Pre-fix this times out — chunks were dropped by the
+        // top-level enable gate before reaching the Listening state.
+        let mut h = spawn_pipeline(false, false);
+
+        h.ptt_tx.send(()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("push-to-talk should enter Listening even when disabled")
+        .unwrap();
+
+        send_chunk(&h).await; // VAD 0.9 -> speech
+        send_chunk(&h).await; // VAD 0.0 -> silence -> transcription
+
+        let got = tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv()).await;
+        h.handle.abort();
+        assert!(
+            matches!(got, Ok(Some(()))),
+            "transcription must run for a push-to-talk utterance while wake word is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_word_ignored_when_disabled() {
+        // Regression guard: an always-firing detector must not trigger
+        // Listening while wake-word listening is disabled.
+        let h = spawn_pipeline(false, true);
+        send_chunk(&h).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let state = *h.state_rx.borrow();
+        h.handle.abort();
+        assert_eq!(
+            state,
+            State::Idle,
+            "wake word must be ignored while disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn wake_word_triggers_listening_when_enabled() {
+        // Regression guard: with wake enabled, detection moves to Listening.
+        let mut h = spawn_pipeline(true, true);
+        send_chunk(&h).await;
+        let reached = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await;
+        h.handle.abort();
+        assert!(
+            reached.is_ok(),
+            "wake word must enter Listening when enabled"
+        );
+    }
+}
