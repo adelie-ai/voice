@@ -80,17 +80,22 @@ If the voice service isn't running, this name simply isn't on the bus — so dep
 
 ## Install & run
 
-> ⚠️ Models and the `piper` binary are **not bundled**. A setup script is tracked in [#1](https://github.com/adelie-ai/voice/issues/1); the manual steps are:
+> ⚠️ Models and the `piper` binary are **not bundled**.
 
-1. Place models in `~/.local/share/adele-voice/models/`:
-   - `silero_vad.onnx`, `ggml-distil-large-v3.bin`, `en_US-amy-medium.onnx` (+ its `.onnx.json`)
-   - `hey-adele.rpw` — train with [`rustpotter-cli`](https://github.com/GiviMAD/rustpotter-cli) from a handful of recordings of the phrase
-2. Install `piper` and ensure it's on `PATH`.
-3. Build and install the daemon:
-   ```sh
-   cargo install --path crates/daemon   # installs `adele-voice`
-   ```
-4. (Optional) configure `~/.config/adele-voice/config.toml` — input/output devices, model paths, wake sensitivity, STT language, silence timeout. Sensible defaults are used if absent.
+**Quick start** — the setup script downloads the VAD/STT/TTS models into `~/.local/share/adele-voice/models/`, checks for `piper`, and reports what's still missing. It's idempotent (safe to re-run):
+
+```sh
+./scripts/setup.sh
+```
+
+The one thing it can't automate is the **wake word**: `hey-adele.rpw` is trained from your *own* recordings (rustpotter ships no "Hey Adele"). The script prints the exact [`rustpotter-cli`](https://github.com/GiviMAD/rustpotter-cli) steps — record a few 16 kHz mono clips of the phrase, then `rustpotter-cli build-model`.
+
+Then build/install (and optionally configure input/output devices, model paths, wake sensitivity, STT language, and the silence timeout):
+
+```sh
+cargo install --path crates/daemon         # installs `adele-voice`
+$EDITOR ~/.config/adele-voice/config.toml  # optional; sensible defaults if absent
+```
 
 The desktop-assistant daemon must be running and exposing `org.desktopAssistant.Conversations` for prompts to be answered.
 
