@@ -1,17 +1,32 @@
 use std::sync::Arc;
 
 use adele_voice_core::domain::State;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot, watch};
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
+
+/// A request to the text-to-speech service backing `SayText` /
+/// `SynthesizeText`. Processed on a single task so requests serialize rather
+/// than collide.
+pub enum TtsCommand {
+    /// Synthesize and play the text through the daemon's audio sink.
+    Say(String),
+    /// Synthesize the text and return it as WAV (16-bit PCM mono) bytes
+    /// without playing it.
+    Synthesize {
+        text: String,
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+}
 
 /// D-Bus adapter exposing org.desktopAssistant.Voice.
 pub struct DbusVoiceAdapter {
     state_rx: watch::Receiver<State>,
     enabled_tx: Arc<watch::Sender<bool>>,
     enabled_rx: watch::Receiver<bool>,
-    ptt_tx: tokio::sync::mpsc::Sender<()>,
-    stop_tx: tokio::sync::mpsc::Sender<()>,
+    ptt_tx: mpsc::Sender<()>,
+    stop_tx: mpsc::Sender<()>,
+    tts_tx: mpsc::Sender<TtsCommand>,
 }
 
 impl DbusVoiceAdapter {
@@ -19,8 +34,9 @@ impl DbusVoiceAdapter {
         state_rx: watch::Receiver<State>,
         enabled_tx: watch::Sender<bool>,
         enabled_rx: watch::Receiver<bool>,
-        ptt_tx: tokio::sync::mpsc::Sender<()>,
-        stop_tx: tokio::sync::mpsc::Sender<()>,
+        ptt_tx: mpsc::Sender<()>,
+        stop_tx: mpsc::Sender<()>,
+        tts_tx: mpsc::Sender<TtsCommand>,
     ) -> Self {
         Self {
             state_rx,
@@ -28,6 +44,7 @@ impl DbusVoiceAdapter {
             enabled_rx,
             ptt_tx,
             stop_tx,
+            tts_tx,
         }
     }
 }
@@ -69,6 +86,34 @@ impl DbusVoiceAdapter {
             .await
             .map_err(|e| fdo::Error::Failed(format!("failed to stop speaking: {e}")))?;
         Ok(())
+    }
+
+    /// Speak the given text aloud with the on-device neural voice. Queues
+    /// behind any in-progress speech; does NOT open the microphone.
+    async fn say_text(&self, text: &str) -> fdo::Result<()> {
+        self.tts_tx
+            .send(TtsCommand::Say(text.to_string()))
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to queue SayText: {e}")))?;
+        Ok(())
+    }
+
+    /// Synthesize the given text and return it as WAV (16-bit PCM mono) bytes
+    /// without playing it — for callers (e.g. accessibility tools) that route
+    /// their own audio.
+    async fn synthesize_text(&self, text: &str) -> fdo::Result<Vec<u8>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tts_tx
+            .send(TtsCommand::Synthesize {
+                text: text.to_string(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to queue SynthesizeText: {e}")))?;
+        reply_rx
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("TTS service dropped the request: {e}")))?
+            .map_err(fdo::Error::Failed)
     }
 
     /// Signal emitted when the pipeline state changes.
