@@ -17,6 +17,20 @@ pub enum TtsCommand {
         text: String,
         reply: oneshot::Sender<Result<Vec<u8>, String>>,
     },
+    /// List installed voices as (id, display name, language, num_speakers).
+    ListVoices {
+        reply: oneshot::Sender<Vec<(String, String, String, u32)>>,
+    },
+    /// Get the current voice as (id, speaker_id); speaker_id is -1 if unset.
+    GetVoice {
+        reply: oneshot::Sender<(String, i32)>,
+    },
+    /// Set the active voice (and optional speaker id; -1 for default/single).
+    SetVoice {
+        voice_id: String,
+        speaker: i32,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// D-Bus adapter exposing org.desktopAssistant.Voice.
@@ -110,6 +124,48 @@ impl DbusVoiceAdapter {
             })
             .await
             .map_err(|e| fdo::Error::Failed(format!("failed to queue SynthesizeText: {e}")))?;
+        reply_rx
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("TTS service dropped the request: {e}")))?
+            .map_err(fdo::Error::Failed)
+    }
+
+    /// List installed TTS voices as (id, display name, language, num_speakers).
+    async fn list_voices(&self) -> fdo::Result<Vec<(String, String, String, u32)>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tts_tx
+            .send(TtsCommand::ListVoices { reply: reply_tx })
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to queue ListVoices: {e}")))?;
+        reply_rx
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("TTS service dropped the request: {e}")))
+    }
+
+    /// Get the current voice as (id, speaker_id); speaker_id is -1 if unset.
+    async fn get_voice(&self) -> fdo::Result<(String, i32)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tts_tx
+            .send(TtsCommand::GetVoice { reply: reply_tx })
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to queue GetVoice: {e}")))?;
+        reply_rx
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("TTS service dropped the request: {e}")))
+    }
+
+    /// Set the active voice by id (and optional multi-speaker id; -1 for the
+    /// default). Affects both spoken responses and SayText.
+    async fn set_voice(&self, voice_id: &str, speaker: i32) -> fdo::Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tts_tx
+            .send(TtsCommand::SetVoice {
+                voice_id: voice_id.to_string(),
+                speaker,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to queue SetVoice: {e}")))?;
         reply_rx
             .await
             .map_err(|e| fdo::Error::Failed(format!("TTS service dropped the request: {e}")))?
