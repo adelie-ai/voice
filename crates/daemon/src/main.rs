@@ -6,11 +6,13 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod pipeline;
+mod tts_service;
 
 use adele_voice_assistant_dbus::DbusAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
 use adele_voice_core::domain::State;
-use adele_voice_dbus_interface::DbusVoiceAdapter;
+use adele_voice_core::ports::audio::AudioSink;
+use adele_voice_dbus_interface::{DbusVoiceAdapter, TtsCommand};
 use adele_voice_stt_whisper::WhisperStt;
 use adele_voice_tts_piper::PiperTts;
 use adele_voice_vad_silero::SileroVad;
@@ -38,7 +40,7 @@ async fn main() -> Result<()> {
     let assistant = DbusAssistantGateway::connect().await?;
 
     let source = Arc::new(CpalAudioSource::new(&config.audio.input_device));
-    let sink = Arc::new(CpalAudioSink::new(&config.audio.output_device));
+    let sink: Arc<dyn AudioSink> = Arc::new(CpalAudioSink::new(&config.audio.output_device));
 
     // State channels
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
@@ -46,9 +48,29 @@ async fn main() -> Result<()> {
     let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel(1);
     let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
 
+    // Text-to-speech service backing SayText/SynthesizeText. Uses its own
+    // Piper instance (Piper is stateless) and shares the audio sink with the
+    // conversation pipeline, so all playback serializes through the sink.
+    let (tts_tx, tts_rx) = tokio::sync::mpsc::channel::<TtsCommand>(16);
+    let tts_service = Arc::new(PiperTts::new(
+        &config.tts.piper_binary,
+        &config.tts.model_path,
+    ));
+    tokio::spawn(tts_service::run_tts_service(
+        tts_service,
+        Arc::clone(&sink),
+        tts_rx,
+    ));
+
     // D-Bus server interface
-    let dbus_adapter =
-        DbusVoiceAdapter::new(state_rx, enabled_tx, enabled_rx.clone(), ptt_tx, stop_tx);
+    let dbus_adapter = DbusVoiceAdapter::new(
+        state_rx,
+        enabled_tx,
+        enabled_rx.clone(),
+        ptt_tx,
+        stop_tx,
+        tts_tx,
+    );
 
     let connection = zbus::Connection::session().await?;
     connection
