@@ -122,12 +122,16 @@ where
 
                 // Process audio chunks
                 Some(chunk) = audio_rx.recv() => {
-                    if !*self.enabled_rx.borrow() {
-                        continue;
-                    }
-
                     match state {
                         State::Idle => {
+                            // `enabled` governs only always-on wake-word
+                            // listening. Push-to-talk (and SayText) must work
+                            // even when "Hey Adele" is off, so the gate lives
+                            // here in the Idle branch rather than around the
+                            // whole audio handler (#3).
+                            if !*self.enabled_rx.borrow() {
+                                continue;
+                            }
                             // Feed to wake word detector
                             if self.wake.detect(&chunk)? {
                                 tracing::info!("wake word detected");
