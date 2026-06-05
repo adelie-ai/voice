@@ -296,7 +296,21 @@ where
                                         state = new_state;
                                         self.set_state(state);
 
-                                        let outcome = self.process_utterance(samples).await?;
+                                        // A failed turn must NOT crash the
+                                        // daemon. The orchestrator may have
+                                        // restarted and dropped the connection;
+                                        // log it, apologize, and end the turn —
+                                        // the gateway reconnects so the next
+                                        // turn works.
+                                        let outcome = match self.process_utterance(samples).await {
+                                            Ok(outcome) => outcome,
+                                            Err(e) => {
+                                                tracing::error!("voice turn failed: {e}");
+                                                self.set_state(State::Speaking);
+                                                let _ = self.speaker.say(ERROR_APOLOGY).await;
+                                                UtteranceOutcome::EndConversation
+                                            }
+                                        };
 
                                         if outcome == UtteranceOutcome::EndConversation {
                                             // A voice "stop" command ends the
@@ -710,6 +724,9 @@ mod tests {
         tx: StdMutex<Option<mpsc::UnboundedSender<AssistantEvent>>>,
         prompt_tx: mpsc::UnboundedSender<SentPrompt>,
         created_tx: mpsc::UnboundedSender<String>,
+        /// When set, `create_conversation` errors — simulating a dropped
+        /// orchestrator connection so the turn fails mid-flight.
+        fail: bool,
     }
     impl FakeAssistant {
         /// Shared recording + immediate-completion path for both send
@@ -742,6 +759,11 @@ mod tests {
             &self,
             title: &str,
         ) -> Result<String, adele_voice_core::VoiceError> {
+            if self.fail {
+                return Err(adele_voice_core::VoiceError::Assistant(
+                    "uds connection closed".to_string(),
+                ));
+            }
             let _ = self.created_tx.send(title.to_string());
             Ok("own-session".to_string())
         }
@@ -823,6 +845,7 @@ mod tests {
         spoken_response_hint: String,
         vad: Vec<f32>,
         stt_text: String,
+        assistant_fails: bool,
     }
     impl Default for Cfg {
         fn default() -> Self {
@@ -835,6 +858,7 @@ mod tests {
                 spoken_response_hint: String::new(),
                 vad: vec![0.9],
                 stt_text: "hello".to_string(),
+                assistant_fails: false,
             }
         }
     }
@@ -865,6 +889,7 @@ mod tests {
                 tx: StdMutex::new(None),
                 prompt_tx,
                 created_tx,
+                fail: cfg.assistant_fails,
             },
             Arc::new(FakeSource {
                 rx: StdMutex::new(Some(audio_rx)),
@@ -904,6 +929,42 @@ mod tests {
     /// chunk (VAD 0.9) then one silence chunk (VAD 0.0) closes the utterance.
     async fn send_chunk(h: &Harness) {
         h.audio_tx.send(vec![0.1f32; 1000]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_turn_does_not_crash_the_daemon() {
+        // A dropped orchestrator connection (create_conversation errors) must
+        // not crash the pipeline: it apologizes, returns to Idle, and keeps
+        // running so the next turn — after the gateway reconnects — works.
+        let mut h = spawn_pipeline(Cfg {
+            assistant_fails: true,
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process -> create_conversation fails
+
+        // The failed turn must recover to Idle rather than crashing.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("a failed turn must recover to Idle")
+        .unwrap();
+        assert!(
+            !h.handle.is_finished(),
+            "a failed turn must not crash the daemon"
+        );
+        h.handle.abort();
     }
 
     #[tokio::test]
