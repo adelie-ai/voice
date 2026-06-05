@@ -21,6 +21,18 @@ fn compose_prompt(hint: &str, transcript: &str) -> String {
     }
 }
 
+/// Spoken when the assistant turn fails — short and human, never the raw error.
+const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
+
+/// Heuristic: does this look like an orchestrator error surfaced as reply text?
+/// The orchestrator reports LLM failures as the assistant message (so they show
+/// in the chat UI), e.g. "Details: LLM error: Bedrock …". Reading that aloud is
+/// terrible, so we substitute a short apology. "llm error" is specific enough
+/// that a genuine spoken reply won't contain it.
+fn is_error_response(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("llm error")
+}
+
 pub struct Pipeline<W, V, S, T, A>
 where
     W: WakeWordDetector + 'static,
@@ -391,6 +403,12 @@ where
                 event = signal_rx.recv() => {
                     match event {
                         Some(AssistantEvent::Chunk { request_id: rid, text }) if rid == request_id => {
+                            if first_chunk && is_error_response(&text) {
+                                tracing::error!(chunk = %text, "assistant streamed an error message; speaking a short apology instead");
+                                self.set_state(State::Speaking);
+                                self.speak_sentence(ERROR_APOLOGY).await?;
+                                break;
+                            }
                             if first_chunk {
                                 first_chunk = false;
                                 self.set_state(State::Speaking);
@@ -410,22 +428,32 @@ where
                             } else if first_chunk && !full_response.trim().is_empty() {
                                 // Nothing was streamed as chunks — e.g. a
                                 // tool-using reply delivered as one final block.
-                                // Speak the full response instead of dropping it.
                                 self.set_state(State::Speaking);
-                                let sentences = sentence_buf.push(&full_response);
-                                for sentence in sentences {
-                                    self.speak_sentence(&sentence).await?;
-                                }
-                                let remaining = sentence_buf.flush();
-                                if !remaining.is_empty() {
-                                    self.speak_sentence(&remaining).await?;
+                                if is_error_response(&full_response) {
+                                    // The orchestrator surfaces LLM failures as
+                                    // the reply text (so they show in chat);
+                                    // don't read the raw error aloud.
+                                    tracing::error!(response = %full_response, "assistant returned an error message; speaking a short apology instead");
+                                    self.speak_sentence(ERROR_APOLOGY).await?;
+                                } else {
+                                    // Speak the full response instead of dropping it.
+                                    let sentences = sentence_buf.push(&full_response);
+                                    for sentence in sentences {
+                                        self.speak_sentence(&sentence).await?;
+                                    }
+                                    let remaining = sentence_buf.flush();
+                                    if !remaining.is_empty() {
+                                        self.speak_sentence(&remaining).await?;
+                                    }
                                 }
                             }
                             tracing::info!(streamed = !first_chunk, "assistant response complete");
                             break;
                         }
                         Some(AssistantEvent::Error { request_id: rid, error }) if rid == request_id => {
-                            tracing::error!(error = %error, "assistant response error");
+                            tracing::error!(error = %error, "assistant response error; speaking a short apology");
+                            self.set_state(State::Speaking);
+                            self.speak_sentence(ERROR_APOLOGY).await?;
                             break;
                         }
                         None => {
@@ -473,6 +501,24 @@ mod tests {
             compose_prompt("Be brief.", "what's the weather?"),
             "Be brief.\n\nwhat's the weather?"
         );
+    }
+
+    #[test]
+    fn detects_orchestrator_error_responses() {
+        // An LLM failure surfaced as reply text must be recognized so the
+        // daemon apologizes instead of reading the raw error aloud.
+        assert!(is_error_response(
+            "Details: LLM error: Bedrock converse_stream request failed: validation error"
+        ));
+        assert!(is_error_response("LLM error: provider unavailable"));
+    }
+
+    #[test]
+    fn normal_replies_are_not_errors() {
+        assert!(!is_error_response("It's sunny and about 72 degrees today."));
+        assert!(!is_error_response(
+            "The forecast calls for rain this afternoon, clearing by evening."
+        ));
     }
 
     #[test]
