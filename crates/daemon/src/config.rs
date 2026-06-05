@@ -49,8 +49,16 @@ pub struct SttConfig {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct TtsConfig {
+    /// "piper" (local, default) or "polly" (AWS cloud, neural/generative voices).
+    pub backend: String,
     pub piper_binary: String,
     pub model_path: PathBuf,
+    /// Polly voice id (e.g. "Joanna", "Ruth", "Matthew") when backend = "polly".
+    pub polly_voice: String,
+    /// Polly engine: "neural" (default), "generative" (most natural), "long-form", or "standard".
+    pub polly_engine: String,
+    /// AWS region for Polly; falls back to the AWS credential chain when unset.
+    pub polly_region: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,8 +120,12 @@ impl Default for TtsConfig {
     fn default() -> Self {
         let data_dir = dirs_path("adele-voice/models");
         Self {
+            backend: "piper".into(),
             piper_binary: "piper".into(),
             model_path: data_dir.join("en_US-amy-medium.onnx"),
+            polly_voice: "Joanna".into(),
+            polly_engine: "neural".into(),
+            polly_region: None,
         }
     }
 }
@@ -124,7 +136,7 @@ impl Default for AssistantConfig {
             conversation_title: "Voice Conversation".into(),
             conversation_mode: false,
             followup_timeout_ms: 8000,
-            spoken_response_hint: "You are Adele, responding by voice — the user's message was transcribed from speech, so expect occasional recognition errors — use your judgment, and if anything seems garbled or like a non-sequitur, briefly lead with how you understood it (e.g. open with 'it sounds like you asked about X') so the user can catch a mishearing, then answer; ask a short clarifying question only if you truly cannot tell. Your reply will be read aloud, so keep it brief, conversational, and relevant, never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points and then ask whether they'd like the details. If they ask for more, you may expand but stay under about ten sentences (roughly a 30-second read). Let the user lead — invite follow-up questions and let them steer the conversation. Avoid markdown, lists, code blocks, and emoji.".into(),
+            spoken_response_hint: "You are Adele, responding by voice. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. Answer directly and naturally — do not restate or paraphrase the question back before answering; just respond. Only if a message is clearly garbled or you truly cannot tell what was meant should you briefly check (e.g. 'did you mean X?') or ask one short clarifying question. Your reply will be read aloud, so keep it brief, conversational, and relevant — never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points, then ask whether they'd like more. If they ask for more, you may expand but stay under about ten sentences. Let the user lead — invite follow-ups and let them steer. Avoid markdown, lists, code blocks, and emoji.".into(),
         }
     }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "adele-voice-tts-polly"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+adele-voice-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# default-features=false drops the legacy hyper-0.14 connector (which pulled the
+# vulnerable rustls-webpki 0.101 — RUSTSEC-2026-0104). We use the modern hyper-1.x
+# rustls-aws-lc client via default-https-client. SSO / credential_process providers
+# are off, so credentials come from env vars, a static/STS profile, or IMDS.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
+aws-sdk-polly = { version = "1", default-features = false, features = ["behavior-version-latest", "http-1x", "default-https-client", "rt-tokio"] }

@@ -15,9 +15,11 @@ use adele_voice_dbus_interface::TtsCommand;
 use adele_voice_tts_piper::{DEFAULT_PIPER_SAMPLE_RATE, PiperTts};
 use tokio::sync::mpsc;
 
+use crate::tts_backend::TtsBackend;
+
 /// Drive the TTS service until the command channel closes.
 pub async fn run_tts_service(
-    tts: Arc<PiperTts>,
+    tts: Arc<TtsBackend>,
     sink: Arc<dyn AudioSink>,
     models_dir: PathBuf,
     mut rx: mpsc::Receiver<TtsCommand>,
@@ -42,23 +44,41 @@ pub async fn run_tts_service(
                 let _ = reply.send(result);
             }
             TtsCommand::ListVoices { reply } => {
-                let _ = reply.send(list_voices(&models_dir));
+                let voices = match &*tts {
+                    TtsBackend::Piper(_) => list_voices(&models_dir),
+                    TtsBackend::Polly(_) => polly_voices(),
+                };
+                let _ = reply.send(voices);
             }
             TtsCommand::GetVoice { reply } => {
-                let (path, speaker) = tts.current_voice();
-                let id = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                let _ = reply.send((id, speaker.map(|s| s as i32).unwrap_or(-1)));
+                let id_speaker = match &*tts {
+                    TtsBackend::Piper(p) => {
+                        let (path, speaker) = p.current_voice();
+                        let id = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        (id, speaker.map(|s| s as i32).unwrap_or(-1))
+                    }
+                    TtsBackend::Polly(p) => (p.current_voice().0, -1),
+                };
+                let _ = reply.send(id_speaker);
             }
             TtsCommand::SetVoice {
                 voice_id,
                 speaker,
                 reply,
             } => {
-                let _ = reply.send(set_voice(&tts, &models_dir, &voice_id, speaker));
+                let result = match &*tts {
+                    TtsBackend::Piper(p) => set_voice(p, &models_dir, &voice_id, speaker),
+                    TtsBackend::Polly(p) => {
+                        let (_, engine) = p.current_voice();
+                        p.set_voice(&voice_id, &engine);
+                        Ok(())
+                    }
+                };
+                let _ = reply.send(result);
             }
         }
     }
@@ -124,6 +144,32 @@ fn list_voices(models_dir: &Path) -> Vec<(String, String, String, u32)> {
     }
     voices.sort();
     voices
+}
+
+/// A curated set of high-quality Polly English voices for the voice switcher.
+/// Selecting one keeps the configured engine (neural/generative); it only
+/// changes which voice speaks.
+fn polly_voices() -> Vec<(String, String, String, u32)> {
+    [
+        ("Joanna", "Joanna (female, US)", "en_US"),
+        ("Matthew", "Matthew (male, US)", "en_US"),
+        ("Ruth", "Ruth (female, US)", "en_US"),
+        ("Stephen", "Stephen (male, US)", "en_US"),
+        ("Danielle", "Danielle (female, US)", "en_US"),
+        ("Gregory", "Gregory (male, US)", "en_US"),
+        ("Amy", "Amy (female, GB)", "en_GB"),
+        ("Arthur", "Arthur (male, GB)", "en_GB"),
+    ]
+    .iter()
+    .map(|(id, name, lang)| {
+        (
+            (*id).to_string(),
+            (*name).to_string(),
+            (*lang).to_string(),
+            1u32,
+        )
+    })
+    .collect()
 }
 
 /// Read a voice's `.onnx.json`, returning (name, language, num_speakers,
