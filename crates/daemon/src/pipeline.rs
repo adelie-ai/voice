@@ -10,10 +10,15 @@ use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
 use adele_voice_dbus_interface::StopRequest;
+use adele_voice_module::{Endpoint, Endpointer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
 /// Spoken when the assistant turn fails — short and human, never the raw error.
 const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
+
+/// Buffered-sample floor below which a trailing silence won't close an
+/// utterance — guards against a single stray blip (50 ms at 16 kHz).
+const ENDPOINT_MIN_SAMPLES: usize = 800;
 
 /// Heuristic: does this look like an orchestrator error surfaced as reply text?
 /// The orchestrator reports LLM failures as the assistant message (so they show
@@ -79,11 +84,11 @@ where
 {
     wake: W,
     vad: V,
-    stt: Arc<S>,
-    tts: Arc<T>,
+    transcriber: Transcriber<S>,
+    speaker: Speaker<T>,
     assistant: Arc<A>,
     source: Arc<dyn AudioSource>,
-    sink: Arc<dyn AudioSink>,
+    endpointer: Endpointer,
     state_tx: watch::Sender<State>,
     enabled_rx: watch::Receiver<bool>,
     ptt_rx: mpsc::Receiver<Option<String>>,
@@ -96,7 +101,6 @@ where
     /// conversation ends. `None` means "use the daemon's own session".
     ptt_conversation_override: Option<String>,
     conversation_title: String,
-    silence_duration: Duration,
     speech_threshold: f32,
     conversation_mode: bool,
     followup_timeout: Duration,
@@ -136,11 +140,11 @@ where
         Self {
             wake,
             vad,
-            stt: Arc::new(stt),
-            tts: Arc::new(tts),
+            transcriber: Transcriber::new(Arc::new(stt)),
+            speaker: Speaker::new(Arc::new(tts), sink),
             assistant: Arc::new(assistant),
             source,
-            sink,
+            endpointer: Endpointer::new(speech_threshold, silence_duration, ENDPOINT_MIN_SAMPLES),
             state_tx,
             enabled_rx,
             ptt_rx,
@@ -148,7 +152,6 @@ where
             conversation_id: None,
             ptt_conversation_override: None,
             conversation_title,
-            silence_duration,
             speech_threshold,
             conversation_mode,
             followup_timeout,
@@ -168,13 +171,9 @@ where
         let mut state = State::Idle;
         self.set_state(state);
 
-        let mut speech_buffer: Vec<f32> = Vec::new();
-        let mut last_speech_at: Option<Instant> = None;
-        // In conversation mode, set after a reply while awaiting a follow-up
-        // turn; elapsing it with no speech ends the conversation.
-        let mut followup_deadline: Option<Instant> = None;
         // For idle-exit (#5): time of the last activity other than idle-while-
-        // wake-disabled.
+        // wake-disabled. (Utterance accumulation and the follow-up/lead-in
+        // deadline now live in the shared `Endpointer`.)
         let mut last_activity = Instant::now();
 
         loop {
@@ -186,7 +185,7 @@ where
                 Some(target) = self.ptt_rx.recv() => {
                     if state == State::Idle || state == State::Speaking {
                         if state == State::Speaking {
-                            self.sink.stop()?;
+                            self.speaker.stop()?;
                         }
                         // Route this PTT session: `Some(id)` dictates into that
                         // conversation; `None` (plain PushToTalk) falls back to
@@ -197,12 +196,10 @@ where
                         self.ptt_conversation_override = target.clone();
                         state = State::Listening;
                         self.set_state(state);
-                        speech_buffer.clear();
                         // Wait (lead-in) for speech to start rather than cutting
                         // on the silence timer from the moment of the press; only
                         // cut after speech-then-silence, or if the lead-in elapses.
-                        last_speech_at = None;
-                        followup_deadline = Some(Instant::now() + self.followup_timeout);
+                        self.endpointer.arm(Some(self.followup_timeout));
                         self.vad.reset();
                         tracing::info!(
                             target_conversation = target.as_deref().unwrap_or("<own session>"),
@@ -217,7 +214,7 @@ where
                     match req {
                         StopRequest::Speaking => {
                             if state == State::Speaking {
-                                self.sink.stop()?;
+                                self.speaker.stop()?;
                                 state = State::Idle;
                                 self.set_state(state);
                             }
@@ -226,15 +223,13 @@ where
                             // "Stop listening": end the session now without
                             // waiting out the silence timeout.
                             if state != State::Idle {
-                                let _ = self.sink.stop();
+                                let _ = self.speaker.stop();
                                 state = State::Idle;
                                 self.set_state(state);
                             }
                             self.conversation_id = None;
                             self.ptt_conversation_override = None;
-                            speech_buffer.clear();
-                            last_speech_at = None;
-                            followup_deadline = None;
+                            self.endpointer.reset();
                         }
                     }
                 }
@@ -251,7 +246,7 @@ where
                         // D-Bus activation can restart the daemon on demand.
                         if let Some(timeout) = self.idle_exit_timeout
                             && last_activity.elapsed() >= timeout
-                            && !self.sink.is_playing()
+                            && !self.speaker.is_playing()
                         {
                             tracing::info!(
                                 "idle-exit: wake word disabled and idle, exiting for on-demand activation"
@@ -275,91 +270,76 @@ where
                                     // StopSpeaking so this utterance can't leak
                                     // into a previously dictated conversation.
                                     self.ptt_conversation_override = None;
-                                    speech_buffer.clear();
-                                    last_speech_at = None;
-                                    followup_deadline = Some(Instant::now() + self.followup_timeout);
+                                    self.endpointer.arm(Some(self.followup_timeout));
                                     self.vad.reset();
                                 }
                             }
                         }
 
                         State::Listening => {
-                            // Feed to VAD and accumulate speech
+                            // Feed to VAD; the endpointer accumulates and decides
+                            // when the utterance ends (or the lead-in elapses).
                             let prob = self.vad.speech_probability(&chunk)?;
-                            speech_buffer.extend_from_slice(&chunk);
-
-                            if prob >= self.speech_threshold {
-                                if last_speech_at.is_none() {
+                            match self.endpointer.push(&chunk, prob) {
+                                Endpoint::SpeechStarted => {
                                     tracing::info!(prob, "speech detected, recording");
                                 }
-                                last_speech_at = Some(Instant::now());
-                                followup_deadline = None; // speech began; cancel follow-up timeout
-                            } else if let Some(last) = last_speech_at
-                                && last.elapsed() >= self.silence_duration
-                                && speech_buffer.len() > 800
-                            {
-                                // Silence detected after speech
-                                tracing::info!(
-                                    samples = speech_buffer.len(),
-                                    "silence detected, transitioning to processing"
-                                );
-                                if let Some(new_state) = state.transition(&StateEvent::SilenceDetected) {
-                                    state = new_state;
-                                    self.set_state(state);
-
-                                    // Spawn transcription + response pipeline
-                                    let samples = std::mem::take(&mut speech_buffer);
-                                    let outcome = self.process_utterance(samples).await?;
-
-                                    if outcome == UtteranceOutcome::EndConversation {
-                                        // A voice "stop" command ends the
-                                        // conversation regardless of mode.
-                                        state = State::Idle;
+                                Endpoint::Accumulating => {}
+                                Endpoint::Complete(samples) => {
+                                    tracing::info!(
+                                        samples = samples.len(),
+                                        "silence detected, transitioning to processing"
+                                    );
+                                    if let Some(new_state) =
+                                        state.transition(&StateEvent::SilenceDetected)
+                                    {
+                                        state = new_state;
                                         self.set_state(state);
-                                        self.conversation_id = None;
-                                        self.ptt_conversation_override = None;
-                                        speech_buffer.clear();
-                                        last_speech_at = None;
-                                        followup_deadline = None;
-                                    } else if self.conversation_mode {
-                                        // Re-open the mic for a follow-up turn:
-                                        // wait for the reply to finish playing,
-                                        // then drop any audio captured during
-                                        // playback (echo) before listening again.
-                                        while self.sink.is_playing() {
-                                            tokio::time::sleep(Duration::from_millis(50)).await;
+
+                                        let outcome = self.process_utterance(samples).await?;
+
+                                        if outcome == UtteranceOutcome::EndConversation {
+                                            // A voice "stop" command ends the
+                                            // conversation regardless of mode.
+                                            state = State::Idle;
+                                            self.set_state(state);
+                                            self.conversation_id = None;
+                                            self.ptt_conversation_override = None;
+                                            self.endpointer.reset();
+                                        } else if self.conversation_mode {
+                                            // Re-open the mic for a follow-up turn:
+                                            // wait for the reply to finish playing,
+                                            // then drop any audio captured during
+                                            // playback (echo) before listening again.
+                                            while self.speaker.is_playing() {
+                                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                            }
+                                            while audio_rx.try_recv().is_ok() {}
+                                            state = State::Listening;
+                                            self.set_state(state);
+                                            self.endpointer.arm(Some(self.followup_timeout));
+                                            self.vad.reset();
+                                        } else {
+                                            // Single-shot: back to wake-word idle.
+                                            // Drop any PTT-into-conversation target
+                                            // so the next own-session turn doesn't
+                                            // inherit it.
+                                            state = State::Idle;
+                                            self.set_state(state);
+                                            self.ptt_conversation_override = None;
                                         }
-                                        while audio_rx.try_recv().is_ok() {}
-                                        state = State::Listening;
-                                        self.set_state(state);
-                                        speech_buffer.clear();
-                                        last_speech_at = None;
-                                        followup_deadline =
-                                            Some(Instant::now() + self.followup_timeout);
-                                        self.vad.reset();
-                                    } else {
-                                        // Single-shot: back to wake-word idle.
-                                        // Drop any PTT-into-conversation target
-                                        // so the next own-session turn doesn't
-                                        // inherit it.
-                                        state = State::Idle;
-                                        self.set_state(state);
-                                        self.ptt_conversation_override = None;
                                     }
                                 }
-                            } else if let Some(deadline) = followup_deadline
-                                && Instant::now() >= deadline
-                            {
-                                // No follow-up speech within the timeout: end
-                                // the conversation, return to wake-word idle.
-                                tracing::info!("conversation follow-up timed out");
-                                state = State::Idle;
-                                self.set_state(state);
-                                self.conversation_id = None;
-                                self.ptt_conversation_override = None;
-                                speech_buffer.clear();
-                                last_speech_at = None;
-                                followup_deadline = None;
+                                Endpoint::Timeout => {
+                                    // No follow-up speech within the timeout: end
+                                    // the conversation, return to wake-word idle.
+                                    tracing::info!("conversation follow-up timed out");
+                                    state = State::Idle;
+                                    self.set_state(state);
+                                    self.conversation_id = None;
+                                    self.ptt_conversation_override = None;
+                                    self.endpointer.reset();
+                                }
                             }
                         }
 
@@ -368,16 +348,16 @@ where
                             let prob = self.vad.speech_probability(&chunk)?;
                             if prob >= self.speech_threshold {
                                 tracing::info!("barge-in detected");
-                                self.sink.stop()?;
+                                self.speaker.stop()?;
                                 if let Some(new_state) = state.transition(&StateEvent::BargeIn) {
                                     state = new_state;
                                     self.set_state(state);
-                                    speech_buffer.clear();
-                                    speech_buffer.extend_from_slice(&chunk);
-                                    last_speech_at = Some(Instant::now());
+                                    // Seed the endpointer mid-speech so the next
+                                    // silence closes this barge-in utterance.
+                                    self.endpointer.arm_speaking(&chunk);
                                     self.vad.reset();
                                 }
-                            } else if !self.sink.is_playing()
+                            } else if !self.speaker.is_playing()
                                 && let Some(new_state) =
                                     state.transition(&StateEvent::PlaybackComplete)
                             {
@@ -402,31 +382,17 @@ where
     }
 
     async fn process_utterance(&mut self, samples: Vec<f32>) -> anyhow::Result<UtteranceOutcome> {
-        // Discard near-silent captures before they reach STT. Ambient noise or
-        // the tail of our own playback can trip the VAD without containing real
-        // speech, and Whisper then hallucinates filler ("Thank you.") — which in
-        // conversation mode loops every follow-up window. Real speech sits well
-        // above this RMS floor (a buffer with even a brief utterance is ~0.02+,
-        // noise/echo is ~0.003-0.008).
-        const MIN_SPEECH_RMS: f32 = 0.01;
-        let rms = if samples.is_empty() {
-            0.0
-        } else {
-            (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+        // Energy-gate + transcribe (in the module's `Transcriber`). The gate
+        // discards near-silent captures — ambient noise or the tail of our own
+        // playback can trip the VAD without real speech, and Whisper then
+        // hallucinates filler ("Thank you.") that loops every follow-up window —
+        // and an empty transcript is likewise nothing to act on; both yield
+        // `None`. We transcribe before touching the orchestrator so a "stop"
+        // command needn't create or poke the conversation.
+        let transcript = match self.transcriber.transcribe(&samples).await? {
+            Some(t) => t,
+            None => return Ok(UtteranceOutcome::Continue),
         };
-        tracing::info!(rms, samples = samples.len(), "utterance captured");
-        if rms < MIN_SPEECH_RMS {
-            tracing::info!(rms, "discarding near-silent capture (no speech)");
-            return Ok(UtteranceOutcome::Continue);
-        }
-
-        // Transcribe first, so a "stop" command ends the conversation without
-        // creating or poking the orchestrator conversation.
-        let transcript = self.stt.transcribe(&samples).await?;
-        if transcript.text.is_empty() {
-            tracing::debug!("empty transcript, skipping");
-            return Ok(UtteranceOutcome::Continue);
-        }
         tracing::info!(text = %transcript.text, "transcribed");
 
         // A whole-utterance stop phrase ("stop", "never mind", "that's all", …)
@@ -435,7 +401,7 @@ where
         if is_stop_phrase(&transcript.text) {
             tracing::info!(text = %transcript.text, "stop phrase — ending conversation");
             self.set_state(State::Speaking);
-            self.speak_sentence("Okay.").await?;
+            self.speaker.say("Okay.").await?;
             return Ok(UtteranceOutcome::EndConversation);
         }
 
@@ -489,7 +455,7 @@ where
                             if first_chunk && is_error_response(&text) {
                                 tracing::error!(chunk = %text, "assistant streamed an error message; speaking a short apology instead");
                                 self.set_state(State::Speaking);
-                                self.speak_sentence(ERROR_APOLOGY).await?;
+                                self.speaker.say(ERROR_APOLOGY).await?;
                                 break;
                             }
                             if first_chunk {
@@ -499,14 +465,14 @@ where
 
                             let sentences = sentence_buf.push(&text);
                             for sentence in sentences {
-                                self.speak_sentence(&sentence).await?;
+                                self.speaker.say(&sentence).await?;
                             }
                         }
                         Some(AssistantEvent::Complete { request_id: rid, full_response }) if rid == request_id => {
                             if sentence_buf.has_content() {
                                 let remaining = sentence_buf.flush();
                                 if !remaining.is_empty() {
-                                    self.speak_sentence(&remaining).await?;
+                                    self.speaker.say(&remaining).await?;
                                 }
                             } else if first_chunk && !full_response.trim().is_empty() {
                                 // Nothing was streamed as chunks — e.g. a
@@ -517,16 +483,16 @@ where
                                     // the reply text (so they show in chat);
                                     // don't read the raw error aloud.
                                     tracing::error!(response = %full_response, "assistant returned an error message; speaking a short apology instead");
-                                    self.speak_sentence(ERROR_APOLOGY).await?;
+                                    self.speaker.say(ERROR_APOLOGY).await?;
                                 } else {
                                     // Speak the full response instead of dropping it.
                                     let sentences = sentence_buf.push(&full_response);
                                     for sentence in sentences {
-                                        self.speak_sentence(&sentence).await?;
+                                        self.speaker.say(&sentence).await?;
                                     }
                                     let remaining = sentence_buf.flush();
                                     if !remaining.is_empty() {
-                                        self.speak_sentence(&remaining).await?;
+                                        self.speaker.say(&remaining).await?;
                                     }
                                 }
                             }
@@ -536,7 +502,7 @@ where
                         Some(AssistantEvent::Error { request_id: rid, error }) if rid == request_id => {
                             tracing::error!(error = %error, "assistant response error; speaking a short apology");
                             self.set_state(State::Speaking);
-                            self.speak_sentence(ERROR_APOLOGY).await?;
+                            self.speaker.say(ERROR_APOLOGY).await?;
                             break;
                         }
                         None => {
@@ -549,22 +515,13 @@ where
                 // Check for timeout flush while waiting for chunks
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     if let Some(sentence) = sentence_buf.flush_if_timeout() {
-                        self.speak_sentence(&sentence).await?;
+                        self.speaker.say(&sentence).await?;
                     }
                 }
             }
         }
 
         Ok(UtteranceOutcome::Continue)
-    }
-
-    async fn speak_sentence(&self, text: &str) -> anyhow::Result<()> {
-        tracing::info!(text = %text, "speaking");
-        let samples = self.tts.synthesize(text).await?;
-        if !samples.is_empty() {
-            self.sink.play(samples)?;
-        }
-        Ok(())
     }
 }
 

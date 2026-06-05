@@ -11,6 +11,7 @@ members = [
     "crates/tts-kokoro",
     "crates/assistant-dbus",
     "crates/dbus-interface",
+    "crates/module",
     "crates/daemon",
 ]
 
@@ -35,3 +36,4 @@ adele-voice-tts-polly = { path = "crates/tts-polly" }
 adele-voice-tts-kokoro = { path = "crates/tts-kokoro" }
 adele-voice-assistant-dbus = { path = "crates/assistant-dbus" }
 adele-voice-dbus-interface = { path = "crates/dbus-interface" }
+adele-voice-module = { path = "crates/module" }

@@ -6,20 +6,15 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod pipeline;
-mod tts_backend;
 mod tts_service;
-
-use tts_backend::TtsBackend;
 
 use adele_voice_assistant_dbus::DbusAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
 use adele_voice_core::domain::State;
 use adele_voice_core::ports::audio::AudioSink;
 use adele_voice_dbus_interface::{DbusVoiceAdapter, StopRequest, TtsCommand};
+use adele_voice_module::{Speaker, TtsBackend};
 use adele_voice_stt_whisper::WhisperStt;
-use adele_voice_tts_kokoro::KokoroTts;
-use adele_voice_tts_piper::PiperTts;
-use adele_voice_tts_polly::PollyTts;
 use adele_voice_vad_silero::SileroVad;
 use adele_voice_wake_rustpotter::RustpotterWakeWordDetector;
 
@@ -54,52 +49,9 @@ async fn main() -> Result<()> {
     )?;
     let vad = SileroVad::new(&config.vad.model_path)?;
     let stt = WhisperStt::new(&config.stt.model_path, &config.stt.language)?;
-    let tts = match config.tts.backend.as_str() {
-        "polly" => {
-            tracing::info!(
-                voice = %config.tts.polly_voice,
-                engine = %config.tts.polly_engine,
-                "using AWS Polly TTS backend"
-            );
-            TtsBackend::Polly(
-                PollyTts::new(
-                    &config.tts.polly_voice,
-                    &config.tts.polly_engine,
-                    config.tts.polly_region.clone(),
-                )
-                .await,
-            )
-        }
-        "kokoro" => match KokoroTts::new(
-            &config.tts.kokoro_model_path,
-            &config.tts.kokoro_voices_dir,
-            &config.tts.kokoro_voice,
-            &config.tts.kokoro_lang,
-        ) {
-            Ok(k) => {
-                tracing::info!(voice = %config.tts.kokoro_voice, "using local Kokoro TTS backend");
-                TtsBackend::Kokoro(k)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Kokoro init failed ({e}); falling back to Piper. Run scripts/setup.sh to provision Kokoro."
-                );
-                TtsBackend::Piper(PiperTts::new(
-                    &config.tts.piper_binary,
-                    &config.tts.model_path,
-                ))
-            }
-        },
-        other => {
-            if other != "piper" {
-                tracing::warn!(backend = %other, "unknown tts.backend, falling back to piper");
-            }
-            TtsBackend::Piper(PiperTts::new(
-                &config.tts.piper_binary,
-                &config.tts.model_path,
-            ))
-        }
-    };
+    // Select the TTS backend (local-first: Kokoro→Piper fallback, never auto
+    // cloud). The conversation pipeline and the SayText service share it.
+    let tts = TtsBackend::from_config(&config.tts).await;
     let assistant = DbusAssistantGateway::connect().await?;
 
     let source = Arc::new(CpalAudioSource::new(&config.audio.input_device));
@@ -113,8 +65,9 @@ async fn main() -> Result<()> {
     let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<StopRequest>(1);
 
     // Text-to-speech service backing SayText/SynthesizeText and voice
-    // selection. Shares the pipeline's Piper instance (PiperTts clones share
-    // the active-voice state, so SetVoice affects both) and the audio sink.
+    // selection. Shares the backend instance (TTS clones share the active-voice
+    // state, so SetVoice affects both) and, via a `Speaker`, the audio sink —
+    // so spoken replies and SayText queue onto one playback stream.
     let (tts_tx, tts_rx) = tokio::sync::mpsc::channel::<TtsCommand>(16);
     let models_dir = config
         .tts
@@ -122,9 +75,11 @@ async fn main() -> Result<()> {
         .parent()
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
+    let tts_handle = Arc::new(tts.clone());
+    let say_speaker = Speaker::new(Arc::clone(&tts_handle), Arc::clone(&sink));
     tokio::spawn(tts_service::run_tts_service(
-        Arc::new(tts.clone()),
-        Arc::clone(&sink),
+        say_speaker,
+        tts_handle,
         models_dir,
         tts_rx,
     ));

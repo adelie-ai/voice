@@ -1,3 +1,4 @@
+use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -19,54 +20,9 @@ pub struct Config {
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
-pub struct AudioConfig {
-    pub input_device: String,
-    pub output_device: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
 pub struct WakeWordConfig {
     pub model_path: PathBuf,
     pub sensitivity: f32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct VadConfig {
-    pub model_path: PathBuf,
-    pub speech_threshold: f32,
-    pub silence_duration_ms: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct SttConfig {
-    pub model_path: PathBuf,
-    pub language: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(default)]
-pub struct TtsConfig {
-    /// "piper" (local, default) or "polly" (AWS cloud, neural/generative voices).
-    pub backend: String,
-    pub piper_binary: String,
-    pub model_path: PathBuf,
-    /// Polly voice id (e.g. "Joanna", "Ruth", "Matthew") when backend = "polly".
-    pub polly_voice: String,
-    /// Polly engine: "neural" (default), "generative" (most natural), "long-form", or "standard".
-    pub polly_engine: String,
-    /// AWS region for Polly; falls back to the AWS credential chain when unset.
-    pub polly_region: Option<String>,
-    /// Kokoro ONNX model path (when backend = "kokoro").
-    pub kokoro_model_path: PathBuf,
-    /// Directory of Kokoro voice `.bin` files (one per voice).
-    pub kokoro_voices_dir: PathBuf,
-    /// Kokoro voice name — a `<name>.bin` in the voices dir, e.g. "af_heart".
-    pub kokoro_voice: String,
-    /// espeak-ng language for Kokoro phonemization, e.g. "en-us" or "en-gb".
-    pub kokoro_lang: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,60 +40,12 @@ pub struct AssistantConfig {
     pub spoken_response_hint: String,
 }
 
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            input_device: "default".into(),
-            output_device: "default".into(),
-        }
-    }
-}
-
 impl Default for WakeWordConfig {
     fn default() -> Self {
         let data_dir = dirs_path("adele-voice/models");
         Self {
             model_path: data_dir.join("hey-adele.rpw"),
             sensitivity: 0.5,
-        }
-    }
-}
-
-impl Default for VadConfig {
-    fn default() -> Self {
-        let data_dir = dirs_path("adele-voice/models");
-        Self {
-            model_path: data_dir.join("silero_vad.onnx"),
-            speech_threshold: 0.5,
-            silence_duration_ms: 800,
-        }
-    }
-}
-
-impl Default for SttConfig {
-    fn default() -> Self {
-        let data_dir = dirs_path("adele-voice/models");
-        Self {
-            model_path: data_dir.join("ggml-distil-large-v3.bin"),
-            language: "en".into(),
-        }
-    }
-}
-
-impl Default for TtsConfig {
-    fn default() -> Self {
-        let data_dir = dirs_path("adele-voice/models");
-        Self {
-            backend: "kokoro".into(),
-            piper_binary: "piper".into(),
-            model_path: data_dir.join("en_US-amy-medium.onnx"),
-            polly_voice: "Joanna".into(),
-            polly_engine: "neural".into(),
-            polly_region: None,
-            kokoro_model_path: data_dir.join("kokoro.onnx"),
-            kokoro_voices_dir: data_dir.join("kokoro-voices"),
-            kokoro_voice: "af_heart".into(),
-            kokoro_lang: "en-us".into(),
         }
     }
 }
