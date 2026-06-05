@@ -38,9 +38,15 @@ where
     sink: Arc<dyn AudioSink>,
     state_tx: watch::Sender<State>,
     enabled_rx: watch::Receiver<bool>,
-    ptt_rx: mpsc::Receiver<()>,
+    ptt_rx: mpsc::Receiver<Option<String>>,
     stop_rx: mpsc::Receiver<()>,
     conversation_id: Option<String>,
+    /// When a push-to-talk specified a target conversation, its orchestrator
+    /// id. Set on `PushToTalkInConversation`, used by `process_utterance` to
+    /// route the turn (and any conversation-mode follow-ups) to that
+    /// conversation instead of the daemon's own session; cleared when the
+    /// conversation ends. `None` means "use the daemon's own session".
+    ptt_conversation_override: Option<String>,
     conversation_title: String,
     silence_duration: Duration,
     speech_threshold: f32,
@@ -69,7 +75,7 @@ where
         sink: Arc<dyn AudioSink>,
         state_tx: watch::Sender<State>,
         enabled_rx: watch::Receiver<bool>,
-        ptt_rx: mpsc::Receiver<()>,
+        ptt_rx: mpsc::Receiver<Option<String>>,
         stop_rx: mpsc::Receiver<()>,
         conversation_title: String,
         silence_duration: Duration,
@@ -92,6 +98,7 @@ where
             ptt_rx,
             stop_rx,
             conversation_id: None,
+            ptt_conversation_override: None,
             conversation_title,
             silence_duration,
             speech_threshold,
@@ -124,12 +131,21 @@ where
 
         loop {
             tokio::select! {
-                // Push-to-talk: skip wake word, go to Listening
-                Some(()) = self.ptt_rx.recv() => {
+                // Push-to-talk: skip wake word, go to Listening. The payload is
+                // the target conversation: `None` uses the daemon's own
+                // session, `Some(id)` routes the utterance to that orchestrator
+                // conversation (the in-chat mic button).
+                Some(target) = self.ptt_rx.recv() => {
                     if state == State::Idle || state == State::Speaking {
                         if state == State::Speaking {
                             self.sink.stop()?;
                         }
+                        // Start a fresh PTT session: route to the supplied
+                        // conversation (if any) and drop any prior session's
+                        // conversation so a re-press can't leak the previous
+                        // turn's target into this one.
+                        self.ptt_conversation_override = target.clone();
+                        self.conversation_id = None;
                         state = State::Listening;
                         self.set_state(state);
                         speech_buffer.clear();
@@ -139,7 +155,10 @@ where
                         last_speech_at = None;
                         followup_deadline = Some(Instant::now() + self.followup_timeout);
                         self.vad.reset();
-                        tracing::info!("push-to-talk activated, waiting for speech");
+                        tracing::info!(
+                            target_conversation = target.as_deref().unwrap_or("<own session>"),
+                            "push-to-talk activated, waiting for speech"
+                        );
                     }
                 }
 
@@ -236,8 +255,12 @@ where
                                         self.vad.reset();
                                     } else {
                                         // Single-shot: back to wake-word idle.
+                                        // Drop any PTT-into-conversation target
+                                        // so the next own-session turn doesn't
+                                        // inherit it.
                                         state = State::Idle;
                                         self.set_state(state);
+                                        self.ptt_conversation_override = None;
                                     }
                                 }
                             } else if let Some(deadline) = followup_deadline
@@ -249,6 +272,7 @@ where
                                 state = State::Idle;
                                 self.set_state(state);
                                 self.conversation_id = None;
+                                self.ptt_conversation_override = None;
                                 speech_buffer.clear();
                                 last_speech_at = None;
                                 followup_deadline = None;
@@ -312,16 +336,25 @@ where
             return Ok(());
         }
 
-        // Ensure we have a conversation
-        if self.conversation_id.is_none() {
-            let id = self
-                .assistant
-                .create_conversation(&self.conversation_title)
-                .await?;
-            tracing::info!(conversation_id = %id, "created voice conversation");
-            self.conversation_id = Some(id);
-        }
-        let conversation_id = self.conversation_id.as_ref().unwrap().clone();
+        // Resolve the target conversation. A push-to-talk into a specific
+        // conversation (the in-chat mic button) routes this turn — and any
+        // conversation-mode follow-ups — to that existing orchestrator
+        // conversation; we never create it (the client owns its lifecycle).
+        // Otherwise fall back to the daemon's own session, creating it lazily
+        // and reusing it across turns.
+        let conversation_id = if let Some(target) = self.ptt_conversation_override.clone() {
+            target
+        } else {
+            if self.conversation_id.is_none() {
+                let id = self
+                    .assistant
+                    .create_conversation(&self.conversation_title)
+                    .await?;
+                tracing::info!(conversation_id = %id, "created voice conversation");
+                self.conversation_id = Some(id);
+            }
+            self.conversation_id.as_ref().unwrap().clone()
+        };
 
         // Transcribe
         let transcript = self.stt.transcribe(&samples).await?;
@@ -492,22 +525,28 @@ mod tests {
 
     /// Assistant that completes immediately: `subscribe` hands back a receiver
     /// and `send_prompt` pushes a matching `Complete` so `process_utterance`
-    /// returns without hanging.
+    /// returns without hanging. It records the conversation id each prompt was
+    /// sent to (via `prompt_tx`) so tests can assert PTT routing, and reports
+    /// the title of any conversation it created (via `created_tx`).
     struct FakeAssistant {
         tx: StdMutex<Option<mpsc::UnboundedSender<AssistantEvent>>>,
+        prompt_tx: mpsc::UnboundedSender<String>,
+        created_tx: mpsc::UnboundedSender<String>,
     }
     impl AssistantGateway for FakeAssistant {
         async fn create_conversation(
             &self,
-            _title: &str,
+            title: &str,
         ) -> Result<String, adele_voice_core::VoiceError> {
-            Ok("conv".to_string())
+            let _ = self.created_tx.send(title.to_string());
+            Ok("own-session".to_string())
         }
         async fn send_prompt(
             &self,
-            _conversation_id: &str,
+            conversation_id: &str,
             _prompt: &str,
         ) -> Result<String, adele_voice_core::VoiceError> {
+            let _ = self.prompt_tx.send(conversation_id.to_string());
             let request_id = "req".to_string();
             if let Some(tx) = self.tx.lock().unwrap().as_ref() {
                 let _ = tx.send(AssistantEvent::Complete {
@@ -558,11 +597,15 @@ mod tests {
 
     struct Harness {
         audio_tx: mpsc::Sender<Vec<f32>>,
-        ptt_tx: mpsc::Sender<()>,
+        ptt_tx: mpsc::Sender<Option<String>>,
         _enabled_tx: watch::Sender<bool>,
         _stop_tx: mpsc::Sender<()>,
         state_rx: watch::Receiver<State>,
         transcribe_rx: mpsc::UnboundedReceiver<()>,
+        /// Conversation id each prompt was routed to.
+        prompt_rx: mpsc::UnboundedReceiver<String>,
+        /// Title of each conversation the daemon asked to create.
+        created_rx: mpsc::UnboundedReceiver<String>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -596,6 +639,8 @@ mod tests {
         let (stop_tx, stop_rx) = mpsc::channel(1);
         let (state_tx, state_rx) = watch::channel(State::Idle);
         let (hit_tx, transcribe_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
+        let (created_tx, created_rx) = mpsc::unbounded_channel();
 
         let pipeline = Pipeline::new(
             FakeWake {
@@ -608,6 +653,8 @@ mod tests {
             FakeTts,
             FakeAssistant {
                 tx: StdMutex::new(None),
+                prompt_tx,
+                created_tx,
             },
             Arc::new(FakeSource {
                 rx: StdMutex::new(Some(audio_rx)),
@@ -635,6 +682,8 @@ mod tests {
             _stop_tx: stop_tx,
             state_rx,
             transcribe_rx,
+            prompt_rx,
+            created_rx,
             handle,
         }
     }
@@ -657,7 +706,7 @@ mod tests {
             ..Default::default()
         });
 
-        h.ptt_tx.send(()).await.unwrap();
+        h.ptt_tx.send(None).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
             h.state_rx.wait_for(|s| *s == State::Listening),
@@ -678,13 +727,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ptt_with_conversation_id_routes_to_that_conversation() {
+        // #24 (core acceptance): a push-to-talk carrying a conversation id
+        // routes the utterance to THAT orchestrator conversation — it must
+        // send the prompt to the supplied id and must NOT create the daemon's
+        // own session.
+        let mut h = spawn_pipeline(Cfg::default());
+
+        h.ptt_tx
+            .send(Some("chat-window-42".to_string()))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process
+
+        let routed = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("a prompt should be sent")
+            .expect("prompt sender open");
+        h.handle.abort();
+        assert_eq!(
+            routed, "chat-window-42",
+            "the utterance must be routed to the conversation id the PTT supplied"
+        );
+        assert!(
+            h.created_rx.try_recv().is_err(),
+            "PTT-into-conversation must not create the daemon's own session"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_ptt_uses_daemon_own_session() {
+        // #24 (back-compat): a plain PushToTalk() (no id) must keep creating
+        // and using the daemon's own session ("test" title here) rather than
+        // any caller conversation.
+        let mut h = spawn_pipeline(Cfg::default());
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process
+
+        let created = tokio::time::timeout(Duration::from_secs(2), h.created_rx.recv())
+            .await
+            .expect("the daemon's own session should be created")
+            .expect("created sender open");
+        assert_eq!(
+            created, "test",
+            "a plain PTT must create the daemon's own session by its configured title"
+        );
+        let routed = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("a prompt should be sent")
+            .expect("prompt sender open");
+        h.handle.abort();
+        assert_eq!(
+            routed, "own-session",
+            "a plain PTT must route to the daemon's own session id, not a caller conversation"
+        );
+    }
+
+    #[tokio::test]
     async fn near_silent_capture_is_discarded() {
         // The energy gate must drop a near-silent buffer (noise/echo that
         // tripped the VAD) before STT, so Whisper can't hallucinate filler
         // that would loop in conversation mode.
         let mut h = spawn_pipeline(Cfg::default());
 
-        h.ptt_tx.send(()).await.unwrap();
+        h.ptt_tx.send(None).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
             h.state_rx.wait_for(|s| *s == State::Listening),
@@ -754,7 +879,7 @@ mod tests {
             followup_timeout: Duration::from_secs(5),
             ..Default::default()
         });
-        h.ptt_tx.send(()).await.unwrap();
+        h.ptt_tx.send(None).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
             h.state_rx.wait_for(|s| *s == State::Listening),
@@ -792,7 +917,7 @@ mod tests {
             followup_timeout: Duration::from_millis(100),
             ..Default::default()
         });
-        h.ptt_tx.send(()).await.unwrap();
+        h.ptt_tx.send(None).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
             h.state_rx.wait_for(|s| *s == State::Listening),
@@ -837,7 +962,7 @@ mod tests {
     async fn non_conversation_mode_returns_to_idle() {
         // Regression guard: without conversation mode, a reply returns to Idle.
         let mut h = spawn_pipeline(Cfg::default());
-        h.ptt_tx.send(()).await.unwrap();
+        h.ptt_tx.send(None).await.unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
             h.state_rx.wait_for(|s| *s == State::Listening),

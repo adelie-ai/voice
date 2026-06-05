@@ -104,7 +104,8 @@ async fn main() -> Result<()> {
     // State channels
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
     let (enabled_tx, enabled_rx) = tokio::sync::watch::channel(true);
-    let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel(1);
+    // PTT payload: the target conversation id (None = the daemon's own session).
+    let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
     let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
 
     // Text-to-speech service backing SayText/SynthesizeText and voice
