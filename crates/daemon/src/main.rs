@@ -181,6 +181,18 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// True if `bin` resolves to an existing file — an explicit path, or a bare
+/// name found on `PATH`. Used instead of `<bin> --version`, which some TTS
+/// CLIs (notably piper-tts) don't implement, yielding a false "missing".
+fn binary_resolves(bin: &str) -> bool {
+    if bin.contains('/') {
+        return std::path::Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
 /// Print which backends are provisioned/available, which one is configured, and
 /// the local-first fallback policy. Run with `adele-voice check-setup`.
 fn check_setup(config: &config::Config) {
@@ -231,7 +243,7 @@ fn check_setup(config: &config::Config) {
         voices,
         if espeak { "yes" } else { "NO" }
     );
-    let piper = runnable(&config.tts.piper_binary);
+    let piper = binary_resolves(&config.tts.piper_binary);
     println!(
         "  [{}] piper  (local)            binary:{} voice:{}",
         mark(piper && is_file(&config.tts.model_path)),
@@ -272,4 +284,26 @@ fn check_setup(config: &config::Config) {
         "Fallback policy: if the configured backend can't initialize it falls back to a LOCAL"
     );
     println!("backend (Piper) — never to a billable cloud backend automatically.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::binary_resolves;
+
+    #[test]
+    fn resolves_bare_name_on_path() {
+        // `sh` is on PATH on any Linux/macOS host.
+        assert!(binary_resolves("sh"));
+    }
+
+    #[test]
+    fn resolves_explicit_existing_path() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(binary_resolves(exe.to_str().unwrap()));
+    }
+
+    #[test]
+    fn rejects_missing_binary() {
+        assert!(!binary_resolves("definitely-not-a-real-binary-xyzzy"));
+    }
 }
