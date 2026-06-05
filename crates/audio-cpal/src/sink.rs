@@ -9,8 +9,12 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Producer, Split};
 
-/// Ring buffer capacity for output: 2 seconds of audio at 16kHz.
-const OUTPUT_RING_BUFFER_CAPACITY: usize = SAMPLE_RATE as usize * 2;
+/// Ring buffer capacity for output, sized to hold a full spoken reply at
+/// 16kHz. Sentences are synthesized and pushed back-to-back without waiting,
+/// so a small buffer overflowed and dropped each sentence's tail as the next
+/// was pushed; the response hint caps replies near ~30s, so 120s is ample
+/// headroom for them to queue and play gaplessly.
+const OUTPUT_RING_BUFFER_CAPACITY: usize = SAMPLE_RATE as usize * 120;
 
 pub struct CpalAudioSink {
     device_name: String,
