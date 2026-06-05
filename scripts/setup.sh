@@ -19,6 +19,12 @@ STT_URL="https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main
 TTS_ONNX_URL="https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/amy/medium/en_US-amy-medium.onnx"
 TTS_JSON_URL="${TTS_ONNX_URL}.json"
 
+# Kokoro — the default neural TTS. Quantized (q8f16) model + a few voices. The
+# tts-kokoro adapter caps the onnxruntime optimizer so q8f16 loads cleanly.
+KOKORO_BASE="https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main"
+KOKORO_MODEL_URL="$KOKORO_BASE/onnx/model_q8f16.onnx"
+KOKORO_VOICES="af_heart af_bella am_michael am_fenrir bf_emma bm_george"
+
 c_blue=$'\033[1;34m'; c_yellow=$'\033[1;33m'; c_green=$'\033[1;32m'; c_red=$'\033[1;31m'; c_off=$'\033[0m'
 log()  { printf '%s==>%s %s\n' "$c_blue" "$c_off" "$*"; }
 warn() { printf '%swarning:%s %s\n' "$c_yellow" "$c_off" "$*" >&2; }
@@ -42,6 +48,12 @@ fetch "$STT_URL"      "$MODELS_DIR/ggml-distil-large-v3.bin"
 fetch "$TTS_ONNX_URL" "$MODELS_DIR/en_US-amy-medium.onnx"
 fetch "$TTS_JSON_URL" "$MODELS_DIR/en_US-amy-medium.onnx.json"
 
+fetch "$KOKORO_MODEL_URL" "$MODELS_DIR/kokoro.onnx"
+mkdir -p "$MODELS_DIR/kokoro-voices"
+for v in $KOKORO_VOICES; do
+  fetch "$KOKORO_BASE/voices/$v.bin" "$MODELS_DIR/kokoro-voices/$v.bin"
+done
+
 # --- piper (text-to-speech) binary ---
 if command -v piper >/dev/null 2>&1; then
   log "piper found: $(command -v piper)"
@@ -51,25 +63,33 @@ else
   echo "    # or a release binary: https://github.com/rhasspy/piper/releases"
 fi
 
+# --- espeak-ng (phonemizer for the default Kokoro TTS) ---
+if command -v espeak-ng >/dev/null 2>&1; then
+  log "espeak-ng found: $(command -v espeak-ng)"
+else
+  warn "espeak-ng not found — required by the default Kokoro TTS. Install it:"
+  echo "    sudo pacman -S espeak-ng      # Arch / CachyOS"
+  echo "    sudo apt install espeak-ng    # Debian / Ubuntu"
+fi
+
 # --- wake word model (manual; needs your voice) ---
 if [[ -s "$MODELS_DIR/hey-adele.rpw" ]]; then
   log "have hey-adele.rpw — skipping"
 else
   warn "hey-adele.rpw is missing — it must be TRAINED from your own recordings:"
   cat <<TRAIN
-    1. Record 5-10 clips of "Hey Adele" as 16kHz mono WAV, e.g.:
-         arecord -f S16_LE -r 16000 -c 1 hey-adele-01.wav   # repeat, vary tone
-    2. cargo install rustpotter-cli
-    3. rustpotter-cli build-model --model-path hey-adele.rpw hey-adele-*.wav
-    4. mv hey-adele.rpw "$MODELS_DIR"/
-    Then tune wake_word.sensitivity in ~/.config/adele-voice/config.toml.
+    1. cargo install rustpotter-cli
+    2. Record ~8-10 clips of "Hey Adele" (consistent tone/distance, quiet room):
+         rustpotter-cli record --ms 2000 hey-adele-01.wav   # repeat for 02..10
+    3. rustpotter-cli build --name "hey adele" --path "$MODELS_DIR/hey-adele.rpw" hey-adele-*.wav
+    Then tune wake_word.sensitivity in ~/.config/adele-voice/config.toml (lower = more sensitive).
 TRAIN
 fi
 
 # --- summary ---
 echo
 log "asset status in $MODELS_DIR:"
-for f in silero_vad.onnx ggml-distil-large-v3.bin en_US-amy-medium.onnx en_US-amy-medium.onnx.json hey-adele.rpw; do
+for f in silero_vad.onnx ggml-distil-large-v3.bin kokoro.onnx en_US-amy-medium.onnx en_US-amy-medium.onnx.json hey-adele.rpw; do
   if [[ -s "$MODELS_DIR/$f" ]]; then
     printf '  %sok%s   %s\n' "$c_green" "$c_off" "$f"
   else

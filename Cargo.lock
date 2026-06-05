@@ -11,6 +11,7 @@ dependencies = [
  "adele-voice-core",
  "adele-voice-dbus-interface",
  "adele-voice-stt-whisper",
+ "adele-voice-tts-kokoro",
  "adele-voice-tts-piper",
  "adele-voice-tts-polly",
  "adele-voice-vad-silero",
@@ -77,6 +78,17 @@ dependencies = [
  "anyhow",
  "tracing",
  "whisper-rs",
+]
+
+[[package]]
+name = "adele-voice-tts-kokoro"
+version = "0.1.0"
+dependencies = [
+ "adele-voice-core",
+ "ort",
+ "rubato 2.0.0",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -23,12 +23,12 @@ The pipeline is a small state machine, and the microphone is treated very differ
 | **Processing** | Mic input ignored | — |
 | **Speaking** | Monitored only for *barge-in* so you can interrupt the reply | nowhere |
 
-**Captured audio never leaves your machine, in any state.** There is no cloud speech service anywhere in this project.
+**Captured audio never leaves your machine, in any state.** Speech *recognition* is always local. Speech *synthesis* is local by default (Kokoro or Piper); the only way any voice data leaves the machine is if you **opt into the AWS Polly TTS backend**, which sends the assistant's *reply text* (never your microphone audio) to AWS for synthesis — see [Text-to-speech backends](#text-to-speech-backends).
 
 ### Where do speech-to-text and text-to-speech run?
 
 - **Speech-to-text:** [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (via [`whisper-rs`](https://github.com/tazz4843/whisper-rs)), running the Whisper **distil-large-v3** model **in-process, on your own CPU**. Your voice is transcribed locally.
-- **Text-to-speech:** [Piper](https://github.com/rhasspy/piper) — a **neural (VITS) on-device** synthesizer. This is *not* eSpeak / formant synthesis; replies are spoken with a real neural voice, locally.
+- **Text-to-speech:** pluggable via `tts.backend`. The **default is [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** — a neural model running **on-device** (ONNX, roughly real-time on CPU). [Piper](https://github.com/rhasspy/piper) is an alternative local neural voice. **AWS Polly** (cloud) is available opt-in for its generative voices — see [Text-to-speech backends](#text-to-speech-backends). Only Polly sends text off-device; the local backends keep everything on your machine.
 
 ### What actually leaves the machine?
 
@@ -59,7 +59,9 @@ Ports-and-adapters (hexagonal). `core` defines the domain, the state machine, an
 | `wake-rustpotter` | wake-word detection | [rustpotter](https://github.com/GiviMAD/rustpotter) (`hey-adele.rpw`) |
 | `vad-silero` | voice-activity detection | [Silero VAD](https://github.com/snakers4/silero-vad) (ONNX) |
 | `stt-whisper` | speech-to-text | whisper.cpp (distil-large-v3) |
-| `tts-piper` | text-to-speech | Piper |
+| `tts-kokoro` | text-to-speech (**default**) | [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (ONNX, local) |
+| `tts-piper` | text-to-speech | [Piper](https://github.com/rhasspy/piper) (local) |
+| `tts-polly` | text-to-speech | [AWS Polly](https://aws.amazon.com/polly/) (cloud, opt-in) |
 | `assistant-dbus` | send prompts / receive streamed responses | zbus → `org.desktopAssistant.Conversations` |
 | `dbus-interface` | control + status surface | zbus ← `org.desktopAssistant.Voice` |
 | `daemon` | wires the pipeline together | — |
@@ -75,8 +77,55 @@ The daemon owns **`org.desktopAssistant.Voice`** at `/org/desktopAssistant/Voice
 | `PushToTalk()` | method | skip the wake word, start listening now |
 | `StopSpeaking()` | method | cancel current playback |
 | `StateChanged` / `TranscriptReady` / `SpeakingText` | signals | UI updates |
+| `SayText(s)` | method | speak text with the on-device voice — for **any** app, no orchestrator involved |
+| `SynthesizeText(s) → ay` | method | return spoken text as WAV bytes (the caller routes its own audio) |
+| `ListVoices() → a(sssu)` · `GetVoice() → si` · `SetVoice(si)` | methods | enumerate / read / switch the active voice at runtime |
 
-If the voice service isn't running, this name simply isn't on the bus — so dependent UI should degrade gracefully.
+**TTS is independent of the assistant orchestrator.** `SayText` and `SynthesizeText` are handled **directly by this daemon** — they synthesize speech without ever contacting `org.desktopAssistant.Conversations` or any LLM. Other apps (an accessibility tool, or a future Orca / speech-dispatcher shim) can therefore use the on-device voice purely as a system TTS service. If the voice service isn't running, the name simply isn't on the bus — so dependent UI should degrade gracefully.
+
+## Text-to-speech backends
+
+TTS is a swappable adapter chosen at startup via `tts.backend` in `~/.config/adele-voice/config.toml`. The default is **Kokoro** — local, natural, and free.
+
+| Backend | Runs | Naturalness | Latency | Cost | Provision |
+|---|---|---|---|---|---|
+| **`kokoro`** (default) | on-device (ONNX) | high | ~real-time on CPU (RTF ≈ 0.7) | free | `just init-kokoro` (model + voices; needs `espeak-ng`) |
+| `piper` | on-device | good | very fast | free | `just init-piper` (voice; needs the `piper` binary) |
+| `polly` | **AWS cloud** | highest (generative) | network round-trip | per-character¹ | `just init-polly` (no model; AWS credentials) |
+
+¹ Polly bills per character of synthesized text — roughly ½–2¢ per spoken reply (~$16 / 1M chars neural, ~$30 / 1M generative). Your microphone audio is never sent; only the assistant's reply text.
+
+**Local-first, never billable by accident.** If the configured backend can't initialize, the daemon falls back to a **local** backend (Piper) — it will **never** switch to a billable cloud backend on its own. Run `adele-voice check-setup` to see what's available, what's configured, and the active voice.
+
+### Switching backend and voice
+
+```toml
+[tts]
+backend = "kokoro"             # "kokoro" | "piper" | "polly"
+
+# kokoro (default)
+kokoro_voice = "af_heart"      # any <name>.bin in the voices dir; af_*/am_* = US, bf_*/bm_* = GB
+kokoro_lang  = "en-us"
+
+# piper
+# model_path = "~/.local/share/adele-voice/models/en_US-amy-medium.onnx"
+
+# polly (cloud, opt-in)
+# polly_voice  = "Ruth"
+# polly_engine = "generative"  # "neural" (cheaper, every region) | "generative" (most natural)
+# polly_region = "us-east-1"
+```
+
+The active voice can also be changed **at runtime** — without editing config — through the D-Bus voice API (`ListVoices` / `GetVoice` / `SetVoice`), which the KDE and GTK clients surface as a dropdown.
+
+**Polly credentials** come from the standard AWS chain (env vars, a shared profile, STS, or IMDS). For the systemd service, point it at a profile with a drop-in (SSO / `credential_process` providers are excluded from the build — use a static-key or STS profile):
+
+```ini
+# ~/.config/systemd/user/adele-voice.service.d/aws.conf
+[Service]
+Environment=AWS_PROFILE=myprofile
+Environment=AWS_REGION=us-east-1
+```
 
 ## Install & run
 
