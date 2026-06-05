@@ -6,7 +6,10 @@ use tracing_subscriber::EnvFilter;
 
 mod config;
 mod pipeline;
+mod tts_backend;
 mod tts_service;
+
+use tts_backend::TtsBackend;
 
 use adele_voice_assistant_dbus::DbusAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
@@ -15,6 +18,7 @@ use adele_voice_core::ports::audio::AudioSink;
 use adele_voice_dbus_interface::{DbusVoiceAdapter, TtsCommand};
 use adele_voice_stt_whisper::WhisperStt;
 use adele_voice_tts_piper::PiperTts;
+use adele_voice_tts_polly::PollyTts;
 use adele_voice_vad_silero::SileroVad;
 use adele_voice_wake_rustpotter::RustpotterWakeWordDetector;
 
@@ -36,7 +40,32 @@ async fn main() -> Result<()> {
     )?;
     let vad = SileroVad::new(&config.vad.model_path)?;
     let stt = WhisperStt::new(&config.stt.model_path, &config.stt.language)?;
-    let tts = PiperTts::new(&config.tts.piper_binary, &config.tts.model_path);
+    let tts = match config.tts.backend.as_str() {
+        "polly" => {
+            tracing::info!(
+                voice = %config.tts.polly_voice,
+                engine = %config.tts.polly_engine,
+                "using AWS Polly TTS backend"
+            );
+            TtsBackend::Polly(
+                PollyTts::new(
+                    &config.tts.polly_voice,
+                    &config.tts.polly_engine,
+                    config.tts.polly_region.clone(),
+                )
+                .await,
+            )
+        }
+        other => {
+            if other != "piper" {
+                tracing::warn!(backend = %other, "unknown tts.backend, falling back to piper");
+            }
+            TtsBackend::Piper(PiperTts::new(
+                &config.tts.piper_binary,
+                &config.tts.model_path,
+            ))
+        }
+    };
     let assistant = DbusAssistantGateway::connect().await?;
 
     let source = Arc::new(CpalAudioSource::new(&config.audio.input_device));
