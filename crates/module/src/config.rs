@@ -37,10 +37,18 @@ pub struct TtsConfig {
     pub model_path: PathBuf,
     /// Polly voice id (e.g. "Joanna", "Ruth", "Matthew") when backend = "polly".
     pub polly_voice: String,
-    /// Polly engine: "neural" (default), "generative" (most natural), "long-form", or "standard".
+    /// Polly engine: "neural" (default), "generative" (most natural),
+    /// "long-form", or "standard". Cost rises sharply per 1M characters of
+    /// synthesized text: standard ≈ $4, neural ≈ $16, generative ≈ $30 (~2×
+    /// neural), long-form ≈ $100 — so "generative"/"long-form" are the pricier
+    /// choices.
     pub polly_engine: String,
     /// AWS region for Polly; falls back to the AWS credential chain when unset.
     pub polly_region: Option<String>,
+    /// AWS profile for Polly credentials (default "adele", matching the
+    /// orchestrator's Bedrock connector). Set to an empty string to use the
+    /// ambient AWS environment/IMDS chain instead of a named profile.
+    pub polly_profile: Option<String>,
     /// Kokoro ONNX model path (when backend = "kokoro").
     pub kokoro_model_path: PathBuf,
     /// Directory of Kokoro voice `.bin` files (one per voice).
@@ -88,6 +96,7 @@ impl Default for TtsConfig {
             polly_voice: "Joanna".into(),
             polly_engine: "neural".into(),
             polly_region: None,
+            polly_profile: Some("adele".into()),
             kokoro_model_path: models_dir().join("kokoro.onnx"),
             kokoro_voices_dir: models_dir().join("kokoro-voices"),
             kokoro_voice: "af_heart".into(),
@@ -114,6 +123,7 @@ mod tests {
         assert_eq!(VadConfig::default().silence_duration_ms, 800);
         assert_eq!(SttConfig::default().language, "en");
         assert_eq!(TtsConfig::default().backend, "kokoro");
+        assert_eq!(TtsConfig::default().polly_profile.as_deref(), Some("adele"));
     }
 
     #[test]
@@ -122,5 +132,8 @@ mod tests {
         assert_eq!(cfg.backend, "piper");
         // Unspecified fields fall back to defaults.
         assert_eq!(cfg.kokoro_voice, "af_heart");
+        // Polly profile defaults to "adele" (matching the Bedrock connector)
+        // even when the config omits it — pre-existing configs keep working.
+        assert_eq!(cfg.polly_profile.as_deref(), Some("adele"));
     }
 }

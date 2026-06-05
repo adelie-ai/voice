@@ -25,11 +25,21 @@ pub struct PollyTts {
 }
 
 impl PollyTts {
-    /// Build a Polly client. `region` overrides the AWS-chain default when set.
-    pub async fn new(voice_id: &str, engine: &str, region: Option<String>) -> Self {
+    /// Build a Polly client. `region` overrides the AWS-chain default when set;
+    /// `profile` selects a named AWS credentials profile (an empty or `None`
+    /// profile falls back to the ambient env/IMDS chain).
+    pub async fn new(
+        voice_id: &str,
+        engine: &str,
+        region: Option<String>,
+        profile: Option<String>,
+    ) -> Self {
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(r) = region {
             loader = loader.region(aws_config::Region::new(r));
+        }
+        if let Some(p) = profile.filter(|p| !p.is_empty()) {
+            loader = loader.profile_name(p);
         }
         let shared = loader.load().await;
         let client = aws_sdk_polly::Client::new(&shared);
