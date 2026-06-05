@@ -9,6 +9,7 @@ use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
+use adele_voice_dbus_interface::StopRequest;
 use tokio::sync::{mpsc, watch};
 
 /// Compose the prompt sent to the assistant: when a spoken-response hint is
@@ -33,6 +34,51 @@ fn is_error_response(text: &str) -> bool {
     text.to_ascii_lowercase().contains("llm error")
 }
 
+/// Outcome of handling one captured utterance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UtteranceOutcome {
+    /// Normal turn — the run loop decides whether to keep listening (in
+    /// conversation mode) or return to wake-word idle.
+    Continue,
+    /// The user spoke a stop phrase — end the conversation now, whatever the mode.
+    EndConversation,
+}
+
+/// Whole-utterance "stop listening" phrases, matched only against the entire
+/// normalized transcript (so "stop" inside a sentence isn't a command). Lets the
+/// user end a conversation hands-free.
+fn is_stop_phrase(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !matches!(c, '.' | ',' | '!' | '?'))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    matches!(
+        normalized.as_str(),
+        "stop"
+            | "stop listening"
+            | "stop listening adele"
+            | "stop adele"
+            | "never mind"
+            | "nevermind"
+            | "that's all"
+            | "thats all"
+            | "that is all"
+            | "that'll be all"
+            | "goodbye"
+            | "good bye"
+            | "cancel"
+            | "we're done"
+            | "were done"
+            | "i'm done"
+            | "im done"
+    )
+}
+
 pub struct Pipeline<W, V, S, T, A>
 where
     W: WakeWordDetector + 'static,
@@ -51,7 +97,7 @@ where
     state_tx: watch::Sender<State>,
     enabled_rx: watch::Receiver<bool>,
     ptt_rx: mpsc::Receiver<Option<String>>,
-    stop_rx: mpsc::Receiver<()>,
+    stop_rx: mpsc::Receiver<StopRequest>,
     conversation_id: Option<String>,
     /// When a push-to-talk specified a target conversation, its orchestrator
     /// id. Set on `PushToTalkInConversation`, used by `process_utterance` to
@@ -88,7 +134,7 @@ where
         state_tx: watch::Sender<State>,
         enabled_rx: watch::Receiver<bool>,
         ptt_rx: mpsc::Receiver<Option<String>>,
-        stop_rx: mpsc::Receiver<()>,
+        stop_rx: mpsc::Receiver<StopRequest>,
         conversation_title: String,
         silence_duration: Duration,
         speech_threshold: f32,
@@ -175,12 +221,31 @@ where
                     }
                 }
 
-                // Stop speaking
-                Some(()) = self.stop_rx.recv() => {
-                    if state == State::Speaking {
-                        self.sink.stop()?;
-                        state = State::Idle;
-                        self.set_state(state);
+                // Stop: cancel current playback (Speaking) or end the whole
+                // conversation and return to wake-word idle.
+                Some(req) = self.stop_rx.recv() => {
+                    match req {
+                        StopRequest::Speaking => {
+                            if state == State::Speaking {
+                                self.sink.stop()?;
+                                state = State::Idle;
+                                self.set_state(state);
+                            }
+                        }
+                        StopRequest::Conversation => {
+                            // "Stop listening": end the session now without
+                            // waiting out the silence timeout.
+                            if state != State::Idle {
+                                let _ = self.sink.stop();
+                                state = State::Idle;
+                                self.set_state(state);
+                            }
+                            self.conversation_id = None;
+                            self.ptt_conversation_override = None;
+                            speech_buffer.clear();
+                            last_speech_at = None;
+                            followup_deadline = None;
+                        }
                     }
                 }
 
@@ -254,9 +319,19 @@ where
 
                                     // Spawn transcription + response pipeline
                                     let samples = std::mem::take(&mut speech_buffer);
-                                    self.process_utterance(samples).await?;
+                                    let outcome = self.process_utterance(samples).await?;
 
-                                    if self.conversation_mode {
+                                    if outcome == UtteranceOutcome::EndConversation {
+                                        // A voice "stop" command ends the
+                                        // conversation regardless of mode.
+                                        state = State::Idle;
+                                        self.set_state(state);
+                                        self.conversation_id = None;
+                                        self.ptt_conversation_override = None;
+                                        speech_buffer.clear();
+                                        last_speech_at = None;
+                                        followup_deadline = None;
+                                    } else if self.conversation_mode {
                                         // Re-open the mic for a follow-up turn:
                                         // wait for the reply to finish playing,
                                         // then drop any audio captured during
@@ -336,7 +411,7 @@ where
         Ok(())
     }
 
-    async fn process_utterance(&mut self, samples: Vec<f32>) -> anyhow::Result<()> {
+    async fn process_utterance(&mut self, samples: Vec<f32>) -> anyhow::Result<UtteranceOutcome> {
         // Discard near-silent captures before they reach STT. Ambient noise or
         // the tail of our own playback can trip the VAD without containing real
         // speech, and Whisper then hallucinates filler ("Thank you.") — which in
@@ -352,7 +427,26 @@ where
         tracing::info!(rms, samples = samples.len(), "utterance captured");
         if rms < MIN_SPEECH_RMS {
             tracing::info!(rms, "discarding near-silent capture (no speech)");
-            return Ok(());
+            return Ok(UtteranceOutcome::Continue);
+        }
+
+        // Transcribe first, so a "stop" command ends the conversation without
+        // creating or poking the orchestrator conversation.
+        let transcript = self.stt.transcribe(&samples).await?;
+        if transcript.text.is_empty() {
+            tracing::debug!("empty transcript, skipping");
+            return Ok(UtteranceOutcome::Continue);
+        }
+        tracing::info!(text = %transcript.text, "transcribed");
+
+        // A whole-utterance stop phrase ("stop", "never mind", "that's all", …)
+        // ends the conversation hands-free: acknowledge briefly and return to
+        // wake-word idle instead of sending it to the assistant.
+        if is_stop_phrase(&transcript.text) {
+            tracing::info!(text = %transcript.text, "stop phrase — ending conversation");
+            self.set_state(State::Speaking);
+            self.speak_sentence("Okay.").await?;
+            return Ok(UtteranceOutcome::EndConversation);
         }
 
         // Resolve the target conversation. A push-to-talk into a specific
@@ -374,14 +468,6 @@ where
             }
             self.conversation_id.as_ref().unwrap().clone()
         };
-
-        // Transcribe
-        let transcript = self.stt.transcribe(&samples).await?;
-        if transcript.text.is_empty() {
-            tracing::debug!("empty transcript, skipping");
-            return Ok(());
-        }
-        tracing::info!(text = %transcript.text, "transcribed");
 
         // Subscribe to response signals
         let mut signal_rx = self.assistant.subscribe().await?;
@@ -472,7 +558,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(UtteranceOutcome::Continue)
     }
 
     async fn speak_sentence(&self, text: &str) -> anyhow::Result<()> {
@@ -522,6 +608,91 @@ mod tests {
     }
 
     #[test]
+    fn stop_phrases_match_whole_utterance_only() {
+        assert!(is_stop_phrase("stop"));
+        assert!(is_stop_phrase("Stop listening."));
+        assert!(is_stop_phrase("never mind"));
+        assert!(is_stop_phrase("That's all!"));
+        assert!(is_stop_phrase("goodbye"));
+        // Not a command when it's only part of a real request.
+        assert!(!is_stop_phrase("stop the timer"));
+        assert!(!is_stop_phrase("what should I never mind about?"));
+        assert!(!is_stop_phrase("tell me a story"));
+    }
+
+    #[tokio::test]
+    async fn stop_phrase_ends_conversation_without_prompting() {
+        // A whole-utterance "stop" must end the conversation — even in
+        // conversation mode — and must NOT be sent to the assistant.
+        let mut h = spawn_pipeline(Cfg {
+            stt_text: "stop".to_string(),
+            conversation_mode: true,
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process
+
+        // Conversation mode would normally re-listen; a stop phrase returns to Idle.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("stop phrase returns to Idle")
+        .unwrap();
+        h.handle.abort();
+        assert!(
+            h.prompt_rx.try_recv().is_err(),
+            "a stop phrase must not be sent to the assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_listening_ends_an_active_conversation() {
+        // StopListening (StopRequest::Conversation) ends a live conversation-mode
+        // follow-up immediately, returning to wake-word idle.
+        let mut h = spawn_pipeline(Cfg {
+            conversation_mode: true,
+            followup_timeout: Duration::from_secs(30),
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process -> re-listen
+        // Wait until the first turn actually reached the assistant, so the
+        // conversation is genuinely active before we stop it.
+        tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("first turn prompted")
+            .expect("prompt sender open");
+
+        h.stop_tx.send(StopRequest::Conversation).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("StopListening -> Idle")
+        .unwrap();
+        h.handle.abort();
+    }
+
+    #[test]
     fn compose_prompt_empty_hint_is_bare_transcript() {
         assert_eq!(compose_prompt("", "hello"), "hello");
         assert_eq!(compose_prompt("   ", "hello"), "hello");
@@ -556,6 +727,7 @@ mod tests {
     /// returns a non-empty transcript so the response cycle proceeds.
     struct FakeStt {
         hit: mpsc::UnboundedSender<()>,
+        text: String,
     }
     impl SpeechToText for FakeStt {
         async fn transcribe(
@@ -564,7 +736,7 @@ mod tests {
         ) -> Result<Transcript, adele_voice_core::VoiceError> {
             let _ = self.hit.send(());
             Ok(Transcript {
-                text: "hello".to_string(),
+                text: self.text.clone(),
             })
         }
     }
@@ -652,7 +824,7 @@ mod tests {
         audio_tx: mpsc::Sender<Vec<f32>>,
         ptt_tx: mpsc::Sender<Option<String>>,
         _enabled_tx: watch::Sender<bool>,
-        _stop_tx: mpsc::Sender<()>,
+        stop_tx: mpsc::Sender<StopRequest>,
         state_rx: watch::Receiver<State>,
         transcribe_rx: mpsc::UnboundedReceiver<()>,
         /// Conversation id each prompt was routed to.
@@ -670,6 +842,7 @@ mod tests {
         idle_exit_timeout: Option<Duration>,
         spoken_response_hint: String,
         vad: Vec<f32>,
+        stt_text: String,
     }
     impl Default for Cfg {
         fn default() -> Self {
@@ -681,6 +854,7 @@ mod tests {
                 idle_exit_timeout: None,
                 spoken_response_hint: String::new(),
                 vad: vec![0.9],
+                stt_text: "hello".to_string(),
             }
         }
     }
@@ -702,7 +876,10 @@ mod tests {
             FakeVad {
                 probs: StdMutex::new(VecDeque::from(cfg.vad)),
             },
-            FakeStt { hit: hit_tx },
+            FakeStt {
+                hit: hit_tx,
+                text: cfg.stt_text,
+            },
             FakeTts,
             FakeAssistant {
                 tx: StdMutex::new(None),
@@ -732,7 +909,7 @@ mod tests {
             audio_tx,
             ptt_tx,
             _enabled_tx: enabled_tx,
-            _stop_tx: stop_tx,
+            stop_tx,
             state_rx,
             transcribe_rx,
             prompt_rx,
