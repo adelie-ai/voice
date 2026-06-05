@@ -9,7 +9,7 @@ members = [
     "crates/tts-piper",
     "crates/tts-polly",
     "crates/tts-kokoro",
-    "crates/assistant-dbus",
+    "crates/assistant-connector",
     "crates/dbus-interface",
     "crates/module",
     "crates/daemon",
@@ -34,6 +34,11 @@ adele-voice-stt-whisper = { path = "crates/stt-whisper" }
 adele-voice-tts-piper = { path = "crates/tts-piper" }
 adele-voice-tts-polly = { path = "crates/tts-polly" }
 adele-voice-tts-kokoro = { path = "crates/tts-kokoro" }
-adele-voice-assistant-dbus = { path = "crates/assistant-dbus" }
+adele-voice-assistant-connector = { path = "crates/assistant-connector" }
 adele-voice-dbus-interface = { path = "crates/dbus-interface" }
 adele-voice-module = { path = "crates/module" }
+
+# Cross-repo path-dep on the chat clients' shared transport layer (sibling
+# checkout; mirrors adele-gtk↔desktop-assistant). Gives the voice service the
+# `Connector` + every orchestrator transport (UDS/WS/D-Bus).
+desktop-assistant-client-common = { path = "../desktop-assistant/crates/client-common" }

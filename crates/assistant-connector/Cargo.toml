@@ -1,0 +1,14 @@
+[package]
+name = "adele-voice-assistant-connector"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+# Assistant gateway backed by desktop-assistant's transport-agnostic `Connector`,
+# so the voice service reaches the orchestrator over local UDS (default), remote
+# WebSocket, or D-Bus — instead of a bespoke zbus proxy.
+[dependencies]
+adele-voice-core.workspace = true
+desktop-assistant-client-common.workspace = true
+tokio = { workspace = true, features = ["sync", "rt"] }
+tracing.workspace = true

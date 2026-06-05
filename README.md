@@ -62,7 +62,7 @@ Ports-and-adapters (hexagonal). `core` defines the domain, the state machine, an
 | `tts-kokoro` | text-to-speech (**default**) | [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (ONNX, local) |
 | `tts-piper` | text-to-speech | [Piper](https://github.com/rhasspy/piper) (local) |
 | `tts-polly` | text-to-speech | [AWS Polly](https://aws.amazon.com/polly/) (cloud, opt-in) |
-| `assistant-dbus` | send prompts / receive streamed responses | zbus → `org.desktopAssistant.Conversations` |
+| `assistant-connector` | send prompts / receive streamed responses | client-common `Connector` → UDS / WS / D-Bus |
 | `dbus-interface` | control + status surface | zbus ← `org.desktopAssistant.Voice` |
 | `module` | embeddable on-demand voice (`Dictation` + `Speaker`) | reuses the adapters above |
 | `daemon` | the system **service** — consumes `module`, adds wake word + D-Bus | — |
@@ -97,6 +97,25 @@ speaker.say(&reply).await?;
 `build_dictation` / `build_speaker` take the same `[audio]` / `[vad]` / `[stt]` / `[tts]` config the daemon uses (re-exported as `adele_voice_module::config`), so a client gets the local-first backend selection (Kokoro → Piper fallback, **never** auto cloud) for free. The lower-level `Dictation` / `Speaker` / `Endpointer` / `Transcriber` / `TtsBackend` types are public too, for clients that manage their own audio devices. A client typically exposes this behind a config toggle (embedded vs. the daemon path), so a machine with no daemon still gets dictation and playback.
 
 **Dependency approach.** Clients **path-dep** the voice crates for now (mirroring the existing adele-gtk ↔ desktop-assistant path-dep); a published or git dependency can follow once the API settles.
+
+### Reaching the orchestrator
+
+The voice service sends prompts to the desktop-assistant orchestrator and streams replies back. It runs **wherever the microphone is** — which need not be where the orchestrator runs — so the transport is configurable via `[assistant] transport` in `~/.config/adele-voice/config.toml`, reusing the chat clients' shared transport layer (`Connector`):
+
+| `transport` | Reaches | Use |
+|---|---|---|
+| `uds` *(default)* | the local Unix socket (`$XDG_RUNTIME_DIR/adelie/sock`) | orchestrator on the same machine |
+| `ws` | a (possibly remote) WebSocket — set `ws_url` | the mic and the orchestrator are on different machines |
+| `dbus` | the local session bus (`org.desktopAssistant.Conversations`) | legacy local path |
+
+```toml
+[assistant]
+transport = "uds"                            # "uds" (default) | "ws" | "dbus"
+# ws_url      = "wss://host:11339/ws"        # when transport = "ws"
+# socket_path = "/run/user/1000/adelie/sock" # override the default UDS path
+```
+
+The local UDS and WebSocket transports carry the per-request spoken-response hint as a native field; the legacy D-Bus transport folds it into the prompt. A bearer token is minted automatically via the local D-Bus minter (the same path the chat clients use); for a remote `ws` daemon, set `ws_jwt` or `ws_login_username` / `ws_login_password`.
 
 ## D-Bus control surface
 

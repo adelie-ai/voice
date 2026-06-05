@@ -1,3 +1,4 @@
+use adele_voice_assistant_connector::{ConnectionConfig, TransportMode};
 use adele_voice_module::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -38,6 +39,24 @@ pub struct AssistantConfig {
     /// Instruction prepended to each spoken prompt so the assistant keeps
     /// replies short, conversational, and read-aloud friendly. Empty disables.
     pub spoken_response_hint: String,
+    /// Transport used to reach the orchestrator: `"uds"` (the default — the
+    /// local Unix socket), `"ws"` (a possibly-remote WebSocket), or `"dbus"`
+    /// (legacy local D-Bus). The voice service runs wherever the microphone is,
+    /// which may not be where the orchestrator runs (voice#31).
+    pub transport: String,
+    /// WebSocket URL when `transport = "ws"`, e.g. `"wss://host:11339/ws"`.
+    pub ws_url: Option<String>,
+    /// Local socket path when `transport = "uds"`; unset resolves to
+    /// `$XDG_RUNTIME_DIR/adelie/sock`.
+    pub socket_path: Option<PathBuf>,
+    /// Pre-minted bearer JWT for ws/uds; unset mints one via the local D-Bus
+    /// token minter (the same path the chat clients use locally).
+    pub ws_jwt: Option<String>,
+    /// Username/password for the WebSocket `/login` token fallback.
+    pub ws_login_username: Option<String>,
+    pub ws_login_password: Option<String>,
+    /// PEM CA certificate to trust for `wss://` (defaults to the daemon's CA).
+    pub tls_ca_cert: Option<PathBuf>,
 }
 
 impl Default for WakeWordConfig {
@@ -57,7 +76,50 @@ impl Default for AssistantConfig {
             conversation_mode: false,
             followup_timeout_ms: 8000,
             spoken_response_hint: "You are Adele, responding by voice. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. Answer directly and naturally — do not restate or paraphrase the question back before answering; just respond. Only if a message is clearly garbled or you truly cannot tell what was meant should you briefly check (e.g. 'did you mean X?') or ask one short clarifying question. Your reply will be read aloud, so keep it brief, conversational, and relevant — never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points, then ask whether they'd like more. If they ask for more, you may expand but stay under about ten sentences. Let the user lead — invite follow-ups and let them steer. Avoid markdown, lists, code blocks, and emoji.".into(),
+            transport: "uds".into(),
+            ws_url: None,
+            socket_path: None,
+            ws_jwt: None,
+            ws_login_username: None,
+            ws_login_password: None,
+            tls_ca_cert: None,
         }
+    }
+}
+
+impl AssistantConfig {
+    /// Build the client-common connection config from the `[assistant]`
+    /// transport settings, defaulting to the local UDS transport. Unset fields
+    /// fall back to client-common's defaults (e.g. the standard CA path).
+    pub fn connection_config(&self) -> ConnectionConfig {
+        let transport_mode = match self.transport.to_ascii_lowercase().as_str() {
+            "ws" | "websocket" => TransportMode::Ws,
+            "dbus" => TransportMode::Dbus,
+            _ => TransportMode::Uds, // "uds" / "local" / anything else
+        };
+        let mut config = ConnectionConfig {
+            transport_mode,
+            ..ConnectionConfig::default()
+        };
+        if let Some(url) = &self.ws_url {
+            config.ws_url = url.clone();
+        }
+        if self.socket_path.is_some() {
+            config.socket_path = self.socket_path.clone();
+        }
+        if self.ws_jwt.is_some() {
+            config.ws_jwt = self.ws_jwt.clone();
+        }
+        if self.ws_login_username.is_some() {
+            config.ws_login_username = self.ws_login_username.clone();
+        }
+        if self.ws_login_password.is_some() {
+            config.ws_login_password = self.ws_login_password.clone();
+        }
+        if self.tls_ca_cert.is_some() {
+            config.tls_ca_cert = self.tls_ca_cert.clone();
+        }
+        config
     }
 }
 
@@ -117,5 +179,33 @@ speech_threshold = 0.7
         // Defaults for unspecified fields
         assert_eq!(config.audio.output_device, "default");
         assert_eq!(config.stt.language, "en");
+    }
+
+    #[test]
+    fn defaults_to_local_uds_transport() {
+        let config = AssistantConfig::default();
+        assert_eq!(config.transport, "uds");
+        assert_eq!(
+            config.connection_config().transport_mode,
+            TransportMode::Uds
+        );
+    }
+
+    #[test]
+    fn transport_selection_maps_to_connection_config() {
+        let ws = AssistantConfig {
+            transport: "ws".into(),
+            ws_url: Some("wss://host:11339/ws".into()),
+            ..AssistantConfig::default()
+        };
+        let cfg = ws.connection_config();
+        assert_eq!(cfg.transport_mode, TransportMode::Ws);
+        assert_eq!(cfg.ws_url, "wss://host:11339/ws");
+
+        let dbus = AssistantConfig {
+            transport: "dbus".into(),
+            ..AssistantConfig::default()
+        };
+        assert_eq!(dbus.connection_config().transport_mode, TransportMode::Dbus);
     }
 }
