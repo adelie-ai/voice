@@ -8,6 +8,7 @@ members = [
     "crates/stt-whisper",
     "crates/tts-piper",
     "crates/tts-polly",
+    "crates/tts-kokoro",
     "crates/assistant-dbus",
     "crates/dbus-interface",
     "crates/daemon",
@@ -31,5 +32,6 @@ adele-voice-vad-silero = { path = "crates/vad-silero" }
 adele-voice-stt-whisper = { path = "crates/stt-whisper" }
 adele-voice-tts-piper = { path = "crates/tts-piper" }
 adele-voice-tts-polly = { path = "crates/tts-polly" }
+adele-voice-tts-kokoro = { path = "crates/tts-kokoro" }
 adele-voice-assistant-dbus = { path = "crates/assistant-dbus" }
 adele-voice-dbus-interface = { path = "crates/dbus-interface" }

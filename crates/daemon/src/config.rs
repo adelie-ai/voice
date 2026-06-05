@@ -59,6 +59,14 @@ pub struct TtsConfig {
     pub polly_engine: String,
     /// AWS region for Polly; falls back to the AWS credential chain when unset.
     pub polly_region: Option<String>,
+    /// Kokoro ONNX model path (when backend = "kokoro").
+    pub kokoro_model_path: PathBuf,
+    /// Directory of Kokoro voice `.bin` files (one per voice).
+    pub kokoro_voices_dir: PathBuf,
+    /// Kokoro voice name — a `<name>.bin` in the voices dir, e.g. "af_heart".
+    pub kokoro_voice: String,
+    /// espeak-ng language for Kokoro phonemization, e.g. "en-us" or "en-gb".
+    pub kokoro_lang: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,12 +128,16 @@ impl Default for TtsConfig {
     fn default() -> Self {
         let data_dir = dirs_path("adele-voice/models");
         Self {
-            backend: "piper".into(),
+            backend: "kokoro".into(),
             piper_binary: "piper".into(),
             model_path: data_dir.join("en_US-amy-medium.onnx"),
             polly_voice: "Joanna".into(),
             polly_engine: "neural".into(),
             polly_region: None,
+            kokoro_model_path: data_dir.join("kokoro.onnx"),
+            kokoro_voices_dir: data_dir.join("kokoro-voices"),
+            kokoro_voice: "af_heart".into(),
+            kokoro_lang: "en-us".into(),
         }
     }
 }

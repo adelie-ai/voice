@@ -16,6 +16,7 @@ adele-voice-vad-silero.workspace = true
 adele-voice-stt-whisper.workspace = true
 adele-voice-tts-piper.workspace = true
 adele-voice-tts-polly.workspace = true
+adele-voice-tts-kokoro.workspace = true
 adele-voice-assistant-dbus.workspace = true
 adele-voice-dbus-interface.workspace = true
 anyhow.workspace = true

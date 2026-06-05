@@ -12,6 +12,7 @@ use adele_voice_core::domain::SAMPLE_RATE;
 use adele_voice_core::ports::audio::AudioSink;
 use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_dbus_interface::TtsCommand;
+use adele_voice_tts_kokoro::KokoroTts;
 use adele_voice_tts_piper::{DEFAULT_PIPER_SAMPLE_RATE, PiperTts};
 use tokio::sync::mpsc;
 
@@ -47,6 +48,7 @@ pub async fn run_tts_service(
                 let voices = match &*tts {
                     TtsBackend::Piper(_) => list_voices(&models_dir),
                     TtsBackend::Polly(_) => polly_voices(),
+                    TtsBackend::Kokoro(k) => kokoro_voices(k),
                 };
                 let _ = reply.send(voices);
             }
@@ -62,6 +64,7 @@ pub async fn run_tts_service(
                         (id, speaker.map(|s| s as i32).unwrap_or(-1))
                     }
                     TtsBackend::Polly(p) => (p.current_voice().0, -1),
+                    TtsBackend::Kokoro(k) => (k.current_voice(), -1),
                 };
                 let _ = reply.send(id_speaker);
             }
@@ -77,6 +80,7 @@ pub async fn run_tts_service(
                         p.set_voice(&voice_id, &engine);
                         Ok(())
                     }
+                    TtsBackend::Kokoro(k) => k.set_voice(&voice_id).map_err(|e| e.to_string()),
                 };
                 let _ = reply.send(result);
             }
@@ -170,6 +174,21 @@ fn polly_voices() -> Vec<(String, String, String, u32)> {
         )
     })
     .collect()
+}
+
+/// List Kokoro voices (the `*.bin` files in the voices dir) for the switcher.
+fn kokoro_voices(tts: &KokoroTts) -> Vec<(String, String, String, u32)> {
+    tts.list_voices()
+        .into_iter()
+        .map(|name| {
+            let lang = if name.starts_with('b') {
+                "en_GB"
+            } else {
+                "en_US"
+            };
+            (name.clone(), name, lang.to_string(), 1u32)
+        })
+        .collect()
 }
 
 /// Read a voice's `.onnx.json`, returning (name, language, num_speakers,
