@@ -15,7 +15,7 @@ use adele_voice_assistant_dbus::DbusAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
 use adele_voice_core::domain::State;
 use adele_voice_core::ports::audio::AudioSink;
-use adele_voice_dbus_interface::{DbusVoiceAdapter, TtsCommand};
+use adele_voice_dbus_interface::{DbusVoiceAdapter, StopRequest, TtsCommand};
 use adele_voice_stt_whisper::WhisperStt;
 use adele_voice_tts_kokoro::KokoroTts;
 use adele_voice_tts_piper::PiperTts;
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
     let (enabled_tx, enabled_rx) = tokio::sync::watch::channel(true);
     // PTT payload: the target conversation id (None = the daemon's own session).
     let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
-    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<StopRequest>(1);
 
     // Text-to-speech service backing SayText/SynthesizeText and voice
     // selection. Shares the pipeline's Piper instance (PiperTts clones share

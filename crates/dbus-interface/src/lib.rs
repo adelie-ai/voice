@@ -40,13 +40,23 @@ pub enum TtsCommand {
 /// so the mic button in a chat window dictates into that chat.
 pub type PttRequest = Option<String>;
 
+/// How to interrupt the pipeline. `Speaking` cancels current playback
+/// (barge-in) but leaves a conversation-mode session listening; `Conversation`
+/// ends the whole interaction — stop any playback and return to wake-word idle,
+/// clearing the session so a follow-up doesn't keep listening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequest {
+    Speaking,
+    Conversation,
+}
+
 /// D-Bus adapter exposing org.desktopAssistant.Voice.
 pub struct DbusVoiceAdapter {
     state_rx: watch::Receiver<State>,
     enabled_tx: Arc<watch::Sender<bool>>,
     enabled_rx: watch::Receiver<bool>,
     ptt_tx: mpsc::Sender<PttRequest>,
-    stop_tx: mpsc::Sender<()>,
+    stop_tx: mpsc::Sender<StopRequest>,
     tts_tx: mpsc::Sender<TtsCommand>,
 }
 
@@ -56,7 +66,7 @@ impl DbusVoiceAdapter {
         enabled_tx: watch::Sender<bool>,
         enabled_rx: watch::Receiver<bool>,
         ptt_tx: mpsc::Sender<PttRequest>,
-        stop_tx: mpsc::Sender<()>,
+        stop_tx: mpsc::Sender<StopRequest>,
         tts_tx: mpsc::Sender<TtsCommand>,
     ) -> Self {
         Self {
@@ -117,12 +127,25 @@ impl DbusVoiceAdapter {
         Ok(())
     }
 
-    /// Stop any ongoing speech playback.
+    /// Stop any ongoing speech playback (barge-in). A conversation-mode session
+    /// keeps listening afterward; use `StopListening` to end it.
     async fn stop_speaking(&self) -> fdo::Result<()> {
         self.stop_tx
-            .send(())
+            .send(StopRequest::Speaking)
             .await
             .map_err(|e| fdo::Error::Failed(format!("failed to stop speaking: {e}")))?;
+        Ok(())
+    }
+
+    /// End the current conversation: stop any playback and return to wake-word
+    /// idle, clearing the session so a conversation-mode follow-up stops
+    /// listening. Lets a client "stop listening" without waiting out the silence
+    /// timeout.
+    async fn stop_listening(&self) -> fdo::Result<()> {
+        self.stop_tx
+            .send(StopRequest::Conversation)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to stop listening: {e}")))?;
         Ok(())
     }
 
