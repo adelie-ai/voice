@@ -12,16 +12,6 @@ use adele_voice_core::sentence_buffer::SentenceBuffer;
 use adele_voice_dbus_interface::StopRequest;
 use tokio::sync::{mpsc, watch};
 
-/// Compose the prompt sent to the assistant: when a spoken-response hint is
-/// configured, prepend it so the reply stays short and conversational.
-fn compose_prompt(hint: &str, transcript: &str) -> String {
-    if hint.trim().is_empty() {
-        transcript.to_string()
-    } else {
-        format!("{hint}\n\n{transcript}")
-    }
-}
-
 /// Spoken when the assistant turn fails — short and human, never the raw error.
 const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
 
@@ -472,12 +462,19 @@ where
         // Subscribe to response signals
         let mut signal_rx = self.assistant.subscribe().await?;
 
-        // Send prompt, prefixed with the spoken-response hint so the reply
-        // stays short and conversational for read-aloud.
-        let prompt = compose_prompt(&self.spoken_response_hint, &transcript.text);
+        // Send the CLEAN transcript as the user message and pass the
+        // spoken-response hint as a per-request system_refinement, so the reply
+        // stays short and conversational for read-aloud WITHOUT the blurb
+        // polluting the visible chat transcript. The gateway falls back to
+        // prepending the hint (the pre-#200 behaviour) when the orchestrator
+        // lacks the refinement-aware method.
         let request_id = self
             .assistant
-            .send_prompt(&conversation_id, &prompt)
+            .send_prompt_with_system_refinement(
+                &conversation_id,
+                &transcript.text,
+                &self.spoken_response_hint,
+            )
             .await?;
 
         // Stream response through sentence buffer → TTS → speaker
@@ -582,14 +579,6 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     #[test]
-    fn compose_prompt_prepends_hint() {
-        assert_eq!(
-            compose_prompt("Be brief.", "what's the weather?"),
-            "Be brief.\n\nwhat's the weather?"
-        );
-    }
-
-    #[test]
     fn detects_orchestrator_error_responses() {
         // An LLM failure surfaced as reply text must be recognized so the
         // daemon apologizes instead of reading the raw error aloud.
@@ -692,12 +681,6 @@ mod tests {
         h.handle.abort();
     }
 
-    #[test]
-    fn compose_prompt_empty_hint_is_bare_transcript() {
-        assert_eq!(compose_prompt("", "hello"), "hello");
-        assert_eq!(compose_prompt("   ", "hello"), "hello");
-    }
-
     struct FakeWake {
         detects: bool,
     }
@@ -748,15 +731,54 @@ mod tests {
         }
     }
 
+    /// What the pipeline handed to the assistant gateway for one turn.
+    /// Captures the target conversation plus the split between the
+    /// user-visible `prompt` and the per-request `system_refinement`, so a
+    /// test can assert the clean transcript is the message and the hint
+    /// rides as the refinement.
+    #[derive(Debug, Clone)]
+    struct SentPrompt {
+        conversation_id: String,
+        prompt: String,
+        system_refinement: String,
+    }
+
     /// Assistant that completes immediately: `subscribe` hands back a receiver
-    /// and `send_prompt` pushes a matching `Complete` so `process_utterance`
-    /// returns without hanging. It records the conversation id each prompt was
-    /// sent to (via `prompt_tx`) so tests can assert PTT routing, and reports
-    /// the title of any conversation it created (via `created_tx`).
+    /// and each send method pushes a matching `Complete` so
+    /// `process_utterance` returns without hanging. It records every send
+    /// (via `prompt_tx`) so tests can assert PTT routing and the
+    /// prompt/refinement split, and reports the title of any conversation it
+    /// created (via `created_tx`).
     struct FakeAssistant {
         tx: StdMutex<Option<mpsc::UnboundedSender<AssistantEvent>>>,
-        prompt_tx: mpsc::UnboundedSender<String>,
+        prompt_tx: mpsc::UnboundedSender<SentPrompt>,
         created_tx: mpsc::UnboundedSender<String>,
+    }
+    impl FakeAssistant {
+        /// Shared recording + immediate-completion path for both send
+        /// methods. Records exactly what reached the gateway (target
+        /// conversation, the user-visible `prompt`, and the per-request
+        /// `system_refinement`) and pushes a matching `Complete`.
+        fn record_and_complete(
+            &self,
+            conversation_id: &str,
+            prompt: &str,
+            system_refinement: &str,
+        ) -> String {
+            let _ = self.prompt_tx.send(SentPrompt {
+                conversation_id: conversation_id.to_string(),
+                prompt: prompt.to_string(),
+                system_refinement: system_refinement.to_string(),
+            });
+            let request_id = "req".to_string();
+            if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                let _ = tx.send(AssistantEvent::Complete {
+                    request_id: request_id.clone(),
+                    full_response: "hello".to_string(),
+                });
+            }
+            request_id
+        }
     }
     impl AssistantGateway for FakeAssistant {
         async fn create_conversation(
@@ -769,17 +791,17 @@ mod tests {
         async fn send_prompt(
             &self,
             conversation_id: &str,
-            _prompt: &str,
+            prompt: &str,
         ) -> Result<String, adele_voice_core::VoiceError> {
-            let _ = self.prompt_tx.send(conversation_id.to_string());
-            let request_id = "req".to_string();
-            if let Some(tx) = self.tx.lock().unwrap().as_ref() {
-                let _ = tx.send(AssistantEvent::Complete {
-                    request_id: request_id.clone(),
-                    full_response: "hello".to_string(),
-                });
-            }
-            Ok(request_id)
+            Ok(self.record_and_complete(conversation_id, prompt, ""))
+        }
+        async fn send_prompt_with_system_refinement(
+            &self,
+            conversation_id: &str,
+            prompt: &str,
+            system_refinement: &str,
+        ) -> Result<String, adele_voice_core::VoiceError> {
+            Ok(self.record_and_complete(conversation_id, prompt, system_refinement))
         }
         async fn subscribe(
             &self,
@@ -827,8 +849,9 @@ mod tests {
         stop_tx: mpsc::Sender<StopRequest>,
         state_rx: watch::Receiver<State>,
         transcribe_rx: mpsc::UnboundedReceiver<()>,
-        /// Conversation id each prompt was routed to.
-        prompt_rx: mpsc::UnboundedReceiver<String>,
+        /// Every send the pipeline made (target conversation + the
+        /// prompt/refinement split).
+        prompt_rx: mpsc::UnboundedReceiver<SentPrompt>,
         /// Title of each conversation the daemon asked to create.
         created_rx: mpsc::UnboundedReceiver<String>,
         handle: tokio::task::JoinHandle<()>,
@@ -985,12 +1008,59 @@ mod tests {
             .expect("prompt sender open");
         h.handle.abort();
         assert_eq!(
-            routed, "chat-window-42",
+            routed.conversation_id, "chat-window-42",
             "the utterance must be routed to the conversation id the PTT supplied"
         );
         assert!(
             h.created_rx.try_recv().is_err(),
             "PTT-into-conversation must not create the daemon's own session"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_sends_clean_transcript_with_hint_as_system_refinement() {
+        // Core of the #200 voice follow-up: the pipeline must send the CLEAN
+        // transcript as the user-visible prompt and pass the configured
+        // spoken-response hint as the per-request system_refinement — NOT
+        // prepend the hint blurb into the message. That keeps the visible
+        // chat transcript free of the "respond briefly, by voice" boilerplate.
+        let mut h = spawn_pipeline(Cfg {
+            spoken_response_hint: "Respond briefly, by voice.".to_string(),
+            stt_text: "what's the weather?".to_string(),
+            ..Default::default()
+        });
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process
+
+        let sent = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("a prompt should be sent")
+            .expect("prompt sender open");
+        h.handle.abort();
+
+        // The user message is the clean transcript — no hint blurb folded in.
+        assert_eq!(
+            sent.prompt, "what's the weather?",
+            "the user-visible message must be the clean transcript"
+        );
+        assert!(
+            !sent.prompt.contains("Respond briefly"),
+            "the spoken-response hint must NOT be prepended to the prompt"
+        );
+        // The hint rides as the per-request system_refinement.
+        assert_eq!(
+            sent.system_refinement, "Respond briefly, by voice.",
+            "the configured hint must be passed as the per-request system_refinement"
         );
     }
 
@@ -1027,7 +1097,7 @@ mod tests {
             .expect("prompt sender open");
         h.handle.abort();
         assert_eq!(
-            routed, "own-session",
+            routed.conversation_id, "own-session",
             "a plain PTT must route to the daemon's own session id, not a caller conversation"
         );
     }
@@ -1057,7 +1127,7 @@ mod tests {
             .await
             .expect("first prompt")
             .expect("prompt sender open");
-        assert_eq!(first, "own-session");
+        assert_eq!(first.conversation_id, "own-session");
 
         tokio::time::timeout(
             Duration::from_secs(2),
@@ -1084,7 +1154,7 @@ mod tests {
         h.handle.abort();
 
         assert_eq!(
-            second, "own-session",
+            second.conversation_id, "own-session",
             "the second plain PTT must reuse the own session id"
         );
         let created = h
