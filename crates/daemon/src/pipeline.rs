@@ -521,6 +521,13 @@ where
                         }
                         None => {
                             tracing::warn!("assistant signal stream closed before completion");
+                            if first_chunk {
+                                // The reply stream dropped before any content
+                                // arrived (e.g. the orchestrator restarted
+                                // mid-turn) — don't leave the user in silence.
+                                self.set_state(State::Speaking);
+                                self.speaker.say(ERROR_APOLOGY).await?;
+                            }
                             break;
                         }
                         _ => {} // Ignore events for other requests

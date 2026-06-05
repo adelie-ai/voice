@@ -15,6 +15,13 @@ impl RustpotterWakeWordDetector {
         config.fmt.sample_format = SampleFormat::F32;
         config.fmt.channels = 1;
         config.detector.threshold = sensitivity;
+        // Normalize the input level toward the wake-word reference so a quieter
+        // live mic still scores like the (louder) training clips. `max_gain`
+        // above the default 1.0 lets the filter AMPLIFY quiet input (the default
+        // only attenuates) — a common cause of a model that scores its own
+        // recordings well yet never fires on live speech.
+        config.filters.gain_normalizer.enabled = true;
+        config.filters.gain_normalizer.max_gain = 4.0;
 
         let mut rustpotter = Rustpotter::new(&config)
             .map_err(|e| VoiceError::WakeWord(format!("failed to create rustpotter: {e}")))?;
@@ -39,7 +46,19 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         // Convert f32 samples to bytes (little-endian) as rustpotter expects raw bytes
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
-        let detection = self.rustpotter.process_bytes(&bytes);
-        Ok(detection.is_some())
+        match self.rustpotter.process_bytes(&bytes) {
+            Some(detection) => {
+                // Log the score + applied gain so the threshold can be tuned
+                // and we can see the gain-normalizer working on live audio.
+                tracing::info!(
+                    score = detection.score,
+                    avg_score = detection.avg_score,
+                    gain = detection.gain,
+                    "wake word detected"
+                );
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 }
