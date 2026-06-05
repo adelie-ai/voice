@@ -1,31 +1,25 @@
 [package]
-name = "adele-voice"
+name = "adele-voice-module"
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
-[[bin]]
-name = "adele-voice"
-path = "src/main.rs"
-
+# The embeddable voice module: on-demand dictation + speech playback, with no
+# wake word, no D-Bus, and no orchestrator/assistant coupling. Depends only on
+# the domain (`core`) and the adapter crates it wires for the concrete builders.
 [dependencies]
 adele-voice-core.workspace = true
 adele-voice-audio-cpal.workspace = true
-adele-voice-wake-rustpotter.workspace = true
 adele-voice-vad-silero.workspace = true
 adele-voice-stt-whisper.workspace = true
 adele-voice-tts-piper.workspace = true
 adele-voice-tts-polly.workspace = true
 adele-voice-tts-kokoro.workspace = true
-adele-voice-assistant-dbus.workspace = true
-adele-voice-dbus-interface.workspace = true
-adele-voice-module.workspace = true
-anyhow.workspace = true
 dirs.workspace = true
 serde.workspace = true
-serde_json = "1"
-tokio.workspace = true
-toml.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
-zbus.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml.workspace = true

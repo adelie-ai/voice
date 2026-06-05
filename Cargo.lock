@@ -10,6 +10,7 @@ dependencies = [
  "adele-voice-audio-cpal",
  "adele-voice-core",
  "adele-voice-dbus-interface",
+ "adele-voice-module",
  "adele-voice-stt-whisper",
  "adele-voice-tts-kokoro",
  "adele-voice-tts-piper",
@@ -68,6 +69,24 @@ dependencies = [
  "tokio",
  "tracing",
  "zbus",
+]
+
+[[package]]
+name = "adele-voice-module"
+version = "0.1.0"
+dependencies = [
+ "adele-voice-audio-cpal",
+ "adele-voice-core",
+ "adele-voice-stt-whisper",
+ "adele-voice-tts-kokoro",
+ "adele-voice-tts-piper",
+ "adele-voice-tts-polly",
+ "adele-voice-vad-silero",
+ "dirs",
+ "serde",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

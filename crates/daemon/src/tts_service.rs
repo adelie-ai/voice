@@ -9,33 +9,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use adele_voice_core::domain::SAMPLE_RATE;
-use adele_voice_core::ports::audio::AudioSink;
 use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_dbus_interface::TtsCommand;
+use adele_voice_module::{Speaker, TtsBackend};
 use adele_voice_tts_kokoro::KokoroTts;
 use adele_voice_tts_piper::{DEFAULT_PIPER_SAMPLE_RATE, PiperTts};
 use tokio::sync::mpsc;
 
-use crate::tts_backend::TtsBackend;
-
-/// Drive the TTS service until the command channel closes.
+/// Drive the TTS service until the command channel closes. `speaker` plays
+/// `SayText` through the shared sink (synth + queue, skipping empty audio);
+/// `tts` backs `SynthesizeText` (raw samples → WAV) and voice management.
 pub async fn run_tts_service(
+    speaker: Speaker<TtsBackend>,
     tts: Arc<TtsBackend>,
-    sink: Arc<dyn AudioSink>,
     models_dir: PathBuf,
     mut rx: mpsc::Receiver<TtsCommand>,
 ) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            TtsCommand::Say(text) => match tts.synthesize(&text).await {
-                Ok(samples) if !samples.is_empty() => {
-                    if let Err(e) = sink.play(samples) {
-                        tracing::error!("SayText playback failed: {e}");
-                    }
+            TtsCommand::Say(text) => {
+                if let Err(e) = speaker.say(&text).await {
+                    tracing::error!("SayText failed: {e}");
                 }
-                Ok(_) => {}
-                Err(e) => tracing::error!("SayText synthesis failed: {e}"),
-            },
+            }
             TtsCommand::Synthesize { text, reply } => {
                 let result = tts
                     .synthesize(&text)
