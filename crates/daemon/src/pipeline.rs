@@ -294,6 +294,24 @@ where
     }
 
     async fn process_utterance(&mut self, samples: Vec<f32>) -> anyhow::Result<()> {
+        // Discard near-silent captures before they reach STT. Ambient noise or
+        // the tail of our own playback can trip the VAD without containing real
+        // speech, and Whisper then hallucinates filler ("Thank you.") — which in
+        // conversation mode loops every follow-up window. Real speech sits well
+        // above this RMS floor (a buffer with even a brief utterance is ~0.02+,
+        // noise/echo is ~0.003-0.008).
+        const MIN_SPEECH_RMS: f32 = 0.01;
+        let rms = if samples.is_empty() {
+            0.0
+        } else {
+            (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+        };
+        tracing::info!(rms, samples = samples.len(), "utterance captured");
+        if rms < MIN_SPEECH_RMS {
+            tracing::info!(rms, "discarding near-silent capture (no speech)");
+            return Ok(());
+        }
+
         // Ensure we have a conversation
         if self.conversation_id.is_none() {
             let id = self
@@ -622,10 +640,11 @@ mod tests {
     }
 
     /// Each chunk is 1000 samples (> the 800-sample floor for closing an
-    /// utterance). With a zero silence-duration, one speech chunk (VAD 0.9)
-    /// then one silence chunk (VAD 0.0) closes the utterance.
+    /// utterance) at a non-silent amplitude so the captured buffer clears the
+    /// `process_utterance` energy gate. With a zero silence-duration, one speech
+    /// chunk (VAD 0.9) then one silence chunk (VAD 0.0) closes the utterance.
     async fn send_chunk(h: &Harness) {
-        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+        h.audio_tx.send(vec![0.1f32; 1000]).await.unwrap();
     }
 
     #[tokio::test]
@@ -655,6 +674,34 @@ mod tests {
         assert!(
             matches!(got, Ok(Some(()))),
             "transcription must run for a push-to-talk utterance while wake word is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn near_silent_capture_is_discarded() {
+        // The energy gate must drop a near-silent buffer (noise/echo that
+        // tripped the VAD) before STT, so Whisper can't hallucinate filler
+        // that would loop in conversation mode.
+        let mut h = spawn_pipeline(Cfg::default());
+
+        h.ptt_tx.send(()).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("push-to-talk should enter Listening")
+        .unwrap();
+
+        // VAD scripts this as speech-then-silence, but the samples are ~silent.
+        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+
+        let got = tokio::time::timeout(Duration::from_millis(500), h.transcribe_rx.recv()).await;
+        h.handle.abort();
+        assert!(
+            got.is_err(),
+            "a near-silent capture must be discarded before transcription"
         );
     }
 
