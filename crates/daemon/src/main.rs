@@ -28,7 +28,11 @@ const DBUS_VOICE_PATH: &str = "/org/desktopAssistant/Voice";
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            // `ort` logs onnxruntime's allocator/arena activity at INFO (very
+            // noisy for the Kokoro session); keep it at warn by default.
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into()),
+        )
         .init();
 
     let config = config::load()?;
