@@ -31,6 +31,7 @@ impl TtsBackend {
                 tracing::info!(
                     voice = %tts.polly_voice,
                     engine = %tts.polly_engine,
+                    profile = tts.polly_profile.as_deref().unwrap_or(""),
                     "using AWS Polly TTS backend"
                 );
                 TtsBackend::Polly(
@@ -38,6 +39,7 @@ impl TtsBackend {
                         &tts.polly_voice,
                         &tts.polly_engine,
                         tts.polly_region.clone(),
+                        tts.polly_profile.clone(),
                     )
                     .await,
                 )
