@@ -140,12 +140,13 @@ where
                         if state == State::Speaking {
                             self.sink.stop()?;
                         }
-                        // Start a fresh PTT session: route to the supplied
-                        // conversation (if any) and drop any prior session's
-                        // conversation so a re-press can't leak the previous
-                        // turn's target into this one.
+                        // Route this PTT session: `Some(id)` dictates into that
+                        // conversation; `None` (plain PushToTalk) falls back to
+                        // the daemon's own session, which — like the wake word —
+                        // persists across presses for continuity. (A stale
+                        // override can't leak in: every press overwrites it, and
+                        // the wake-word entry resets it to None.)
                         self.ptt_conversation_override = target.clone();
-                        self.conversation_id = None;
                         state = State::Listening;
                         self.set_state(state);
                         speech_buffer.clear();
@@ -201,6 +202,12 @@ where
                                 if let Some(new_state) = state.transition(&StateEvent::WakeWordDetected) {
                                     state = new_state;
                                     self.set_state(state);
+                                    // Wake word always uses the daemon's own
+                                    // session; clear any push-to-talk target
+                                    // left over from a session ended via
+                                    // StopSpeaking so this utterance can't leak
+                                    // into a previously dictated conversation.
+                                    self.ptt_conversation_override = None;
                                     speech_buffer.clear();
                                     last_speech_at = None;
                                     followup_deadline = Some(Instant::now() + self.followup_timeout);
@@ -799,6 +806,72 @@ mod tests {
         assert_eq!(
             routed, "own-session",
             "a plain PTT must route to the daemon's own session id, not a caller conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_ptt_reuses_own_session_across_presses() {
+        // Regression guard (#24): a plain PushToTalk() continues the daemon's
+        // own session across presses — like the wake word — instead of spawning
+        // a fresh "Voice Conversation" each press.
+        // VAD script drives two utterances: speech/silence, then speech/(exhausted)silence.
+        let mut h = spawn_pipeline(Cfg {
+            vad: vec![0.9, 0.0, 0.9],
+            ..Default::default()
+        });
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("first ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        let first = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("first prompt")
+            .expect("prompt sender open");
+        assert_eq!(first, "own-session");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("back to Idle after the first turn")
+        .unwrap();
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("second ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("second prompt")
+            .expect("prompt sender open");
+        h.handle.abort();
+
+        assert_eq!(
+            second, "own-session",
+            "the second plain PTT must reuse the own session id"
+        );
+        let created = h
+            .created_rx
+            .try_recv()
+            .expect("the own session must have been created");
+        assert_eq!(created, "test");
+        assert!(
+            h.created_rx.try_recv().is_err(),
+            "a second plain PTT must NOT create a new session — it reuses the own session"
         );
     }
 
