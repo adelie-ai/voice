@@ -8,7 +8,7 @@ mod config;
 mod pipeline;
 mod tts_service;
 
-use adele_voice_assistant_dbus::DbusAssistantGateway;
+use adele_voice_assistant_connector::ConnectorAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
 use adele_voice_core::domain::State;
 use adele_voice_core::ports::audio::AudioSink;
@@ -52,7 +52,10 @@ async fn main() -> Result<()> {
     // Select the TTS backend (local-first: Kokoro→Piper fallback, never auto
     // cloud). The conversation pipeline and the SayText service share it.
     let tts = TtsBackend::from_config(&config.tts).await;
-    let assistant = DbusAssistantGateway::connect().await?;
+    // Reach the orchestrator over the configured transport — local UDS by
+    // default, or a remote WebSocket / legacy D-Bus (voice#31).
+    let connection_config = config.assistant.connection_config();
+    let assistant = ConnectorAssistantGateway::connect(&connection_config).await?;
 
     let source = Arc::new(CpalAudioSource::new(&config.audio.input_device));
     let sink: Arc<dyn AudioSink> = Arc::new(CpalAudioSink::new(&config.audio.output_device));
