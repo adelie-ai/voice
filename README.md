@@ -64,7 +64,39 @@ Ports-and-adapters (hexagonal). `core` defines the domain, the state machine, an
 | `tts-polly` | text-to-speech | [AWS Polly](https://aws.amazon.com/polly/) (cloud, opt-in) |
 | `assistant-dbus` | send prompts / receive streamed responses | zbus → `org.desktopAssistant.Conversations` |
 | `dbus-interface` | control + status surface | zbus ← `org.desktopAssistant.Voice` |
-| `daemon` | wires the pipeline together | — |
+| `module` | embeddable on-demand voice (`Dictation` + `Speaker`) | reuses the adapters above |
+| `daemon` | the system **service** — consumes `module`, adds wake word + D-Bus | — |
+
+### Embeddable module vs. system service
+
+The reusable voice capabilities live in **`adele-voice-module`** — an embeddable library that does **dictation** and **speech playback** in-process, with **no wake word, no D-Bus, and no orchestrator coupling**. The daemon is just one consumer of it: the system-wide voice *service* that layers the wake word and the `org.desktopAssistant.Voice` surface on top.
+
+| | Wake word | Dictation | Playback | D-Bus surface | Needs the daemon |
+|---|:-:|:-:|:-:|:-:|:-:|
+| **Daemon (service)** | ✅ | ✅ | ✅ | ✅ `SayText` / PTT / … | — |
+| **Embedded (in a client)** | ❌ | ✅ | ✅ | ❌ | ❌ |
+
+**The boundary:** the wake word and the `org.desktopAssistant.Voice` surface are **daemon-only**. Want hands-free "Hey Adele"? Run the daemon. Want a mic button in your own chat client that works even when no daemon is running? Embed the module — the client does STT/TTS locally and reaches only its own assistant connection for the LLM.
+
+**Embedding it.** A client depends on `adele-voice-module` and wires the two verbs:
+
+```rust
+use adele_voice_module::{build_dictation, build_speaker};
+
+// Dictation: tap a mic button → capture one utterance → transcript.
+let mut dictation = build_dictation(&audio_cfg, &vad_cfg, &stt_cfg)?;
+if let Some(text) = dictation.dictate().await? {
+    // feed `text` into the app's normal "send a prompt" path
+}
+
+// Playback: read a reply aloud with the configured backend.
+let speaker = build_speaker(&tts_cfg, &audio_cfg).await;
+speaker.say(&reply).await?;
+```
+
+`build_dictation` / `build_speaker` take the same `[audio]` / `[vad]` / `[stt]` / `[tts]` config the daemon uses (re-exported as `adele_voice_module::config`), so a client gets the local-first backend selection (Kokoro → Piper fallback, **never** auto cloud) for free. The lower-level `Dictation` / `Speaker` / `Endpointer` / `Transcriber` / `TtsBackend` types are public too, for clients that manage their own audio devices. A client typically exposes this behind a config toggle (embedded vs. the daemon path), so a machine with no daemon still gets dictation and playback.
+
+**Dependency approach.** Clients **path-dep** the voice crates for now (mirroring the existing adele-gtk ↔ desktop-assistant path-dep); a published or git dependency can follow once the API settles.
 
 ## D-Bus control surface
 
