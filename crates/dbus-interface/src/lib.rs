@@ -33,12 +33,19 @@ pub enum TtsCommand {
     },
 }
 
+/// A push-to-talk trigger. The payload is the conversation the utterance
+/// should be routed to: `None` uses the daemon's own session ("Voice
+/// Conversation"); `Some(id)` targets the orchestrator conversation with that
+/// id (the id returned by `org.desktopAssistant.Conversations.CreateConversation`),
+/// so the mic button in a chat window dictates into that chat.
+pub type PttRequest = Option<String>;
+
 /// D-Bus adapter exposing org.desktopAssistant.Voice.
 pub struct DbusVoiceAdapter {
     state_rx: watch::Receiver<State>,
     enabled_tx: Arc<watch::Sender<bool>>,
     enabled_rx: watch::Receiver<bool>,
-    ptt_tx: mpsc::Sender<()>,
+    ptt_tx: mpsc::Sender<PttRequest>,
     stop_tx: mpsc::Sender<()>,
     tts_tx: mpsc::Sender<TtsCommand>,
 }
@@ -48,7 +55,7 @@ impl DbusVoiceAdapter {
         state_rx: watch::Receiver<State>,
         enabled_tx: watch::Sender<bool>,
         enabled_rx: watch::Receiver<bool>,
-        ptt_tx: mpsc::Sender<()>,
+        ptt_tx: mpsc::Sender<PttRequest>,
         stop_tx: mpsc::Sender<()>,
         tts_tx: mpsc::Sender<TtsCommand>,
     ) -> Self {
@@ -84,10 +91,27 @@ impl DbusVoiceAdapter {
         Ok(*self.enabled_rx.borrow())
     }
 
-    /// Trigger push-to-talk (skip wake word, go directly to Listening).
+    /// Trigger push-to-talk (skip wake word, go directly to Listening). The
+    /// utterance is routed to the daemon's own session ("Voice Conversation").
     async fn push_to_talk(&self) -> fdo::Result<()> {
         self.ptt_tx
-            .send(())
+            .send(None)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to trigger PTT: {e}")))?;
+        Ok(())
+    }
+
+    /// Trigger push-to-talk and route this utterance to a specific
+    /// conversation instead of the daemon's own session. `conversation_id` is
+    /// the orchestrator conversation id (as returned by
+    /// `org.desktopAssistant.Conversations.CreateConversation` / `ListConversations`);
+    /// an empty string falls back to the daemon's own session, matching
+    /// `PushToTalk()`. Use this for the mic button inside a chat window so the
+    /// spoken prompt and reply appear in the conversation the user is viewing.
+    async fn push_to_talk_in_conversation(&self, conversation_id: &str) -> fdo::Result<()> {
+        let target = Some(conversation_id.to_string()).filter(|id| !id.is_empty());
+        self.ptt_tx
+            .send(target)
             .await
             .map_err(|e| fdo::Error::Failed(format!("failed to trigger PTT: {e}")))?;
         Ok(())

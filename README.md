@@ -74,7 +74,8 @@ The daemon owns **`org.desktopAssistant.Voice`** at `/org/desktopAssistant/Voice
 |---|---|---|
 | `GetState() → s` | method | `Idle` / `Listening` / `Processing` / `Speaking` |
 | `SetEnabled(b)` / `GetEnabled() → b` | method | toggle wake-word processing |
-| `PushToTalk()` | method | skip the wake word, start listening now |
+| `PushToTalk()` | method | skip the wake word, start listening now — routes to the daemon's own session ("Voice Conversation") |
+| `PushToTalkInConversation(s)` | method | like `PushToTalk()`, but dictate into the given orchestrator conversation id (`""` = own session). The in-chat mic button passes the focused conversation so the prompt + spoken reply land in that chat |
 | `StopSpeaking()` | method | cancel current playback |
 | `StateChanged` / `TranscriptReady` / `SpeakingText` | signals | UI updates |
 | `SayText(s)` | method | speak text with the on-device voice — for **any** app, no orchestrator involved |
