@@ -124,17 +124,46 @@ impl AssistantGateway for ConnectorAssistantGateway {
         prompt: &str,
         system_refinement: &str,
     ) -> Result<String, VoiceError> {
-        let connector = self.current();
-        match connector
-            .send_prompt_with_system_refinement(conversation_id, prompt, system_refinement)
+        // Per-turn idempotency key (#39). If the first send fails — the
+        // orchestrator restarted, or the socket dropped mid-turn — we reconnect
+        // and retry ONCE with the SAME key, so the orchestrator re-attaches to
+        // the still-running turn (or replays a completed reply) instead of
+        // re-running the turn and re-processing its tool actions. Recovering the
+        // answer beats the old apologize-and-give-up, and the same key makes the
+        // retry safe. (The D-Bus transport drops the key — see the Connector
+        // method — so this is effective on the default UDS and on WS.)
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        match self
+            .current()
+            .send_prompt_with_system_refinement_idempotent(
+                conversation_id,
+                prompt,
+                system_refinement,
+                Some(idempotency_key.clone()),
+            )
             .await
         {
             Ok(id) => Ok(id),
-            Err(e) => {
+            Err(first_err) => {
+                tracing::warn!(
+                    "send failed ({first_err}); reconnecting and retrying with the same \
+                     idempotency key"
+                );
                 self.reconnect().await;
-                Err(VoiceError::Assistant(format!(
-                    "send_prompt_with_system_refinement failed: {e}"
-                )))
+                self.current()
+                    .send_prompt_with_system_refinement_idempotent(
+                        conversation_id,
+                        prompt,
+                        system_refinement,
+                        Some(idempotency_key),
+                    )
+                    .await
+                    .map_err(|retry_err| {
+                        VoiceError::Assistant(format!(
+                            "send_prompt_with_system_refinement failed; retry after reconnect \
+                             also failed: {first_err}; retry error: {retry_err}"
+                        ))
+                    })
             }
         }
     }
