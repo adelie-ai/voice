@@ -12,3 +12,6 @@ adele-voice-core.workspace = true
 desktop-assistant-client-common.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
+# Per-turn idempotency keys (#39): a random v4 key so a retry after a dropped
+# connection de-duplicates against the original turn at the orchestrator.
+uuid = { version = "1", features = ["v4"] }
