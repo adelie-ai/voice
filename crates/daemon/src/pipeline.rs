@@ -705,6 +705,17 @@ where
                     last_activity = Instant::now();
                     match state {
                         State::Idle => {
+                            // Don't let the daemon wake itself on its own
+                            // playback. A single-shot reply returns to Idle while
+                            // its audio is still sounding, and any cue/SayText
+                            // plays into a mic that hears the speakers; an eager
+                            // detector trips on that echo. While playback is
+                            // outstanding, skip wake detection AND don't seed the
+                            // prebuffer with echo — `is_playing` stays true (with
+                            // its tail pad) until the sound is truly gone.
+                            if self.speaker.is_playing() {
+                                continue;
+                            }
                             // Keep a rolling pre-buffer of recent idle audio so a
                             // command spoken in the same breath as the wake word
                             // isn't dropped during the handoff (#50).

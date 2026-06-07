@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::{CHANNELS, SAMPLE_RATE};
@@ -16,10 +17,29 @@ use ringbuf::traits::{Producer, Split};
 /// headroom for them to queue and play gaplessly.
 const OUTPUT_RING_BUFFER_CAPACITY: usize = SAMPLE_RATE as usize * 120;
 
+/// Padding added to the computed playback deadline so `is_playing` stays true
+/// until the sound is truly done. Covers the gap between queueing audio and it
+/// physically sounding: stream-open latency on the first sentence plus the
+/// device/OS output buffer the callback fills ahead of playout. Erring long is
+/// safe — the daemon waits a hair past the tail; erring short re-arms the mic
+/// mid-word and records the daemon's own voice.
+const PLAYBACK_TAIL_PAD: Duration = Duration::from_millis(250);
+
 pub struct CpalAudioSink {
     device_name: String,
     producer: Mutex<Option<ringbuf::HeapProd<f32>>>,
-    playing: Arc<AtomicBool>,
+    /// Wall-clock instant at which all queued audio will have finished playing,
+    /// or `None` when nothing is queued. Each `play` extends it by the real-time
+    /// duration of the samples it adds; `is_playing` is true until it passes.
+    ///
+    /// This tracks *time*, not ring-buffer occupancy, on purpose. The device
+    /// pulls samples out of the ring buffer into its own hardware/OS buffer well
+    /// ahead of when they actually sound, so any occupancy- or callback-driven
+    /// signal goes false long before playback is audibly done — which let the
+    /// daemon re-arm the mic mid-reply and record its own speech. The queued
+    /// samples have a known duration (count / sample_rate), so the honest answer
+    /// to "is it still playing?" is "has that much wall-clock time elapsed yet?"
+    playback_end: Mutex<Option<Instant>>,
     stream_running: Arc<AtomicBool>,
 }
 
@@ -28,7 +48,7 @@ impl CpalAudioSink {
         Self {
             device_name: device_name.to_string(),
             producer: Mutex::new(None),
-            playing: Arc::new(AtomicBool::new(false)),
+            playback_end: Mutex::new(None),
             stream_running: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -64,7 +84,6 @@ impl CpalAudioSink {
         }
 
         let device_name = self.device_name.clone();
-        let playing = Arc::clone(&self.playing);
         let stream_running = Arc::clone(&self.stream_running);
 
         let rb = HeapRb::<f32>::new(OUTPUT_RING_BUFFER_CAPACITY);
@@ -100,7 +119,6 @@ impl CpalAudioSink {
                     buffer_size: cpal::BufferSize::Default,
                 };
 
-                let playing_cb = playing;
                 let consumer_cb = consumer_clone;
 
                 let stream = match device.build_output_stream(
@@ -118,7 +136,6 @@ impl CpalAudioSink {
                         for sample in &mut data[filled..] {
                             *sample = 0.0;
                         }
-                        playing_cb.store(filled > 0, Ordering::Relaxed);
                     },
                     move |err| {
                         tracing::error!("output stream error: {err}");
@@ -161,6 +178,23 @@ impl CpalAudioSink {
         *prod_guard = Some(producer);
         Ok(())
     }
+
+    /// Push the playback deadline out by the real-time duration of `samples`
+    /// freshly queued frames (mono @ SAMPLE_RATE, so frames == samples). If
+    /// audio is still playing, stack onto the current deadline so back-to-back
+    /// sentences accumulate; otherwise start the clock from now.
+    fn extend_playback_deadline(&self, samples: usize) {
+        let added =
+            Duration::from_secs_f64(samples as f64 / (SAMPLE_RATE as f64 * CHANNELS as f64));
+        if let Ok(mut end) = self.playback_end.lock() {
+            let now = Instant::now();
+            let base = match *end {
+                Some(prev) if prev > now => prev,
+                _ => now,
+            };
+            *end = Some(base + added);
+        }
+    }
 }
 
 impl AudioSink for CpalAudioSink {
@@ -180,6 +214,7 @@ impl AudioSink for CpalAudioSink {
                     "output ring buffer overflow"
                 );
             }
+            self.extend_playback_deadline(written);
         }
 
         Ok(())
@@ -187,7 +222,10 @@ impl AudioSink for CpalAudioSink {
 
     fn stop(&self) -> Result<(), VoiceError> {
         self.stream_running.store(false, Ordering::SeqCst);
-        self.playing.store(false, Ordering::Relaxed);
+        // Barge-in/stop discards the queue, so nothing is outstanding.
+        if let Ok(mut end) = self.playback_end.lock() {
+            *end = None;
+        }
 
         let mut prod_guard = self
             .producer
@@ -200,6 +238,88 @@ impl AudioSink for CpalAudioSink {
     }
 
     fn is_playing(&self) -> bool {
-        self.playing.load(Ordering::Relaxed)
+        // True until the queued audio's real-time duration (plus a tail pad for
+        // output latency) has elapsed — i.e. until it has actually finished
+        // sounding, not merely been handed to the device.
+        match self.playback_end.lock() {
+            Ok(end) => match *end {
+                Some(deadline) => Instant::now() < deadline + PLAYBACK_TAIL_PAD,
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Remaining time on the playback deadline, for asserting accumulation
+    /// without sleeping through full reply durations.
+    fn remaining(sink: &CpalAudioSink) -> Duration {
+        sink.playback_end
+            .lock()
+            .unwrap()
+            .map(|end| end.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO)
+    }
+
+    #[test]
+    fn idle_sink_is_not_playing() {
+        let sink = CpalAudioSink::new("default");
+        assert!(!sink.is_playing(), "nothing queued ⇒ not playing");
+    }
+
+    #[test]
+    fn queueing_marks_playing_immediately() {
+        // The regression: `is_playing` must read true the instant audio is
+        // queued, without waiting for a hardware callback to fire. One second
+        // of audio (SAMPLE_RATE mono frames) is plainly still playing.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline(SAMPLE_RATE as usize);
+        assert!(sink.is_playing(), "freshly queued audio reads as playing");
+        assert!(
+            remaining(&sink) > Duration::from_millis(900),
+            "≈1s of audio should leave ≈1s on the clock, got {:?}",
+            remaining(&sink)
+        );
+    }
+
+    #[test]
+    fn back_to_back_sentences_accumulate() {
+        // Two half-second batches queued back-to-back must stack to ≈1s, not
+        // collapse to the last batch — otherwise the wait ends a sentence early.
+        let sink = CpalAudioSink::new("default");
+        let half_second = (SAMPLE_RATE / 2) as usize;
+        sink.extend_playback_deadline(half_second);
+        sink.extend_playback_deadline(half_second);
+        assert!(
+            remaining(&sink) > Duration::from_millis(900),
+            "two 0.5s batches should accumulate to ≈1s, got {:?}",
+            remaining(&sink)
+        );
+    }
+
+    #[test]
+    fn deadline_elapses_after_the_audio_duration() {
+        // A short clip stops reading as playing once its duration + tail pad
+        // passes. 10ms of audio + 250ms pad ⇒ done well before 400ms.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline((SAMPLE_RATE / 100) as usize); // 10ms
+        assert!(sink.is_playing(), "still playing right after queueing");
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(!sink.is_playing(), "done after duration + tail pad elapses");
+    }
+
+    #[test]
+    fn stop_clears_the_deadline() {
+        // Barge-in: stop must immediately report not-playing even with audio
+        // still on the clock.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline(SAMPLE_RATE as usize * 10); // 10s queued
+        assert!(sink.is_playing());
+        sink.stop().unwrap();
+        assert!(!sink.is_playing(), "stop discards the queue ⇒ not playing");
     }
 }
