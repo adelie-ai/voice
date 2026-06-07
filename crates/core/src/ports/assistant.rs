@@ -6,6 +6,12 @@ use tokio::sync::mpsc;
 pub enum AssistantEvent {
     /// A chunk of the response text.
     Chunk { request_id: String, text: String },
+    /// A human-readable progress status for the in-flight turn (e.g. "checking
+    /// your calendar…"), emitted by the orchestrator at turn-start and per tool
+    /// call. The voice pipeline narrates it sparingly and uses every status —
+    /// like every chunk — as a progress heartbeat that resets its stall
+    /// deadline (#58).
+    Status { request_id: String, message: String },
     /// The response is complete.
     Complete {
         request_id: String,

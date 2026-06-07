@@ -95,6 +95,7 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "anyhow",
+ "tokio",
  "tracing",
  "whisper-rs",
 ]
