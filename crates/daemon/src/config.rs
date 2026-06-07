@@ -155,10 +155,123 @@ fn dirs_path(suffix: &str) -> PathBuf {
         .join(suffix)
 }
 
-fn config_path() -> PathBuf {
+pub fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("adele-voice/config.toml")
+}
+
+/// The subset of [`Config`] the daemon can apply to a running pipeline on a live
+/// reload (config#52), captured as plain values so old/new snapshots can be
+/// diffed cheaply. Anything not here (model paths, STT/TTS, transport) still
+/// requires a restart — those rebuild expensive sessions or reconnect a socket.
+///
+/// New tunable fields added on `main` flow in automatically: derive `Clone` +
+/// `PartialEq`, populate them in [`Config::tunables`], and apply them in the
+/// pipeline's apply path. The watcher diffs whole [`Tunables`] values, so a
+/// reload picks up any field present here without further plumbing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Tunables {
+    /// Hot-swapped in place on the live `Endpointer`.
+    pub speech_threshold: f32,
+    /// Hot-swapped in place on the live `Endpointer`.
+    pub silence_duration_ms: u64,
+    /// Hot-swapped on the pipeline (affects the next turn).
+    pub followup_timeout_ms: u64,
+    /// Hot-swapped on the pipeline (affects the next turn boundary).
+    pub conversation_mode: bool,
+    /// Hot-swapped on the pipeline (next idle check); 0 disables idle-exit.
+    pub idle_exit_timeout_ms: u64,
+    /// Requires rebuilding the wake detector (rustpotter bakes the threshold in
+    /// at construction).
+    pub wake_sensitivity: f32,
+    /// Changing either device requires restarting the capture/playback stream,
+    /// which we do not do live — the daemon logs "restart required" instead.
+    pub input_device: String,
+    pub output_device: String,
+}
+
+impl Config {
+    /// Snapshot the live-applicable knobs for diffing on reload.
+    pub fn tunables(&self) -> Tunables {
+        Tunables {
+            speech_threshold: self.vad.speech_threshold,
+            silence_duration_ms: self.vad.silence_duration_ms,
+            followup_timeout_ms: self.assistant.followup_timeout_ms,
+            conversation_mode: self.assistant.conversation_mode,
+            idle_exit_timeout_ms: self.idle_exit_timeout_ms,
+            wake_sensitivity: self.wake_word.sensitivity,
+            input_device: self.audio.input_device.clone(),
+            output_device: self.audio.output_device.clone(),
+        }
+    }
+}
+
+/// The work a reload implies, derived purely from the old/new [`Tunables`]. Pure
+/// and side-effect-free so the apply decision is unit-tested without audio,
+/// file-watching, or a real pipeline.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReloadPlan {
+    /// Apply `endpointer.set_speech_threshold`.
+    pub set_speech_threshold: Option<f32>,
+    /// Apply `endpointer.set_silence`.
+    pub set_silence_ms: Option<u64>,
+    /// Update the pipeline's follow-up timeout.
+    pub set_followup_timeout_ms: Option<u64>,
+    /// Update the pipeline's conversation-mode flag.
+    pub set_conversation_mode: Option<bool>,
+    /// Update the pipeline's idle-exit timeout (0 disables).
+    pub set_idle_exit_timeout_ms: Option<u64>,
+    /// Rebuild the wake detector at this sensitivity.
+    pub rebuild_wake_sensitivity: Option<f32>,
+    /// A device changed; the capture/playback stream would need a restart, which
+    /// is not done live. Carries the human-readable change for the log.
+    pub restart_required_for_device: Option<String>,
+}
+
+impl ReloadPlan {
+    /// True when nothing changed — the watcher can skip a no-op reload.
+    pub fn is_empty(&self) -> bool {
+        *self == ReloadPlan::default()
+    }
+}
+
+/// Diff two tunable snapshots into the concrete work a reload implies.
+///
+/// - `speech_threshold`, `silence_duration_ms`, `followup_timeout_ms`,
+///   `conversation_mode`, `idle_exit_timeout_ms` hot-apply in place.
+/// - `wake_sensitivity` requires rebuilding the wake detector (rustpotter bakes
+///   the threshold in at construction).
+/// - an `input_device`/`output_device` change can't be applied live (it would
+///   need restarting the cpal stream); the plan flags a restart-required note
+///   instead, and every other changed knob still applies.
+pub fn plan_reload(old: &Tunables, new: &Tunables) -> ReloadPlan {
+    let mut plan = ReloadPlan::default();
+    if old.speech_threshold != new.speech_threshold {
+        plan.set_speech_threshold = Some(new.speech_threshold);
+    }
+    if old.silence_duration_ms != new.silence_duration_ms {
+        plan.set_silence_ms = Some(new.silence_duration_ms);
+    }
+    if old.followup_timeout_ms != new.followup_timeout_ms {
+        plan.set_followup_timeout_ms = Some(new.followup_timeout_ms);
+    }
+    if old.conversation_mode != new.conversation_mode {
+        plan.set_conversation_mode = Some(new.conversation_mode);
+    }
+    if old.idle_exit_timeout_ms != new.idle_exit_timeout_ms {
+        plan.set_idle_exit_timeout_ms = Some(new.idle_exit_timeout_ms);
+    }
+    if old.wake_sensitivity != new.wake_sensitivity {
+        plan.rebuild_wake_sensitivity = Some(new.wake_sensitivity);
+    }
+    if old.input_device != new.input_device || old.output_device != new.output_device {
+        plan.restart_required_for_device = Some(format!(
+            "input {:?}->{:?}, output {:?}->{:?}",
+            old.input_device, new.input_device, old.output_device, new.output_device
+        ));
+    }
+    plan
 }
 
 pub fn load() -> Result<Config> {
@@ -247,6 +360,83 @@ speech_threshold = 0.7
             config.connection_config().transport_mode,
             TransportMode::Uds
         );
+    }
+
+    #[test]
+    fn no_change_yields_an_empty_plan() {
+        let t = Config::default().tunables();
+        let plan = plan_reload(&t, &t);
+        assert!(
+            plan.is_empty(),
+            "an unchanged config must be a no-op reload"
+        );
+    }
+
+    #[test]
+    fn hot_knobs_apply_in_place() {
+        let old = Config::default().tunables();
+        let new = Tunables {
+            speech_threshold: old.speech_threshold + 0.1,
+            silence_duration_ms: old.silence_duration_ms + 100,
+            followup_timeout_ms: old.followup_timeout_ms + 1000,
+            conversation_mode: !old.conversation_mode,
+            idle_exit_timeout_ms: old.idle_exit_timeout_ms + 5000,
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.set_speech_threshold, Some(new.speech_threshold));
+        assert_eq!(plan.set_silence_ms, Some(new.silence_duration_ms));
+        assert_eq!(plan.set_followup_timeout_ms, Some(new.followup_timeout_ms));
+        assert_eq!(plan.set_conversation_mode, Some(new.conversation_mode));
+        assert_eq!(
+            plan.set_idle_exit_timeout_ms,
+            Some(new.idle_exit_timeout_ms)
+        );
+        // No rebuild / restart implied by the hot knobs alone.
+        assert_eq!(plan.rebuild_wake_sensitivity, None);
+        assert_eq!(plan.restart_required_for_device, None);
+        assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn wake_sensitivity_change_requires_rebuilding_the_detector() {
+        let old = Config::default().tunables();
+        let new = Tunables {
+            wake_sensitivity: old.wake_sensitivity + 0.2,
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.rebuild_wake_sensitivity, Some(new.wake_sensitivity));
+        // Only the wake detector — nothing else changed.
+        assert_eq!(plan.set_speech_threshold, None);
+        assert_eq!(plan.restart_required_for_device, None);
+    }
+
+    #[test]
+    fn device_change_flags_restart_required_and_does_not_block_other_knobs() {
+        let old = Config::default().tunables();
+        let new = Tunables {
+            input_device: "hw:1".into(),
+            speech_threshold: old.speech_threshold + 0.1,
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        // A device change can't apply live → flagged for restart …
+        assert!(plan.restart_required_for_device.is_some());
+        // … but the hot knob in the same edit still applies.
+        assert_eq!(plan.set_speech_threshold, Some(new.speech_threshold));
+    }
+
+    #[test]
+    fn output_device_change_also_flags_restart() {
+        let old = Config::default().tunables();
+        let new = Tunables {
+            output_device: "hw:2".into(),
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        assert!(plan.restart_required_for_device.is_some());
+        assert_eq!(plan.set_speech_threshold, None);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use adele_voice_core::VoiceError;
 use adele_voice_core::domain::{SAMPLE_RATE, State, StateEvent};
 use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway};
 use adele_voice_core::ports::audio::{AudioSink, AudioSource};
@@ -13,7 +14,13 @@ use adele_voice_dbus_interface::StopRequest;
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
+use crate::config::{self, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
+
+/// Builds a fresh wake detector at a given sensitivity. rustpotter bakes the
+/// detection threshold in at construction, so changing it on reload (config#52)
+/// means rebuilding the detector rather than poking a setter.
+pub type WakeBuilder<W> = Box<dyn Fn(f32) -> Result<W, VoiceError> + Send>;
 
 /// Spoken when the assistant turn fails — short and human, never the raw error.
 const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
@@ -111,6 +118,15 @@ where
     enabled_rx: watch::Receiver<bool>,
     ptt_rx: mpsc::Receiver<Option<String>>,
     stop_rx: mpsc::Receiver<StopRequest>,
+    /// A ping (from the config-file watcher or the D-Bus `Reload` method) asking
+    /// the pipeline to re-read the config and apply any changed tunables live
+    /// (config#52).
+    reload_rx: mpsc::Receiver<()>,
+    /// Rebuilds the wake detector when `wake_word.sensitivity` changes.
+    wake_builder: WakeBuilder<W>,
+    /// Snapshot of the live-applicable knobs, diffed against a freshly loaded
+    /// config on each reload to decide what to apply.
+    tunables: Tunables,
     conversation_id: Option<String>,
     /// When a push-to-talk specified a target conversation, its orchestrator
     /// id. Set on `PushToTalkInConversation`, used by `process_utterance` to
@@ -147,6 +163,9 @@ where
         enabled_rx: watch::Receiver<bool>,
         ptt_rx: mpsc::Receiver<Option<String>>,
         stop_rx: mpsc::Receiver<StopRequest>,
+        reload_rx: mpsc::Receiver<()>,
+        wake_builder: WakeBuilder<W>,
+        tunables: Tunables,
         conversation_title: String,
         silence_duration: Duration,
         speech_threshold: f32,
@@ -172,6 +191,9 @@ where
             enabled_rx,
             ptt_rx,
             stop_rx,
+            reload_rx,
+            wake_builder,
+            tunables,
             conversation_id: None,
             ptt_conversation_override: None,
             conversation_title,
@@ -214,6 +236,94 @@ where
                     tracing::warn!("failed to speak listening phrase cue: {e}");
                 }
             }
+        }
+    }
+
+    /// Re-read the config file and apply any changed tunables to the running
+    /// pipeline (config#52). A failed/missing read is logged and ignored — a
+    /// momentary write-in-progress must never tear the daemon down.
+    fn reload(&mut self) {
+        let new_config = match config::load() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("config reload: failed to re-read config, keeping current: {e}");
+                return;
+            }
+        };
+        let new_tunables = new_config.tunables();
+        let plan = plan_reload(&self.tunables, &new_tunables);
+        if plan.is_empty() {
+            tracing::info!("config reload: no tunable changes");
+            return;
+        }
+        self.apply_plan(&plan);
+        // Adopt the new snapshot whole — including any field a sibling added,
+        // and the device fields we only logged about — so we diff against the
+        // on-disk truth next time rather than re-flagging the same change.
+        self.tunables = new_tunables;
+    }
+
+    /// Apply a [`ReloadPlan`] to the live pipeline. Pure decisions live in
+    /// [`plan_reload`]; this carries them out.
+    fn apply_plan(&mut self, plan: &config::ReloadPlan) {
+        if let Some(t) = plan.set_speech_threshold {
+            self.speech_threshold = t;
+            self.endpointer.set_speech_threshold(t);
+            tracing::info!(
+                speech_threshold = t,
+                "config reload: applied vad.speech_threshold"
+            );
+        }
+        if let Some(ms) = plan.set_silence_ms {
+            self.endpointer.set_silence(Duration::from_millis(ms));
+            tracing::info!(
+                silence_duration_ms = ms,
+                "config reload: applied vad.silence_duration_ms"
+            );
+        }
+        if let Some(ms) = plan.set_followup_timeout_ms {
+            self.followup_timeout = Duration::from_millis(ms);
+            tracing::info!(
+                followup_timeout_ms = ms,
+                "config reload: applied assistant.followup_timeout_ms"
+            );
+        }
+        if let Some(mode) = plan.set_conversation_mode {
+            self.conversation_mode = mode;
+            tracing::info!(
+                conversation_mode = mode,
+                "config reload: applied assistant.conversation_mode"
+            );
+        }
+        if let Some(ms) = plan.set_idle_exit_timeout_ms {
+            self.idle_exit_timeout = (ms > 0).then(|| Duration::from_millis(ms));
+            tracing::info!(
+                idle_exit_timeout_ms = ms,
+                "config reload: applied idle_exit_timeout_ms"
+            );
+        }
+        if let Some(sensitivity) = plan.rebuild_wake_sensitivity {
+            match (self.wake_builder)(sensitivity) {
+                Ok(wake) => {
+                    self.wake = wake;
+                    tracing::info!(
+                        sensitivity,
+                        "config reload: rebuilt wake detector for wake_word.sensitivity"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        sensitivity,
+                        "config reload: failed to rebuild wake detector, keeping current: {e}"
+                    );
+                }
+            }
+        }
+        if let Some(change) = &plan.restart_required_for_device {
+            tracing::warn!(
+                "config reload: audio device change ({change}) needs a daemon restart to take \
+                 effect — `systemctl --user restart adele-voice`. All other knobs were applied live."
+            );
         }
     }
 
@@ -284,6 +394,13 @@ where
                             self.endpointer.reset();
                         }
                     }
+                }
+
+                // Reload: re-read the config file and apply any changed
+                // tunables to the running pipeline (config#52). Triggered by the
+                // file watcher (debounced) or the D-Bus `Reload` method.
+                Some(()) = self.reload_rx.recv() => {
+                    self.reload();
                 }
 
                 // Process audio chunks
@@ -958,6 +1075,127 @@ mod tests {
         }
     }
 
+    /// A neutral tunables snapshot for the fake pipeline. Matches the fakes'
+    /// constructor args (0.5 threshold, 0 ms silence) so an initial reload that
+    /// re-reads those same values is a no-op.
+    fn test_tunables() -> Tunables {
+        Tunables {
+            speech_threshold: 0.5,
+            silence_duration_ms: 0,
+            followup_timeout_ms: 50,
+            conversation_mode: false,
+            idle_exit_timeout_ms: 0,
+            wake_sensitivity: 0.5,
+            input_device: "default".into(),
+            output_device: "default".into(),
+        }
+    }
+
+    /// Build a non-running pipeline with fakes so `apply_plan` can be exercised
+    /// directly (no audio, no file watch) — the apply side of the reload, while
+    /// `plan_reload`'s decision logic is unit-tested in `config`.
+    fn build_pipeline() -> Pipeline<FakeWake, FakeVad, FakeStt, FakeTts, FakeAssistant> {
+        let (_audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(1);
+        let (_enabled_tx, enabled_rx) = watch::channel(true);
+        let (_ptt_tx, ptt_rx) = mpsc::channel(1);
+        let (_stop_tx, stop_rx) = mpsc::channel(1);
+        let (state_tx, _state_rx) = watch::channel(State::Idle);
+        let (hit_tx, _transcribe_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+        let (created_tx, _created_rx) = mpsc::unbounded_channel();
+        let (_reload_tx, reload_rx) = mpsc::channel(4);
+        let wake_builder: WakeBuilder<FakeWake> =
+            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
+        Pipeline::new(
+            FakeWake { detects: false },
+            FakeVad {
+                probs: StdMutex::new(VecDeque::new()),
+            },
+            FakeStt {
+                hit: hit_tx,
+                text: "hello".to_string(),
+            },
+            FakeTts,
+            FakeAssistant {
+                tx: StdMutex::new(None),
+                prompt_tx,
+                created_tx,
+                fail: false,
+            },
+            Arc::new(FakeSource {
+                rx: StdMutex::new(Some(audio_rx)),
+            }),
+            Arc::new(FakeSink::default()),
+            state_tx,
+            enabled_rx,
+            ptt_rx,
+            stop_rx,
+            reload_rx,
+            wake_builder,
+            test_tunables(),
+            "test".to_string(),
+            Duration::from_millis(0),
+            0.5,
+            false,
+            Duration::from_millis(50),
+            None,
+            String::new(),
+            ListeningCue::Off,
+        )
+    }
+
+    #[test]
+    fn apply_plan_updates_live_tunable_state() {
+        // The apply side of reload: a plan's hot knobs must mutate the running
+        // pipeline's fields (and the shared endpointer threshold) in place.
+        let mut p = build_pipeline();
+        let plan = config::ReloadPlan {
+            set_speech_threshold: Some(0.8),
+            set_silence_ms: Some(1200),
+            set_followup_timeout_ms: Some(9000),
+            set_conversation_mode: Some(true),
+            set_idle_exit_timeout_ms: Some(60_000),
+            ..config::ReloadPlan::default()
+        };
+        p.apply_plan(&plan);
+        assert_eq!(p.speech_threshold, 0.8);
+        assert_eq!(p.followup_timeout, Duration::from_millis(9000));
+        assert!(p.conversation_mode);
+        assert_eq!(p.idle_exit_timeout, Some(Duration::from_millis(60_000)));
+    }
+
+    #[test]
+    fn apply_plan_idle_exit_zero_disables() {
+        // idle_exit_timeout_ms = 0 means "always-on" → the Option clears to None.
+        let mut p = build_pipeline();
+        p.idle_exit_timeout = Some(Duration::from_millis(1000));
+        let plan = config::ReloadPlan {
+            set_idle_exit_timeout_ms: Some(0),
+            ..config::ReloadPlan::default()
+        };
+        p.apply_plan(&plan);
+        assert_eq!(p.idle_exit_timeout, None);
+    }
+
+    #[test]
+    fn apply_plan_rebuilds_wake_detector_on_sensitivity_change() {
+        // The wake-sensitivity branch must invoke the builder; the builder here
+        // flips `detects` to true so we can observe the swap took effect.
+        let mut p = build_pipeline();
+        // Replace the builder with one that yields a detector that always fires.
+        p.wake_builder = Box::new(|_s| Ok(FakeWake { detects: true }));
+        assert!(!p.wake.detect(&[0.0; 10]).unwrap());
+        let plan = config::ReloadPlan {
+            rebuild_wake_sensitivity: Some(0.9),
+            ..config::ReloadPlan::default()
+        };
+        p.apply_plan(&plan);
+        assert!(
+            p.wake.detect(&[0.0; 10]).unwrap(),
+            "the wake detector must be rebuilt by the builder on a sensitivity change"
+        );
+    }
+
     fn spawn_pipeline(cfg: Cfg) -> Harness {
         let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(64);
         let (enabled_tx, enabled_rx) = watch::channel(cfg.enabled);
@@ -967,6 +1205,14 @@ mod tests {
         let (hit_tx, transcribe_rx) = mpsc::unbounded_channel();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         let (created_tx, created_rx) = mpsc::unbounded_channel();
+        let (_reload_tx, reload_rx) = mpsc::channel(4);
+
+        let wake_detects = cfg.wake_detects;
+        let wake_builder: WakeBuilder<FakeWake> = Box::new(move |_sensitivity| {
+            Ok(FakeWake {
+                detects: wake_detects,
+            })
+        });
 
         let sink = FakeSink::default();
         let sink_played = Arc::clone(&sink.played);
@@ -997,6 +1243,9 @@ mod tests {
             enabled_rx,
             ptt_rx,
             stop_rx,
+            reload_rx,
+            wake_builder,
+            test_tunables(),
             "test".to_string(),
             Duration::from_millis(0),
             0.5,

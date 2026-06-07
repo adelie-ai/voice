@@ -56,6 +56,21 @@ impl Endpointer {
         }
     }
 
+    /// Hot-swap the speech-probability threshold in place. The current
+    /// utterance buffer and timers are left untouched, so a live reload
+    /// (config#52) takes effect on the next pushed chunk without disturbing an
+    /// in-flight capture.
+    pub fn set_speech_threshold(&mut self, speech_threshold: f32) {
+        self.speech_threshold = speech_threshold;
+    }
+
+    /// Hot-swap the post-speech silence duration that closes an utterance, in
+    /// place (config#52). Like [`set_speech_threshold`](Self::set_speech_threshold),
+    /// the in-flight buffer and timers are preserved.
+    pub fn set_silence(&mut self, silence: Duration) {
+        self.silence = silence;
+    }
+
     /// Clear all state without arming a deadline (used when abandoning a turn).
     pub fn reset(&mut self) {
         self.buffer.clear();
@@ -297,6 +312,36 @@ mod tests {
                 "the pre-roll seed must be included in the captured utterance"
             ),
             other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_speech_threshold_takes_effect_on_the_next_chunk() {
+        // Live reload (config#52): raising the threshold mid-stream means a chunk
+        // that previously read as speech no longer does.
+        let mut ep = endpointer();
+        ep.arm(None);
+        // prob 0.6 ≥ default 0.5 → speech.
+        assert_eq!(ep.push(&vec![0.1; 100], 0.6), Endpoint::SpeechStarted);
+        ep.reset();
+        ep.arm(None);
+        ep.set_speech_threshold(0.8);
+        // Same 0.6 now < 0.8 → no speech, just accumulation (no prior speech to close).
+        assert_eq!(ep.push(&vec![0.1; 100], 0.6), Endpoint::Accumulating);
+    }
+
+    #[test]
+    fn set_silence_changes_when_an_utterance_closes() {
+        // With a long silence window, one sub-threshold chunk after speech keeps
+        // accumulating; shortening it to 0 closes on the next silence chunk.
+        let mut ep = Endpointer::new(0.5, Duration::from_secs(3600), 800);
+        ep.arm(None);
+        assert_eq!(ep.push(&vec![0.1; 1000], 0.9), Endpoint::SpeechStarted);
+        assert_eq!(ep.push(&vec![0.1; 1000], 0.0), Endpoint::Accumulating);
+        ep.set_silence(Duration::from_millis(0));
+        match ep.push(&vec![0.1; 1000], 0.0) {
+            Endpoint::Complete(samples) => assert_eq!(samples.len(), 3000),
+            other => panic!("expected Complete after shortening silence, got {other:?}"),
         }
     }
 
