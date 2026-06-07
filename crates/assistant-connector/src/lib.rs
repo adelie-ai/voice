@@ -14,7 +14,8 @@
 use std::sync::{Arc, Mutex};
 
 use adele_voice_core::VoiceError;
-use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway};
+use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway, ClientToolSpec};
+use desktop_assistant_api_model::ClientToolRegistration;
 use desktop_assistant_client_common::{Connector, SignalEvent};
 use tokio::sync::mpsc;
 
@@ -99,6 +100,23 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
         SignalEvent::Error { request_id, error } => {
             Some(AssistantEvent::Error { request_id, error })
         }
+        // The turn suspended on a client-local tool call (voice#61): the LLM is
+        // driving the voice session. Map it through so the pipeline can run the
+        // tool and post the result back, resuming the parked turn. The
+        // `conversation_id` the signal carries isn't needed here — the pipeline
+        // acts on the tool name and replies via the task/tool-call ids.
+        SignalEvent::ClientToolCall {
+            task_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+            ..
+        } => Some(AssistantEvent::ClientToolCall {
+            task_id,
+            tool_call_id,
+            tool_name,
+            arguments,
+        }),
         _ => None,
     }
 }
@@ -178,6 +196,33 @@ impl AssistantGateway for ConnectorAssistantGateway {
         }
     }
 
+    async fn register_client_tools(&self, tools: Vec<ClientToolSpec>) -> Result<usize, VoiceError> {
+        let registrations = tools
+            .into_iter()
+            .map(|t| ClientToolRegistration {
+                name: t.name,
+                description: t.description,
+                input_schema: t.input_schema,
+            })
+            .collect();
+        self.current()
+            .register_client_tools(registrations)
+            .await
+            .map_err(|e| VoiceError::Assistant(format!("register_client_tools failed: {e}")))
+    }
+
+    async fn submit_client_tool_result(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        result: Result<String, String>,
+    ) -> Result<(), VoiceError> {
+        self.current()
+            .submit_client_tool_result(task_id, tool_call_id, result)
+            .await
+            .map_err(|e| VoiceError::Assistant(format!("submit_client_tool_result failed: {e}")))
+    }
+
     async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<AssistantEvent>, VoiceError> {
         // Take a fresh slice of the current connector's fanned-out signal stream
         // and forward the response-turn events, mapped into the voice domain.
@@ -226,6 +271,23 @@ mod tests {
                 message: "checking your calendar".into()
             }),
             Some(AssistantEvent::Status { message, .. }) if message == "checking your calendar"
+        ));
+    }
+
+    #[test]
+    fn maps_client_tool_call_into_a_voice_event() {
+        // voice#61: a suspended client-tool call must reach the pipeline so it
+        // can run the tool (stop/listen/say) and post the result back.
+        assert!(matches!(
+            map_signal(SignalEvent::ClientToolCall {
+                task_id: "task-1".into(),
+                conversation_id: "conv-1".into(),
+                tool_call_id: "call-1".into(),
+                tool_name: "stop_listening".into(),
+                arguments: serde_json::json!({}),
+            }),
+            Some(AssistantEvent::ClientToolCall { task_id, tool_call_id, tool_name, .. })
+                if task_id == "task-1" && tool_call_id == "call-1" && tool_name == "stop_listening"
         ));
     }
 

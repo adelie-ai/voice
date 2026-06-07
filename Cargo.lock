@@ -34,7 +34,9 @@ name = "adele-voice-assistant-connector"
 version = "0.1.0"
 dependencies = [
  "adele-voice-core",
+ "desktop-assistant-api-model",
  "desktop-assistant-client-common",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",
@@ -56,6 +58,7 @@ dependencies = [
 name = "adele-voice-core"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
 ]

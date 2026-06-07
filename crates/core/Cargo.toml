@@ -7,3 +7,4 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+serde_json.workspace = true

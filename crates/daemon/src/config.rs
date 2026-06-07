@@ -116,6 +116,16 @@ pub struct AssistantConfig {
     /// Instruction prepended to each spoken prompt so the assistant keeps
     /// replies short, conversational, and read-aloud friendly. Empty disables.
     pub spoken_response_hint: String,
+    /// Reuse the most recent conversation on a fresh wake (not an in-turn
+    /// follow-up) when the last activity was within this window (voice#53).
+    /// Default 600000 = 10 min; `0` always starts a new conversation. A
+    /// conversation ended explicitly via the `stop_listening` client tool is
+    /// never reused regardless of this window (voice#59).
+    pub conversation_reuse_window_ms: u64,
+    /// Per-tool enable toggles for the LLM-driven session-control client tools
+    /// (voice#61). All on by default; flip one off to withhold that tool from
+    /// the orchestrator's tool list.
+    pub client_tools: ClientToolsConfig,
     /// Transport used to reach the orchestrator: `"uds"` (the default — the
     /// local Unix socket), `"ws"` (a possibly-remote WebSocket), or `"dbus"`
     /// (legacy local D-Bus). The voice service runs wherever the microphone is,
@@ -136,6 +146,30 @@ pub struct AssistantConfig {
     pub tls_ca_cert: Option<PathBuf>,
 }
 
+/// Per-tool enable toggles for the LLM-driven session-control client tools
+/// (voice#61). Each defaults to `true`; set one to `false` in
+/// `[assistant.client_tools]` to withhold it from the orchestrator's tool list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct ClientToolsConfig {
+    /// `stop_listening` — end the session when the user signals they're done.
+    pub stop_listening: bool,
+    /// `listen_for_more` — keep listening when a reply expects a response.
+    pub listen_for_more: bool,
+    /// `say_this` — speak a specific line immediately (LLM-driven narration).
+    pub say_this: bool,
+}
+
+impl Default for ClientToolsConfig {
+    fn default() -> Self {
+        Self {
+            stop_listening: true,
+            listen_for_more: true,
+            say_this: true,
+        }
+    }
+}
+
 impl Default for WakeWordConfig {
     fn default() -> Self {
         let data_dir = dirs_path("adele-voice/models");
@@ -154,6 +188,8 @@ impl Default for AssistantConfig {
             conversation_title: "Voice Conversation".into(),
             conversation_mode: false,
             followup_timeout_ms: 8000,
+            conversation_reuse_window_ms: 600_000,
+            client_tools: ClientToolsConfig::default(),
             spoken_response_hint: "You are Adele, responding by voice. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. For a simple, quick question, just answer directly — do not preface it. But if the request will take real work (looking something up, using a tool, a multi-step task), open with a SHORT spoken acknowledgement that shows you understood — a handful of words, ending in a period so it can be read aloud immediately (e.g. 'Got it — checking that now.' or 'Sure, looking into your calendar.') — then do the work and answer. Keep that acknowledgement to one short clause; never restate the whole question. Only if a message is clearly garbled or you truly cannot tell what was meant should you briefly check (e.g. 'did you mean X?') or ask one short clarifying question. Your reply will be read aloud, so keep it brief, conversational, and relevant — never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points, then ask whether they'd like more. If they ask for more, you may expand but stay under about ten sentences. Let the user lead — invite follow-ups and let them steer. Avoid markdown, lists, code blocks, and emoji.".into(),
             transport: "uds".into(),
             ws_url: None,
@@ -231,6 +267,9 @@ pub struct Tunables {
     pub silence_duration_ms: u64,
     /// Hot-swapped on the pipeline (affects the next turn).
     pub followup_timeout_ms: u64,
+    /// Hot-swapped on the pipeline (affects the next fresh wake); 0 disables
+    /// cross-wake conversation reuse (voice#53).
+    pub conversation_reuse_window_ms: u64,
     /// Hot-swapped on the pipeline (affects the next turn boundary).
     pub conversation_mode: bool,
     /// Hot-swapped on the pipeline (next idle check); 0 disables idle-exit.
@@ -260,6 +299,7 @@ impl Config {
             speech_threshold: self.vad.speech_threshold,
             silence_duration_ms: self.vad.silence_duration_ms,
             followup_timeout_ms: self.assistant.followup_timeout_ms,
+            conversation_reuse_window_ms: self.assistant.conversation_reuse_window_ms,
             conversation_mode: self.assistant.conversation_mode,
             idle_exit_timeout_ms: self.idle_exit_timeout_ms,
             wake_sensitivity: self.wake_word.sensitivity,
@@ -283,6 +323,9 @@ pub struct ReloadPlan {
     pub set_silence_ms: Option<u64>,
     /// Update the pipeline's follow-up timeout.
     pub set_followup_timeout_ms: Option<u64>,
+    /// Update the pipeline's cross-wake conversation reuse window (voice#53; 0
+    /// disables).
+    pub set_conversation_reuse_window_ms: Option<u64>,
     /// Update the pipeline's conversation-mode flag.
     pub set_conversation_mode: Option<bool>,
     /// Update the pipeline's idle-exit timeout (0 disables).
@@ -326,6 +369,9 @@ pub fn plan_reload(old: &Tunables, new: &Tunables) -> ReloadPlan {
     }
     if old.followup_timeout_ms != new.followup_timeout_ms {
         plan.set_followup_timeout_ms = Some(new.followup_timeout_ms);
+    }
+    if old.conversation_reuse_window_ms != new.conversation_reuse_window_ms {
+        plan.set_conversation_reuse_window_ms = Some(new.conversation_reuse_window_ms);
     }
     if old.conversation_mode != new.conversation_mode {
         plan.set_conversation_mode = Some(new.conversation_mode);
@@ -564,6 +610,53 @@ stt_ms = 0
             Some(new.status_narration_min_gap_ms)
         );
         assert_eq!(plan.rebuild_wake_sensitivity, None);
+    }
+
+    #[test]
+    fn conversation_reuse_window_defaults_to_ten_minutes_and_parses() {
+        // voice#53: the reuse window defaults to 10 min and round-trips from TOML.
+        assert_eq!(
+            AssistantConfig::default().conversation_reuse_window_ms,
+            600_000
+        );
+        let cfg: Config =
+            toml::from_str("[assistant]\nconversation_reuse_window_ms = 120000\n").unwrap();
+        assert_eq!(cfg.assistant.conversation_reuse_window_ms, 120_000);
+        // 0 disables reuse (always fresh).
+        let off: Config =
+            toml::from_str("[assistant]\nconversation_reuse_window_ms = 0\n").unwrap();
+        assert_eq!(off.assistant.conversation_reuse_window_ms, 0);
+    }
+
+    #[test]
+    fn client_tools_default_on_and_parse_per_tool_toggles() {
+        // voice#61: each session-control tool defaults on and can be disabled
+        // individually via [assistant.client_tools].
+        let d = ClientToolsConfig::default();
+        assert!(d.stop_listening && d.listen_for_more && d.say_this);
+
+        let cfg: Config = toml::from_str("[assistant.client_tools]\nsay_this = false\n").unwrap();
+        assert!(cfg.assistant.client_tools.stop_listening);
+        assert!(cfg.assistant.client_tools.listen_for_more);
+        assert!(
+            !cfg.assistant.client_tools.say_this,
+            "an explicitly-disabled tool must be off; unspecified ones stay on"
+        );
+    }
+
+    #[test]
+    fn conversation_reuse_window_change_hot_applies() {
+        // voice#53: the reuse window is a hot-reloadable tunable.
+        let old = Config::default().tunables();
+        let new = Tunables {
+            conversation_reuse_window_ms: old.conversation_reuse_window_ms + 60_000,
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        assert_eq!(
+            plan.set_conversation_reuse_window_ms,
+            Some(new.conversation_reuse_window_ms)
+        );
     }
 
     #[test]

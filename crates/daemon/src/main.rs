@@ -175,12 +175,18 @@ async fn main() -> Result<()> {
         Duration::from_millis(config.vad.silence_duration_ms),
         config.vad.speech_threshold,
         config.assistant.conversation_mode,
+        Duration::from_millis(config.assistant.conversation_reuse_window_ms),
         Duration::from_millis(config.assistant.followup_timeout_ms),
         (config.idle_exit_timeout_ms > 0)
             .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
         config.assistant.spoken_response_hint,
         config.wake_word.listening_cue,
         turn_timeouts,
+        pipeline::ClientToolToggles {
+            stop_listening: config.assistant.client_tools.stop_listening,
+            listen_for_more: config.assistant.client_tools.listen_for_more,
+            say_this: config.assistant.client_tools.say_this,
+        },
     );
 
     tokio::select! {
