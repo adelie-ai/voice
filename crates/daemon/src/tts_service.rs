@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use adele_voice_core::domain::SAMPLE_RATE;
 use adele_voice_core::ports::tts::TextToSpeech;
+use adele_voice_core::strip_markdown_for_speech;
 use adele_voice_dbus_interface::TtsCommand;
 use adele_voice_module::{Speaker, TtsBackend};
 use adele_voice_tts_kokoro::KokoroTts;
@@ -33,11 +34,20 @@ pub async fn run_tts_service(
                 }
             }
             TtsCommand::Synthesize { text, reply } => {
-                let result = tts
-                    .synthesize(&text)
-                    .await
-                    .map(|samples| encode_wav(&samples, SAMPLE_RATE))
-                    .map_err(|e| e.to_string());
+                // Strip markdown so `SynthesizeText` never reads asterisks/pound
+                // signs/backticks aloud (voice#63). `Say` is already covered by
+                // `Speaker::say`; this is the one spoken path that bypasses it.
+                // If nothing speakable remains, return a header-only (empty) WAV
+                // rather than feeding empty text to the backend.
+                let spoken = strip_markdown_for_speech(&text);
+                let result = if spoken.is_empty() {
+                    Ok(encode_wav(&[], SAMPLE_RATE))
+                } else {
+                    tts.synthesize(&spoken)
+                        .await
+                        .map(|samples| encode_wav(&samples, SAMPLE_RATE))
+                        .map_err(|e| e.to_string())
+                };
                 let _ = reply.send(result);
             }
             TtsCommand::ListVoices { reply } => {
