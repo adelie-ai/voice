@@ -58,9 +58,14 @@ pub struct DbusVoiceAdapter {
     ptt_tx: mpsc::Sender<PttRequest>,
     stop_tx: mpsc::Sender<StopRequest>,
     tts_tx: mpsc::Sender<TtsCommand>,
+    /// Pings the pipeline to re-read the config file and apply changed tunables
+    /// (config#52). The KCM calls `Reload` after writing config.toml so live
+    /// tuning takes effect without waiting for the file watcher.
+    reload_tx: mpsc::Sender<()>,
 }
 
 impl DbusVoiceAdapter {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state_rx: watch::Receiver<State>,
         enabled_tx: watch::Sender<bool>,
@@ -68,6 +73,7 @@ impl DbusVoiceAdapter {
         ptt_tx: mpsc::Sender<PttRequest>,
         stop_tx: mpsc::Sender<StopRequest>,
         tts_tx: mpsc::Sender<TtsCommand>,
+        reload_tx: mpsc::Sender<()>,
     ) -> Self {
         Self {
             state_rx,
@@ -76,6 +82,7 @@ impl DbusVoiceAdapter {
             ptt_tx,
             stop_tx,
             tts_tx,
+            reload_tx,
         }
     }
 }
@@ -146,6 +153,24 @@ impl DbusVoiceAdapter {
             .send(StopRequest::Conversation)
             .await
             .map_err(|e| fdo::Error::Failed(format!("failed to stop listening: {e}")))?;
+        Ok(())
+    }
+
+    /// Re-read `~/.config/adele-voice/config.toml` and apply any changed
+    /// tunables to the running pipeline without a service restart (config#52).
+    /// Hot-applies vad.speech_threshold, vad.silence_duration_ms,
+    /// assistant.followup_timeout_ms, assistant.conversation_mode, and
+    /// idle_exit_timeout_ms; rebuilds the wake detector on a
+    /// wake_word.sensitivity change. An audio-device change is logged as
+    /// needing a restart (it can't be hot-swapped). The KCM calls this after
+    /// writing the config so live tuning is instant; a file watcher also picks
+    /// up edits made any other way.
+    async fn reload(&self) -> fdo::Result<()> {
+        self.reload_tx
+            .send(())
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to trigger reload: {e}")))?;
+        tracing::info!("config reload requested over D-Bus");
         Ok(())
     }
 
