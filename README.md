@@ -132,8 +132,25 @@ The daemon owns **`org.desktopAssistant.Voice`** at `/org/desktopAssistant/Voice
 | `SayText(s)` | method | speak text with the on-device voice — for **any** app, no orchestrator involved |
 | `SynthesizeText(s) → ay` | method | return spoken text as WAV bytes (the caller routes its own audio) |
 | `ListVoices() → a(sssu)` · `GetVoice() → si` · `SetVoice(si)` | methods | enumerate / read / switch the active voice at runtime |
+| `Reload()` | method | re-read `config.toml` and apply changed tunables live (see below) |
 
 **TTS is independent of the assistant orchestrator.** `SayText` and `SynthesizeText` are handled **directly by this daemon** — they synthesize speech without ever contacting `org.desktopAssistant.Conversations` or any LLM. Other apps (an accessibility tool, or a future Orca / speech-dispatcher shim) can therefore use the on-device voice purely as a system TTS service. If the voice service isn't running, the name simply isn't on the bus — so dependent UI should degrade gracefully.
+
+### Live config reload
+
+Tuning knobs in `~/.config/adele-voice/config.toml` take effect **without a service restart**. The daemon watches the config file (debounced) and re-reads it on edits made any way; a settings UI (e.g. the KDE KCM) can also call `Reload()` after writing for an instant apply. On change, the daemon diffs the new config against the running values and applies only what changed:
+
+| Knob | On reload |
+|---|---|
+| `vad.speech_threshold` | hot-applied in place |
+| `vad.silence_duration_ms` | hot-applied in place |
+| `assistant.followup_timeout_ms` | hot-applied (next turn) |
+| `assistant.conversation_mode` | hot-applied (next turn boundary) |
+| `idle_exit_timeout_ms` | hot-applied (next idle check) |
+| `wake_word.sensitivity` | wake detector **rebuilt** (rustpotter bakes the threshold in at construction) |
+| `audio.input_device` / `audio.output_device` | **restart required** — the capture/playback stream isn't swapped live; the daemon logs a clear "restart required" note and applies every other changed knob |
+
+Everything else (model paths, STT/TTS backend & voice, the orchestrator transport) still needs a restart — those rebuild expensive sessions or reconnect a socket. The TTS voice is the exception: switch it live via `SetVoice` (above).
 
 ## Text-to-speech backends
 

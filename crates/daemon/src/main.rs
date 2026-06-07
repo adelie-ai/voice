@@ -42,11 +42,19 @@ async fn main() -> Result<()> {
 
     tracing::info!("adele-voice starting");
 
-    // Initialize components
-    let wake = RustpotterWakeWordDetector::new(
-        &config.wake_word.model_path,
-        config.wake_word.sensitivity,
-    )?;
+    // Snapshot the live-applicable knobs now, before fields move into the
+    // pipeline, so a reload can diff the on-disk config against the running
+    // values (config#52).
+    let tunables = config.tunables();
+
+    // Initialize components. The wake builder rebuilds the detector at a new
+    // sensitivity on reload (rustpotter bakes the threshold in at construction).
+    let wake_model_path = config.wake_word.model_path.clone();
+    let wake_builder: pipeline::WakeBuilder<RustpotterWakeWordDetector> = {
+        let model_path = wake_model_path.clone();
+        Box::new(move |sensitivity| RustpotterWakeWordDetector::new(&model_path, sensitivity))
+    };
+    let wake = wake_builder(config.wake_word.sensitivity)?;
     let vad = SileroVad::new(&config.vad.model_path)?;
     let stt = WhisperStt::new(&config.stt.model_path, &config.stt.language)?;
     // Select the TTS backend (local-first: Kokoro→Piper fallback, never auto
@@ -66,6 +74,9 @@ async fn main() -> Result<()> {
     // PTT payload: the target conversation id (None = the daemon's own session).
     let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
     let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<StopRequest>(1);
+    // Reload ping: the config-file watcher and the D-Bus `Reload` method both
+    // ask the pipeline to re-read config.toml and apply changed tunables (#52).
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::channel::<()>(4);
 
     // Text-to-speech service backing SayText/SynthesizeText and voice
     // selection. Shares the backend instance (TTS clones share the active-voice
@@ -95,6 +106,7 @@ async fn main() -> Result<()> {
         ptt_tx,
         stop_tx,
         tts_tx,
+        reload_tx.clone(),
     );
 
     let connection = zbus::Connection::session().await?;
@@ -106,6 +118,10 @@ async fn main() -> Result<()> {
         .request_name("org.desktopAssistant.Voice")
         .await?;
     tracing::info!("D-Bus interface registered at {DBUS_VOICE_PATH}");
+
+    // Watch the config file and ping the pipeline (debounced) on edits made
+    // outside the KCM, e.g. a hand-edit, so live tuning works either way (#52).
+    spawn_config_watcher(reload_tx);
 
     // Build and run pipeline
     let pipeline = pipeline::Pipeline::new(
@@ -120,6 +136,9 @@ async fn main() -> Result<()> {
         enabled_rx,
         ptt_rx,
         stop_rx,
+        reload_rx,
+        wake_builder,
+        tunables,
         config.assistant.conversation_title,
         Duration::from_millis(config.vad.silence_duration_ms),
         config.vad.speech_threshold,
@@ -142,6 +161,91 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Watch the config file for edits and ping the pipeline to reload (#52),
+/// debounced so a flurry of write events (editors often write+rename+chmod)
+/// collapses into a single reload.
+///
+/// We watch the *parent directory* rather than the file: many editors replace
+/// the config via a temp-file rename, which would break a watch bound to the
+/// original inode. A blocking `notify` watcher feeds a std channel; a Tokio task
+/// debounces and forwards a single `()` ping per quiet window. The KCM gets
+/// instant reload via the D-Bus `Reload` method; this covers edits made any
+/// other way (hand-edits, other tools).
+fn spawn_config_watcher(reload_tx: tokio::sync::mpsc::Sender<()>) {
+    use notify::{RecursiveMode, Watcher};
+
+    let path = config::config_path();
+    let dir = match path.parent() {
+        Some(d) => d.to_path_buf(),
+        None => {
+            tracing::warn!("config watcher: config path has no parent dir, not watching");
+            return;
+        }
+    };
+    let file_name = path.file_name().map(std::ffi::OsString::from);
+
+    // notify's callback runs on its own (non-async) thread; bridge to a std
+    // mpsc, then debounce on a dedicated blocking thread that forwards into the
+    // async reload channel. A blocking thread (not a Tokio task) is used because
+    // the std `recv()` would otherwise park a runtime worker.
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<()>();
+    let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            // Only react to events touching our config file (the dir may hold
+            // other files). Match by file name; rename targets count too.
+            let touches_config = file_name.as_ref().is_none_or(|name| {
+                event
+                    .paths
+                    .iter()
+                    .any(|p| p.file_name() == Some(name.as_os_str()))
+            });
+            let relevant = matches!(
+                event.kind,
+                notify::EventKind::Modify(_)
+                    | notify::EventKind::Create(_)
+                    | notify::EventKind::Remove(_)
+            );
+            if touches_config && relevant {
+                let _ = raw_tx.send(());
+            }
+        }
+    });
+    let watcher = match watcher {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!(
+                "config watcher: failed to create watcher, live reload on file edits disabled: {e}"
+            );
+            return;
+        }
+    };
+    let mut watcher = watcher;
+    if let Err(e) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+        tracing::warn!(
+            dir = %dir.display(),
+            "config watcher: failed to watch dir, live reload on file edits disabled: {e}"
+        );
+        return;
+    }
+
+    std::thread::spawn(move || {
+        // Keep the watcher alive for the life of the thread (dropping it stops
+        // watching).
+        let _watcher = watcher;
+        // Block until the first raw event, then wait out a short quiet window
+        // and drain any burst — collapsing an editor's write/rename/chmod storm
+        // into one reload.
+        while raw_rx.recv().is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            while raw_rx.try_recv().is_ok() {}
+            tracing::info!("config file changed, reloading");
+            if reload_tx.blocking_send(()).is_err() {
+                break; // pipeline gone
+            }
+        }
+    });
 }
 
 /// True if `bin` resolves to an existing file — an explicit path, or a bare
