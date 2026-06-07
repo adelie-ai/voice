@@ -13,10 +13,63 @@ pub struct Config {
     pub stt: SttConfig,
     pub tts: TtsConfig,
     pub assistant: AssistantConfig,
+    pub timeouts: TimeoutConfig,
     /// Exit after this many ms idle (wake word off and nothing playing) so the
     /// daemon isn't resident when unused; D-Bus activation restarts it on
     /// demand. 0 (the default) keeps it always-on.
     pub idle_exit_timeout_ms: u64,
+}
+
+/// Bounds on the otherwise-unbounded turn operations (#58). Every wait that can
+/// stall — the orchestrator response, STT decode, TTS synth, and the
+/// conversation create/subscribe/send round-trips — is capped so a wedged
+/// dependency apologizes and returns to Idle instead of hanging the user in
+/// Processing forever.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct TimeoutConfig {
+    /// Per-event stall deadline for the streaming response: if no progress
+    /// event (a text chunk OR a status) arrives within this window, the turn is
+    /// considered wedged. Resets on every event — the "if we aren't getting
+    /// progress quickly, the user has given up" guard. 0 disables.
+    pub response_stall_ms: u64,
+    /// Overall ceiling on a single turn's streaming response, regardless of
+    /// heartbeats — a backstop against an event source that dribbles just often
+    /// enough to keep resetting the stall deadline. 0 disables.
+    pub turn_budget_ms: u64,
+    /// Ceiling on a single Whisper STT decode. 0 disables.
+    pub stt_ms: u64,
+    /// Ceiling on a single TTS synth (one sentence). 0 disables.
+    pub tts_ms: u64,
+    /// Ceiling on each conversation create / subscribe / send round-trip to the
+    /// orchestrator. 0 disables.
+    pub connect_ms: u64,
+    /// Minimum gap between spoken status narrations within a turn, so a tool-
+    /// heavy turn doesn't chatter one line per tool call. The first status of a
+    /// turn always speaks; later ones are rate-limited to this interval. 0
+    /// speaks every status (not recommended); a very large value speaks only
+    /// the first.
+    pub status_narration_min_gap_ms: u64,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            // Generous enough not to clip a normal tool turn's gap between
+            // events, tight enough that a truly wedged orchestrator gives up
+            // before the user does.
+            response_stall_ms: 30_000,
+            // A turn that runs past two minutes is almost certainly wedged.
+            turn_budget_ms: 120_000,
+            stt_ms: 20_000,
+            tts_ms: 20_000,
+            connect_ms: 10_000,
+            // Speak the first status immediately, then at most one line every
+            // ~15 s — enough to reassure on a long turn without narrating every
+            // tool call.
+            status_narration_min_gap_ms: 15_000,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +154,7 @@ impl Default for AssistantConfig {
             conversation_title: "Voice Conversation".into(),
             conversation_mode: false,
             followup_timeout_ms: 8000,
-            spoken_response_hint: "You are Adele, responding by voice. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. Answer directly and naturally — do not restate or paraphrase the question back before answering; just respond. Only if a message is clearly garbled or you truly cannot tell what was meant should you briefly check (e.g. 'did you mean X?') or ask one short clarifying question. Your reply will be read aloud, so keep it brief, conversational, and relevant — never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points, then ask whether they'd like more. If they ask for more, you may expand but stay under about ten sentences. Let the user lead — invite follow-ups and let them steer. Avoid markdown, lists, code blocks, and emoji.".into(),
+            spoken_response_hint: "You are Adele, responding by voice. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. For a simple, quick question, just answer directly — do not preface it. But if the request will take real work (looking something up, using a tool, a multi-step task), open with a SHORT spoken acknowledgement that shows you understood — a handful of words, ending in a period so it can be read aloud immediately (e.g. 'Got it — checking that now.' or 'Sure, looking into your calendar.') — then do the work and answer. Keep that acknowledgement to one short clause; never restate the whole question. Only if a message is clearly garbled or you truly cannot tell what was meant should you briefly check (e.g. 'did you mean X?') or ask one short clarifying question. Your reply will be read aloud, so keep it brief, conversational, and relevant — never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points, then ask whether they'd like more. If they ask for more, you may expand but stay under about ten sentences. Let the user lead — invite follow-ups and let them steer. Avoid markdown, lists, code blocks, and emoji.".into(),
             transport: "uds".into(),
             ws_url: None,
             socket_path: None,
@@ -185,6 +238,15 @@ pub struct Tunables {
     /// Requires rebuilding the wake detector (rustpotter bakes the threshold in
     /// at construction).
     pub wake_sensitivity: f32,
+    /// Per-event response stall deadline (#58). Hot-swapped on the pipeline
+    /// (affects the next turn). 0 disables.
+    pub response_stall_ms: u64,
+    /// Overall per-turn response budget (#58). Hot-swapped on the pipeline
+    /// (affects the next turn). 0 disables.
+    pub turn_budget_ms: u64,
+    /// Minimum gap between spoken status narrations (#58). Hot-swapped on the
+    /// pipeline (affects the next turn).
+    pub status_narration_min_gap_ms: u64,
     /// Changing either device requires restarting the capture/playback stream,
     /// which we do not do live — the daemon logs "restart required" instead.
     pub input_device: String,
@@ -201,6 +263,9 @@ impl Config {
             conversation_mode: self.assistant.conversation_mode,
             idle_exit_timeout_ms: self.idle_exit_timeout_ms,
             wake_sensitivity: self.wake_word.sensitivity,
+            response_stall_ms: self.timeouts.response_stall_ms,
+            turn_budget_ms: self.timeouts.turn_budget_ms,
+            status_narration_min_gap_ms: self.timeouts.status_narration_min_gap_ms,
             input_device: self.audio.input_device.clone(),
             output_device: self.audio.output_device.clone(),
         }
@@ -222,6 +287,12 @@ pub struct ReloadPlan {
     pub set_conversation_mode: Option<bool>,
     /// Update the pipeline's idle-exit timeout (0 disables).
     pub set_idle_exit_timeout_ms: Option<u64>,
+    /// Update the pipeline's per-event response stall deadline (#58, 0 disables).
+    pub set_response_stall_ms: Option<u64>,
+    /// Update the pipeline's overall per-turn budget (#58, 0 disables).
+    pub set_turn_budget_ms: Option<u64>,
+    /// Update the pipeline's status-narration min gap (#58).
+    pub set_status_narration_min_gap_ms: Option<u64>,
     /// Rebuild the wake detector at this sensitivity.
     pub rebuild_wake_sensitivity: Option<f32>,
     /// A device changed; the capture/playback stream would need a restart, which
@@ -261,6 +332,15 @@ pub fn plan_reload(old: &Tunables, new: &Tunables) -> ReloadPlan {
     }
     if old.idle_exit_timeout_ms != new.idle_exit_timeout_ms {
         plan.set_idle_exit_timeout_ms = Some(new.idle_exit_timeout_ms);
+    }
+    if old.response_stall_ms != new.response_stall_ms {
+        plan.set_response_stall_ms = Some(new.response_stall_ms);
+    }
+    if old.turn_budget_ms != new.turn_budget_ms {
+        plan.set_turn_budget_ms = Some(new.turn_budget_ms);
+    }
+    if old.status_narration_min_gap_ms != new.status_narration_min_gap_ms {
+        plan.set_status_narration_min_gap_ms = Some(new.status_narration_min_gap_ms);
     }
     if old.wake_sensitivity != new.wake_sensitivity {
         plan.rebuild_wake_sensitivity = Some(new.wake_sensitivity);
@@ -437,6 +517,53 @@ speech_threshold = 0.7
         let plan = plan_reload(&old, &new);
         assert!(plan.restart_required_for_device.is_some());
         assert_eq!(plan.set_speech_threshold, None);
+    }
+
+    #[test]
+    fn timeout_defaults_are_sane_and_parse_from_toml() {
+        // #58: the new [timeouts] section defaults to bounded values and
+        // round-trips from TOML, with unspecified knobs keeping their defaults.
+        let d = TimeoutConfig::default();
+        assert!(d.response_stall_ms > 0 && d.turn_budget_ms > d.response_stall_ms);
+        assert!(d.stt_ms > 0 && d.tts_ms > 0 && d.connect_ms > 0);
+
+        let cfg: Config = toml::from_str(
+            r#"
+[timeouts]
+response_stall_ms = 5000
+stt_ms = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.timeouts.response_stall_ms, 5000);
+        assert_eq!(cfg.timeouts.stt_ms, 0, "0 disables the STT bound");
+        // Unspecified knobs keep their defaults.
+        assert_eq!(
+            cfg.timeouts.turn_budget_ms,
+            TimeoutConfig::default().turn_budget_ms
+        );
+    }
+
+    #[test]
+    fn timeout_knob_changes_hot_apply() {
+        // #58: the hot-reloadable timeout knobs (stall / budget / narration gap)
+        // produce an apply plan; the restart-only ones (stt/tts/connect) don't
+        // need to and aren't part of Tunables.
+        let old = Config::default().tunables();
+        let new = Tunables {
+            response_stall_ms: old.response_stall_ms + 1000,
+            turn_budget_ms: old.turn_budget_ms + 10_000,
+            status_narration_min_gap_ms: old.status_narration_min_gap_ms + 5000,
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.set_response_stall_ms, Some(new.response_stall_ms));
+        assert_eq!(plan.set_turn_budget_ms, Some(new.turn_budget_ms));
+        assert_eq!(
+            plan.set_status_narration_min_gap_ms,
+            Some(new.status_narration_min_gap_ms)
+        );
+        assert_eq!(plan.rebuild_wake_sensitivity, None);
     }
 
     #[test]

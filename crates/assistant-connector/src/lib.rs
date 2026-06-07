@@ -70,14 +70,24 @@ impl ConnectorAssistantGateway {
     }
 }
 
-/// Map an orchestrator signal to a voice turn event. Only response-turn signals
-/// matter to the voice pipeline; everything else (status, title, task,
-/// scratchpad, disconnect) is ignored.
+/// Map an orchestrator signal to a voice turn event. The response-turn signals
+/// (chunk / complete / error) and the per-turn progress `Status` matter to the
+/// voice pipeline; everything else (title, task, scratchpad, disconnect) is
+/// ignored.
 fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
     match event {
         SignalEvent::Chunk { request_id, chunk } => Some(AssistantEvent::Chunk {
             request_id,
             text: chunk,
+        }),
+        // Progress status (turn-start + per tool call). The pipeline uses it as
+        // a progress heartbeat and narrates it sparingly (#58).
+        SignalEvent::Status {
+            request_id,
+            message,
+        } => Some(AssistantEvent::Status {
+            request_id,
+            message,
         }),
         SignalEvent::Complete {
             request_id,
@@ -207,12 +217,25 @@ mod tests {
     }
 
     #[test]
+    fn maps_status_into_a_voice_status_event() {
+        // #58: progress status must reach the pipeline (for narration + as a
+        // stall heartbeat), not be dropped.
+        assert!(matches!(
+            map_signal(SignalEvent::Status {
+                request_id: "r".into(),
+                message: "checking your calendar".into()
+            }),
+            Some(AssistantEvent::Status { message, .. }) if message == "checking your calendar"
+        ));
+    }
+
+    #[test]
     fn ignores_signals_outside_the_voice_turn() {
         assert!(map_signal(SignalEvent::Disconnected { reason: "x".into() }).is_none());
         assert!(
-            map_signal(SignalEvent::Status {
-                request_id: "r".into(),
-                message: "thinking".into()
+            map_signal(SignalEvent::TitleChanged {
+                conversation_id: "c".into(),
+                title: "t".into()
             })
             .is_none()
         );

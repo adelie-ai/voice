@@ -25,6 +25,51 @@ pub type WakeBuilder<W> = Box<dyn Fn(f32) -> Result<W, VoiceError> + Send>;
 /// Spoken when the assistant turn fails — short and human, never the raw error.
 const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
 
+/// Spoken when a turn stalls (no progress within the deadline / over budget) so
+/// the user isn't left in silent Processing forever (#58).
+const STALL_APOLOGY: &str = "Sorry, that's taking too long. Let's try again.";
+
+/// A short leading ack ("Got it — checking that now.") is at most this many
+/// words; longer terminal sentences are the real answer and aren't flushed
+/// early (#58).
+const ACK_MAX_WORDS: usize = 8;
+
+/// The per-turn timeout bounds the pipeline applies (#58), grouped so the
+/// constructor's argument list stays manageable. `Duration::ZERO` disables an
+/// individual bound.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnTimeouts {
+    /// Per-event stall deadline for the streaming response; resets on each
+    /// chunk/status.
+    pub response_stall: Duration,
+    /// Overall ceiling on a single turn's streaming response.
+    pub turn_budget: Duration,
+    /// Per-synth ceiling, applied to the `Speaker`.
+    pub synth: Duration,
+    /// Per-round-trip ceiling for conversation create/subscribe/send.
+    pub connect: Duration,
+    /// Minimum gap between spoken status narrations within a turn.
+    pub status_narration_min_gap: Duration,
+}
+
+/// Wrap a future in `timeout` unless `limit` is zero (zero = unbounded), mapping
+/// an elapsed timeout to an `Assistant` error with `label` for the log (#58).
+async fn bounded<F, R>(limit: Duration, label: &str, fut: F) -> Result<R, VoiceError>
+where
+    F: std::future::Future<Output = Result<R, VoiceError>>,
+{
+    if limit.is_zero() {
+        return fut.await;
+    }
+    match tokio::time::timeout(limit, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(VoiceError::Assistant(format!(
+            "{label} timed out after {} ms",
+            limit.as_millis()
+        ))),
+    }
+}
+
 /// Buffered-sample floor below which a trailing silence won't close an
 /// utterance — guards against a single stray blip (50 ms at 16 kHz).
 const ENDPOINT_MIN_SAMPLES: usize = 800;
@@ -140,6 +185,19 @@ where
     followup_timeout: Duration,
     idle_exit_timeout: Option<Duration>,
     spoken_response_hint: String,
+    /// Per-event stall deadline for the streaming response (#58). Resets on
+    /// every chunk/status; on expiry the turn apologizes and returns to Idle.
+    /// `Duration::ZERO` disables.
+    response_stall: Duration,
+    /// Overall ceiling on a single turn's streaming response, regardless of
+    /// heartbeats (#58). `Duration::ZERO` disables.
+    turn_budget: Duration,
+    /// Minimum gap between spoken status narrations within a turn (#58). The
+    /// first status always speaks; later ones are rate-limited to this interval.
+    status_narration_min_gap: Duration,
+    /// Bound on each conversation create / subscribe / send round-trip (#58).
+    /// `Duration::ZERO` disables.
+    connect_timeout: Duration,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -174,12 +232,15 @@ where
         idle_exit_timeout: Option<Duration>,
         spoken_response_hint: String,
         listening_cue: ListeningCue,
+        timeouts: TurnTimeouts,
     ) -> Self {
+        let mut speaker = Speaker::new(Arc::new(tts), Arc::clone(&sink));
+        speaker.set_synth_timeout(timeouts.synth);
         Self {
             wake,
             vad,
             transcriber: Transcriber::new(Arc::new(stt)),
-            speaker: Speaker::new(Arc::new(tts), Arc::clone(&sink)),
+            speaker,
             assistant: Arc::new(assistant),
             source,
             sink,
@@ -202,6 +263,10 @@ where
             followup_timeout,
             idle_exit_timeout,
             spoken_response_hint,
+            response_stall: timeouts.response_stall,
+            turn_budget: timeouts.turn_budget,
+            status_narration_min_gap: timeouts.status_narration_min_gap,
+            connect_timeout: timeouts.connect,
         }
     }
 
@@ -300,6 +365,27 @@ where
             tracing::info!(
                 idle_exit_timeout_ms = ms,
                 "config reload: applied idle_exit_timeout_ms"
+            );
+        }
+        if let Some(ms) = plan.set_response_stall_ms {
+            self.response_stall = Duration::from_millis(ms);
+            tracing::info!(
+                response_stall_ms = ms,
+                "config reload: applied timeouts.response_stall_ms"
+            );
+        }
+        if let Some(ms) = plan.set_turn_budget_ms {
+            self.turn_budget = Duration::from_millis(ms);
+            tracing::info!(
+                turn_budget_ms = ms,
+                "config reload: applied timeouts.turn_budget_ms"
+            );
+        }
+        if let Some(ms) = plan.set_status_narration_min_gap_ms {
+            self.status_narration_min_gap = Duration::from_millis(ms);
+            tracing::info!(
+                status_narration_min_gap_ms = ms,
+                "config reload: applied timeouts.status_narration_min_gap_ms"
             );
         }
         if let Some(sensitivity) = plan.rebuild_wake_sensitivity {
@@ -621,18 +707,27 @@ where
             target
         } else {
             if self.conversation_id.is_none() {
-                let id = self
-                    .assistant
-                    .create_conversation(&self.conversation_title)
-                    .await?;
+                // Bound the create round-trip: a wedged orchestrator must not
+                // leave the user hanging in Processing (#58).
+                let id = bounded(
+                    self.connect_timeout,
+                    "create_conversation",
+                    self.assistant.create_conversation(&self.conversation_title),
+                )
+                .await?;
                 tracing::info!(conversation_id = %id, "created voice conversation");
                 self.conversation_id = Some(id);
             }
             self.conversation_id.as_ref().unwrap().clone()
         };
 
-        // Subscribe to response signals
-        let mut signal_rx = self.assistant.subscribe().await?;
+        // Subscribe to response signals (bounded — #58).
+        let mut signal_rx = bounded(
+            self.connect_timeout,
+            "subscribe",
+            self.assistant.subscribe(),
+        )
+        .await?;
 
         // Send the CLEAN transcript as the user message and pass the
         // spoken-response hint as a per-request system_refinement, so the reply
@@ -640,22 +735,91 @@ where
         // polluting the visible chat transcript. The gateway falls back to
         // prepending the hint (the pre-#200 behaviour) when the orchestrator
         // lacks the refinement-aware method.
-        let request_id = self
-            .assistant
-            .send_prompt_with_system_refinement(
+        let request_id = bounded(
+            self.connect_timeout,
+            "send_prompt",
+            self.assistant.send_prompt_with_system_refinement(
                 &conversation_id,
                 &transcript.text,
                 &self.spoken_response_hint,
-            )
-            .await?;
+            ),
+        )
+        .await?;
 
-        // Stream response through sentence buffer → TTS → speaker
+        self.stream_response(&mut signal_rx, &request_id).await?;
+
+        Ok(UtteranceOutcome::Continue)
+    }
+
+    /// Drive the streaming response to completion: chunks → sentence buffer →
+    /// TTS, sparingly-narrated status, all under a progress-heartbeat stall
+    /// deadline plus an overall turn budget (#58).
+    ///
+    /// The heartbeat is the core guard: `signal_rx.recv()` is wrapped in a
+    /// per-event deadline that RESETS on every received event (chunk OR status),
+    /// so a turn that keeps making progress never times out, but one that goes
+    /// silent — a wedged orchestrator — apologizes and returns to Idle instead
+    /// of hanging in Processing forever. The turn budget is a backstop against
+    /// an event source that dribbles just often enough to keep resetting the
+    /// stall clock.
+    async fn stream_response(
+        &mut self,
+        signal_rx: &mut mpsc::UnboundedReceiver<AssistantEvent>,
+        request_id: &str,
+    ) -> anyhow::Result<()> {
+        // The heartbeat / budget / narration clocks use `tokio::time::Instant`
+        // so they stay consistent with the `tokio::time::{sleep, timeout}` this
+        // loop awaits — and so the paused-time test clock advances them too.
+        use tokio::time::Instant as TokioInstant;
+
         let mut sentence_buf = SentenceBuffer::new(Duration::from_millis(500));
         let mut first_chunk = true;
+        // Status narration rate-limit (#58): the first status always speaks;
+        // later ones speak only after `status_narration_min_gap` has elapsed.
+        let mut last_status_spoken_at: Option<TokioInstant> = None;
+        // Overall turn budget (#58); `None` when disabled.
+        let turn_deadline =
+            (!self.turn_budget.is_zero()).then(|| TokioInstant::now() + self.turn_budget);
+        // Progress-heartbeat (#58): the time of the last received event. The
+        // stall deadline is measured from here and RESETS on every event, so a
+        // steadily-progressing turn never trips it. Tracked as an explicit
+        // instant (rather than a per-iteration `timeout`) so the 100 ms
+        // sentence-flush tick can't accidentally reset the stall window.
+        let mut last_event_at = TokioInstant::now();
 
         loop {
+            // How long to wait for the NEXT event before declaring a stall: the
+            // remaining slice of the stall window since the last event. The
+            // 100 ms tick keeps the sentence-buffer flush responsive without
+            // resetting that window. 0 disables the stall guard.
+            let stall_wait = if self.response_stall.is_zero() {
+                Duration::from_secs(86_400) // effectively unbounded
+            } else {
+                self.response_stall
+                    .checked_sub(last_event_at.elapsed())
+                    .unwrap_or(Duration::ZERO)
+            };
+
             tokio::select! {
-                event = signal_rx.recv() => {
+                event = tokio::time::timeout(stall_wait, signal_rx.recv()) => {
+                    let event = match event {
+                        Ok(event) => {
+                            // An event (or a clean close) arrived — that's
+                            // progress; reset the heartbeat clock (#58).
+                            last_event_at = TokioInstant::now();
+                            event
+                        }
+                        Err(_elapsed) => {
+                            // No progress within the stall window — the turn is
+                            // wedged. Apologize and bail (#58).
+                            tracing::warn!(
+                                stall_ms = self.response_stall.as_millis(),
+                                "assistant turn stalled (no progress event); apologizing and returning to Idle"
+                            );
+                            self.speak_stall_apology().await;
+                            break;
+                        }
+                    };
                     match event {
                         Some(AssistantEvent::Chunk { request_id: rid, text }) if rid == request_id => {
                             if first_chunk && is_error_response(&text) {
@@ -673,6 +837,20 @@ where
                             for sentence in sentences {
                                 self.speaker.say(&sentence).await?;
                             }
+                            // Speak a short leading ack the instant it looks
+                            // complete (a terminal opener like "Got it —
+                            // checking that now." that the boundary scan won't
+                            // split until the next token), without waiting (#58).
+                            if let Some(ack) = sentence_buf.take_leading_ack(ACK_MAX_WORDS) {
+                                self.speaker.say(&ack).await?;
+                            }
+                        }
+                        Some(AssistantEvent::Status { request_id: rid, message }) if rid == request_id => {
+                            // Progress status doubles as a heartbeat (the
+                            // timeout reset above already happened) and is
+                            // narrated SPARINGLY — the first one immediately,
+                            // later ones rate-limited (#58).
+                            self.maybe_narrate_status(&message, &mut last_status_spoken_at, &mut first_chunk).await?;
                         }
                         Some(AssistantEvent::Complete { request_id: rid, full_response }) if rid == request_id => {
                             if sentence_buf.has_content() {
@@ -732,9 +910,65 @@ where
                     }
                 }
             }
+
+            // Overall turn budget (#58): a backstop against an event source that
+            // keeps the stall clock alive by dribbling events forever.
+            if let Some(deadline) = turn_deadline
+                && TokioInstant::now() >= deadline
+            {
+                tracing::warn!(
+                    budget_ms = self.turn_budget.as_millis(),
+                    "assistant turn exceeded its overall budget; apologizing and returning to Idle"
+                );
+                self.speak_stall_apology().await;
+                break;
+            }
         }
 
-        Ok(UtteranceOutcome::Continue)
+        Ok(())
+    }
+
+    /// Speak the stall apology (best-effort — a failed apology must not turn a
+    /// timeout into a crash) and move to Speaking so the run loop returns to
+    /// Idle when playback finishes (#58).
+    async fn speak_stall_apology(&mut self) {
+        self.set_state(State::Speaking);
+        if let Err(e) = self.speaker.say(STALL_APOLOGY).await {
+            tracing::warn!("failed to speak stall apology: {e}");
+        }
+    }
+
+    /// Narrate a progress status sparingly (#58): speak the first status of the
+    /// turn immediately, then at most one every `status_narration_min_gap`.
+    /// Returns the rate-limit decision so tests can assert it.
+    async fn maybe_narrate_status(
+        &mut self,
+        message: &str,
+        last_spoken_at: &mut Option<tokio::time::Instant>,
+        first_chunk: &mut bool,
+    ) -> anyhow::Result<bool> {
+        let message = message.trim();
+        if message.is_empty() {
+            return Ok(false);
+        }
+        let now = tokio::time::Instant::now();
+        let should_speak = match *last_spoken_at {
+            None => true, // first status of the turn always speaks
+            Some(prev) => now.duration_since(prev) >= self.status_narration_min_gap,
+        };
+        if !should_speak {
+            tracing::debug!(status = %message, "status narration rate-limited; skipping");
+            return Ok(false);
+        }
+        // A status arriving before any reply text moves us into Speaking so the
+        // narration plays (and the user hears progress) rather than sitting in
+        // silent Processing.
+        if *first_chunk {
+            self.set_state(State::Speaking);
+        }
+        *last_spoken_at = Some(now);
+        self.speaker.say(message).await?;
+        Ok(true)
     }
 }
 
@@ -897,6 +1131,19 @@ mod tests {
     struct FakeTts;
     impl TextToSpeech for FakeTts {
         async fn synthesize(&self, _text: &str) -> Result<Vec<f32>, adele_voice_core::VoiceError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// TTS that records the exact text it was asked to synthesize (returning no
+    /// audio), so the #58 tests can assert what was spoken — apologies and
+    /// status narrations — without an audio device.
+    struct FakeRecordingTts {
+        spoken: Arc<StdMutex<Vec<String>>>,
+    }
+    impl TextToSpeech for FakeRecordingTts {
+        async fn synthesize(&self, text: &str) -> Result<Vec<f32>, adele_voice_core::VoiceError> {
+            self.spoken.lock().unwrap().push(text.to_string());
             Ok(Vec::new())
         }
     }
@@ -1086,15 +1333,42 @@ mod tests {
             conversation_mode: false,
             idle_exit_timeout_ms: 0,
             wake_sensitivity: 0.5,
+            response_stall_ms: 0,
+            turn_budget_ms: 0,
+            status_narration_min_gap_ms: 0,
             input_device: "default".into(),
             output_device: "default".into(),
+        }
+    }
+
+    /// Turn timeouts for the fake pipeline: all bounds disabled (0) by default
+    /// so existing tests behave exactly as before; the #58 tests construct
+    /// their own with the bounds they exercise.
+    fn test_timeouts() -> TurnTimeouts {
+        TurnTimeouts {
+            response_stall: Duration::ZERO,
+            turn_budget: Duration::ZERO,
+            synth: Duration::ZERO,
+            connect: Duration::ZERO,
+            status_narration_min_gap: Duration::ZERO,
         }
     }
 
     /// Build a non-running pipeline with fakes so `apply_plan` can be exercised
     /// directly (no audio, no file watch) — the apply side of the reload, while
     /// `plan_reload`'s decision logic is unit-tested in `config`.
-    fn build_pipeline() -> Pipeline<FakeWake, FakeVad, FakeStt, FakeTts, FakeAssistant> {
+    /// The fully-faked pipeline type used across the tests.
+    type FakePipeline = Pipeline<FakeWake, FakeVad, FakeStt, FakeRecordingTts, FakeAssistant>;
+
+    fn build_pipeline() -> FakePipeline {
+        build_pipeline_with(test_timeouts()).0
+    }
+
+    /// Build a non-running pipeline with the given turn timeouts, returning it
+    /// alongside the texts the `Speaker` was asked to synthesize — so the #58
+    /// tests can drive `stream_response`/`maybe_narrate_status` directly and
+    /// assert exactly what was spoken (apologies, narrations) without audio.
+    fn build_pipeline_with(timeouts: TurnTimeouts) -> (FakePipeline, Arc<StdMutex<Vec<String>>>) {
         let (_audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(1);
         let (_enabled_tx, enabled_rx) = watch::channel(true);
         let (_ptt_tx, ptt_rx) = mpsc::channel(1);
@@ -1106,7 +1380,8 @@ mod tests {
         let (_reload_tx, reload_rx) = mpsc::channel(4);
         let wake_builder: WakeBuilder<FakeWake> =
             Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
-        Pipeline::new(
+        let spoken = Arc::new(StdMutex::new(Vec::new()));
+        let pipeline = Pipeline::new(
             FakeWake { detects: false },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
@@ -1115,7 +1390,9 @@ mod tests {
                 hit: hit_tx,
                 text: "hello".to_string(),
             },
-            FakeTts,
+            FakeRecordingTts {
+                spoken: Arc::clone(&spoken),
+            },
             FakeAssistant {
                 tx: StdMutex::new(None),
                 prompt_tx,
@@ -1141,7 +1418,9 @@ mod tests {
             None,
             String::new(),
             ListeningCue::Off,
-        )
+            timeouts,
+        );
+        (pipeline, spoken)
     }
 
     #[test]
@@ -1193,6 +1472,241 @@ mod tests {
         assert!(
             p.wake.detect(&[0.0; 10]).unwrap(),
             "the wake detector must be rebuilt by the builder on a sensitivity change"
+        );
+    }
+
+    #[test]
+    fn apply_plan_updates_timeout_knobs() {
+        // #58: the new timeout knobs hot-apply on reload like the other tunables.
+        let mut p = build_pipeline();
+        let plan = config::ReloadPlan {
+            set_response_stall_ms: Some(7000),
+            set_turn_budget_ms: Some(90_000),
+            set_status_narration_min_gap_ms: Some(12_000),
+            ..config::ReloadPlan::default()
+        };
+        p.apply_plan(&plan);
+        assert_eq!(p.response_stall, Duration::from_millis(7000));
+        assert_eq!(p.turn_budget, Duration::from_millis(90_000));
+        assert_eq!(p.status_narration_min_gap, Duration::from_millis(12_000));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stall_with_no_progress_apologizes_and_returns() {
+        // #58 core: with a stall deadline and an event source that never sends,
+        // the response loop must give up after the deadline — speak the stall
+        // apology and return — instead of hanging in Processing forever.
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            response_stall: Duration::from_millis(500),
+            ..test_timeouts()
+        });
+        // A receiver whose sender we keep alive but never use: recv() pends, so
+        // only the stall deadline can end the loop.
+        let (_tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        tokio::time::timeout(Duration::from_secs(5), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("stream_response must return on stall, not hang")
+            .expect("stream_response ok");
+        assert_eq!(
+            spoken.lock().unwrap().clone(),
+            vec![STALL_APOLOGY.to_string()],
+            "a stalled turn must speak the stall apology"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_resets_the_clock_on_each_event() {
+        // #58 core: each received event RESETS the stall deadline, so a turn
+        // that keeps making progress (chunks/statuses spaced just under the
+        // deadline) never times out — it completes normally.
+        let stall = Duration::from_millis(500);
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            response_stall: stall,
+            ..test_timeouts()
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+
+        // Feed several events each at 60% of the stall window — under the
+        // deadline only because every event resets it — then complete.
+        let feeder = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(stall.mul_f32(0.6)).await;
+                let _ = tx.send(AssistantEvent::Chunk {
+                    request_id: "req".into(),
+                    text: "word ".into(),
+                });
+            }
+            tokio::time::sleep(stall.mul_f32(0.6)).await;
+            let _ = tx.send(AssistantEvent::Complete {
+                request_id: "req".into(),
+                full_response: "word word word word word".into(),
+            });
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("a steadily-progressing turn must not be killed by the stall guard")
+            .expect("stream_response ok");
+        feeder.await.unwrap();
+
+        let said = spoken.lock().unwrap().clone();
+        assert!(
+            !said.iter().any(|s| s == STALL_APOLOGY),
+            "a turn that kept making progress must NOT hit the stall apology; said: {said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn turn_budget_caps_a_dribbling_turn() {
+        // #58: the overall budget is a backstop — even if events keep resetting
+        // the per-event stall clock, a turn that runs past the budget gives up.
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            response_stall: Duration::from_secs(10), // never the limiting factor
+            turn_budget: Duration::from_millis(400),
+            ..test_timeouts()
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        // Dribble forever, faster than the stall window, never completing.
+        let feeder = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if tx
+                    .send(AssistantEvent::Status {
+                        request_id: "req".into(),
+                        message: "still working".into(),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("the budget must cap a dribbling turn")
+            .expect("stream_response ok");
+        feeder.abort();
+        assert!(
+            spoken.lock().unwrap().iter().any(|s| s == STALL_APOLOGY),
+            "a turn over budget must speak the stall apology"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_status_narrates_then_rate_limited() {
+        // #58: status narration is sparing — the first status of a turn speaks,
+        // a second arriving inside the min-gap is suppressed.
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            status_narration_min_gap: Duration::from_secs(3600), // effectively "only the first"
+            ..test_timeouts()
+        });
+        let mut last: Option<tokio::time::Instant> = None;
+        let mut first_chunk = true;
+
+        let spoke1 = p
+            .maybe_narrate_status("checking your calendar", &mut last, &mut first_chunk)
+            .await
+            .unwrap();
+        let spoke2 = p
+            .maybe_narrate_status("looking up the weather", &mut last, &mut first_chunk)
+            .await
+            .unwrap();
+
+        assert!(spoke1, "the first status must be narrated");
+        assert!(
+            !spoke2,
+            "a second status inside the min-gap must be suppressed"
+        );
+        assert_eq!(
+            spoken.lock().unwrap().clone(),
+            vec!["checking your calendar".to_string()],
+            "only the first status is spoken"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_status_is_not_narrated() {
+        // A blank status must never be spoken (and must not consume the "first
+        // status" slot).
+        let (mut p, spoken) = build_pipeline_with(test_timeouts());
+        let mut last: Option<tokio::time::Instant> = None;
+        let mut first_chunk = true;
+        let spoke = p
+            .maybe_narrate_status("   ", &mut last, &mut first_chunk)
+            .await
+            .unwrap();
+        assert!(!spoke, "a blank status must not be narrated");
+        assert!(
+            last.is_none(),
+            "a blank status must not arm the rate-limiter"
+        );
+        assert!(spoken.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn status_after_the_gap_narrates_again() {
+        // #58: once the min-gap has elapsed, a later status narrates again — the
+        // reassurance cadence on a long turn.
+        let gap = Duration::from_secs(15);
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            status_narration_min_gap: gap,
+            ..test_timeouts()
+        });
+        let mut last: Option<tokio::time::Instant> = None;
+        let mut first_chunk = true;
+
+        assert!(
+            p.maybe_narrate_status("first", &mut last, &mut first_chunk)
+                .await
+                .unwrap()
+        );
+        // Inside the gap: suppressed.
+        tokio::time::sleep(gap / 2).await;
+        assert!(
+            !p.maybe_narrate_status("too soon", &mut last, &mut first_chunk)
+                .await
+                .unwrap()
+        );
+        // Past the gap: narrates again.
+        tokio::time::sleep(gap).await;
+        assert!(
+            p.maybe_narrate_status("later", &mut last, &mut first_chunk)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            spoken.lock().unwrap().clone(),
+            vec!["first".to_string(), "later".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn leading_ack_is_spoken_before_the_next_token() {
+        // #58: a short terminal ack chunk is spoken immediately, without waiting
+        // for the following sentence to arrive.
+        let (mut p, spoken) = build_pipeline_with(test_timeouts());
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        // One chunk that is just the ack (ends in a period, alone in the buffer)
+        // then complete with nothing more.
+        tx.send(AssistantEvent::Chunk {
+            request_id: "req".into(),
+            text: "Got it — checking that now.".into(),
+        })
+        .unwrap();
+        tx.send(AssistantEvent::Complete {
+            request_id: "req".into(),
+            full_response: "Got it — checking that now.".into(),
+        })
+        .unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(2), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("stream_response must complete")
+            .expect("ok");
+        let said = spoken.lock().unwrap().clone();
+        assert!(
+            said.first().map(String::as_str) == Some("Got it — checking that now."),
+            "the leading ack must be spoken first; said: {said:?}"
         );
     }
 
@@ -1254,6 +1768,7 @@ mod tests {
             cfg.idle_exit_timeout,
             cfg.spoken_response_hint,
             cfg.listening_cue,
+            test_timeouts(),
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;

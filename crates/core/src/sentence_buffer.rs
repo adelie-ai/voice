@@ -27,6 +27,29 @@ impl SentenceBuffer {
         self.extract_sentences()
     }
 
+    /// Flush a short leading acknowledgement the instant it looks complete,
+    /// without waiting for the next chunk (#58).
+    ///
+    /// The spoken-response hint asks the model to open a larger turn with a
+    /// brief ack ("Got it — checking that now.") terminated by a period.
+    /// [`find_sentence_boundary`](Self::find_sentence_boundary) only splits when
+    /// the punctuation is *followed* by more text, so an ack sitting alone at
+    /// the buffer's end would otherwise stall until the next token arrives —
+    /// exactly the early feedback the user is waiting for. This flushes such a
+    /// terminal ack immediately, but ONLY when it is short (<= `max_words`),
+    /// so a genuine first sentence of the answer isn't spoken twice.
+    pub fn take_leading_ack(&mut self, max_words: usize) -> Option<String> {
+        let trimmed = self.buffer.trim_end();
+        if !trimmed.ends_with(['.', '!', '?']) {
+            return None;
+        }
+        let ack = trimmed.trim();
+        if ack.is_empty() || ack.split_whitespace().count() > max_words {
+            return None;
+        }
+        Some(self.flush())
+    }
+
     /// Check if the timeout has expired and flush the remaining buffer as a sentence.
     pub fn flush_if_timeout(&mut self) -> Option<String> {
         if let Some(last) = self.last_chunk_at
@@ -157,5 +180,40 @@ mod tests {
         let s = buf.push("");
         assert!(s.is_empty());
         assert!(!buf.has_content());
+    }
+
+    #[test]
+    fn take_leading_ack_flushes_a_short_terminal_opener() {
+        // #58: a short ack alone at the end of the buffer is spoken immediately,
+        // before the next token arrives.
+        let mut buf = SentenceBuffer::new(Duration::from_millis(500));
+        assert!(buf.push("Got it — checking that now.").is_empty());
+        let ack = buf.take_leading_ack(8);
+        assert_eq!(ack.as_deref(), Some("Got it — checking that now."));
+        assert!(
+            !buf.has_content(),
+            "the ack must be drained from the buffer"
+        );
+    }
+
+    #[test]
+    fn take_leading_ack_ignores_a_long_first_sentence() {
+        // A real (long) first sentence of the answer must NOT be flushed as an
+        // ack — that would speak it early and then again on the normal path.
+        let mut buf = SentenceBuffer::new(Duration::from_millis(500));
+        buf.push("The weather today is sunny with a high of about seventy two degrees.");
+        assert!(
+            buf.take_leading_ack(8).is_none(),
+            "a long terminal sentence is not a leading ack"
+        );
+        assert!(buf.has_content(), "a non-ack must stay buffered");
+    }
+
+    #[test]
+    fn take_leading_ack_waits_for_terminal_punctuation() {
+        // An incomplete opener (no sentence-ending punctuation yet) isn't ready.
+        let mut buf = SentenceBuffer::new(Duration::from_millis(500));
+        buf.push("Got it");
+        assert!(buf.take_leading_ack(8).is_none());
     }
 }

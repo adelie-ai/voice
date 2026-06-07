@@ -61,7 +61,17 @@ async fn main() -> Result<()> {
     };
     let wake = wake_builder(config.wake_word.sensitivity)?;
     let vad = SileroVad::new(&config.vad.model_path)?;
-    let stt = WhisperStt::new(&config.stt.model_path, &config.stt.language)?;
+    // STT decode is bounded (#58): a wedged inference apologizes instead of
+    // hanging the turn. 0 disables the bound.
+    let stt = if config.timeouts.stt_ms == 0 {
+        WhisperStt::new(&config.stt.model_path, &config.stt.language)?
+    } else {
+        WhisperStt::with_timeout(
+            &config.stt.model_path,
+            &config.stt.language,
+            Duration::from_millis(config.timeouts.stt_ms),
+        )?
+    };
     // Select the TTS backend (local-first: Kokoro→Piper fallback, never auto
     // cloud). The conversation pipeline and the SayText service share it.
     let tts = TtsBackend::from_config(&config.tts).await;
@@ -95,7 +105,12 @@ async fn main() -> Result<()> {
         .map(std::path::Path::to_path_buf)
         .unwrap_or_default();
     let tts_handle = Arc::new(tts.clone());
-    let say_speaker = Speaker::new(Arc::clone(&tts_handle), Arc::clone(&sink));
+    let mut say_speaker = Speaker::new(Arc::clone(&tts_handle), Arc::clone(&sink));
+    // Bound on-demand SayText synth too, so a wedged backend can't hang the
+    // SayText service (#58). 0 disables.
+    if config.timeouts.tts_ms > 0 {
+        say_speaker.set_synth_timeout(Duration::from_millis(config.timeouts.tts_ms));
+    }
     tokio::spawn(tts_service::run_tts_service(
         say_speaker,
         tts_handle,
@@ -128,6 +143,18 @@ async fn main() -> Result<()> {
     // outside the KCM, e.g. a hand-edit, so live tuning works either way (#52).
     spawn_config_watcher(reload_tx);
 
+    // Turn timeouts (#58): bound the synth, response heartbeat, overall budget,
+    // connect round-trips, and status-narration cadence. 0 disables a bound.
+    let turn_timeouts = pipeline::TurnTimeouts {
+        response_stall: Duration::from_millis(config.timeouts.response_stall_ms),
+        turn_budget: Duration::from_millis(config.timeouts.turn_budget_ms),
+        synth: Duration::from_millis(config.timeouts.tts_ms),
+        connect: Duration::from_millis(config.timeouts.connect_ms),
+        status_narration_min_gap: Duration::from_millis(
+            config.timeouts.status_narration_min_gap_ms,
+        ),
+    };
+
     // Build and run pipeline
     let pipeline = pipeline::Pipeline::new(
         wake,
@@ -153,6 +180,7 @@ async fn main() -> Result<()> {
             .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
         config.assistant.spoken_response_hint,
         config.wake_word.listening_cue,
+        turn_timeouts,
     );
 
     tokio::select! {

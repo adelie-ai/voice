@@ -2,10 +2,16 @@
 //! the audio on a sink. Independent of the microphone — speaking never listens.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use adele_voice_core::VoiceError;
 use adele_voice_core::ports::audio::AudioSink;
 use adele_voice_core::ports::tts::TextToSpeech;
+
+/// Default ceiling on a single synth call (#58). Local Kokoro/Piper synth a
+/// short sentence in well under a second and even a cloud Polly round-trip is a
+/// second or two, so this only fires when the backend is genuinely wedged.
+pub const DEFAULT_SYNTH_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Synthesizes text and plays it through an [`AudioSink`].
 ///
@@ -15,6 +21,9 @@ use adele_voice_core::ports::tts::TextToSpeech;
 pub struct Speaker<T> {
     tts: Arc<T>,
     sink: Arc<dyn AudioSink>,
+    /// Per-synth timeout; a synth that exceeds it errors so the caller can
+    /// apologize and move on rather than hang (#58). 0 disables.
+    synth_timeout: Duration,
 }
 
 // Manual `Clone` clones the two handles without requiring `T: Clone`.
@@ -23,20 +32,46 @@ impl<T> Clone for Speaker<T> {
         Self {
             tts: Arc::clone(&self.tts),
             sink: Arc::clone(&self.sink),
+            synth_timeout: self.synth_timeout,
         }
     }
 }
 
 impl<T: TextToSpeech> Speaker<T> {
     pub fn new(tts: Arc<T>, sink: Arc<dyn AudioSink>) -> Self {
-        Self { tts, sink }
+        Self {
+            tts,
+            sink,
+            synth_timeout: DEFAULT_SYNTH_TIMEOUT,
+        }
+    }
+
+    /// Override the per-synth timeout (config knob, #58). `Duration::ZERO`
+    /// disables the bound.
+    pub fn set_synth_timeout(&mut self, timeout: Duration) {
+        self.synth_timeout = timeout;
     }
 
     /// Synthesize `text` and queue it for playback. Empty synthesis (e.g. a
-    /// backend that produced no audio) is a no-op rather than an error.
+    /// backend that produced no audio) is a no-op rather than an error. The
+    /// synth is bounded by [`set_synth_timeout`](Self::set_synth_timeout): a
+    /// wedged backend errors instead of hanging the turn (#58).
     pub async fn say(&self, text: &str) -> Result<(), VoiceError> {
         tracing::info!(text = %text, "speaking");
-        let samples = self.tts.synthesize(text).await?;
+        let synth = self.tts.synthesize(text);
+        let samples = if self.synth_timeout.is_zero() {
+            synth.await?
+        } else {
+            match tokio::time::timeout(self.synth_timeout, synth).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    return Err(VoiceError::Tts(format!(
+                        "synthesis timed out after {} ms",
+                        self.synth_timeout.as_millis()
+                    )));
+                }
+            }
+        };
         if !samples.is_empty() {
             self.sink.play(samples)?;
         }
