@@ -24,6 +24,30 @@ pub struct Config {
 pub struct WakeWordConfig {
     pub model_path: PathBuf,
     pub sensitivity: f32,
+    /// Fire the wake word the moment enough partial frames clear the threshold
+    /// (eager) rather than at the end of the utterance. Snappier trigger, at a
+    /// higher false-trigger risk — tune alongside `sensitivity` (#50). Default
+    /// on for the lower latency the issue asks for; flip off to be conservative.
+    pub eager: bool,
+    /// Audible cue played the instant the daemon enters Listening (and on each
+    /// conversation-mode follow-up re-listen): `"ding"` (a short earcon, the
+    /// default — instant), `"phrase"` (a spoken micro-phrase like "Yes?" —
+    /// friendlier but adds ~1 s), or `"off"` (no cue) (#51).
+    pub listening_cue: ListeningCue,
+}
+
+/// How the daemon announces that it has started Listening (#51).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ListeningCue {
+    /// A short generated earcon (~120 ms tone). Instant and reliable — default.
+    #[default]
+    Ding,
+    /// A spoken micro-phrase ("Yes?", "How can I help?", …) via the TTS path.
+    /// Friendlier but adds ~1 s of synthesis/playback before the user can speak.
+    Phrase,
+    /// No cue at all.
+    Off,
 }
 
 #[derive(Debug, Deserialize)]
@@ -65,6 +89,8 @@ impl Default for WakeWordConfig {
         Self {
             model_path: data_dir.join("hey-adele.rpw"),
             sensitivity: 0.5,
+            eager: true,
+            listening_cue: ListeningCue::Ding,
         }
     }
 }
@@ -162,6 +188,38 @@ mod tests {
         assert_eq!(config.vad.silence_duration_ms, 800);
         assert_eq!(config.stt.language, "en");
         assert_eq!(config.assistant.conversation_title, "Voice Conversation");
+    }
+
+    #[test]
+    fn wake_word_defaults_to_eager_with_ding_cue() {
+        // #50/#51: snappier eager trigger by default, and the ding earcon as the
+        // default Listening cue.
+        let config = WakeWordConfig::default();
+        assert!(config.eager, "eager wake trigger is the default (#50)");
+        assert_eq!(
+            config.listening_cue,
+            ListeningCue::Ding,
+            "the ding earcon is the default Listening cue (#51)"
+        );
+    }
+
+    #[test]
+    fn parses_wake_word_eager_and_listening_cue() {
+        // The new [wake_word] knobs round-trip from TOML, including the
+        // lowercase cue variants.
+        let toml_str = r#"
+[wake_word]
+eager = false
+listening_cue = "phrase"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(!config.wake_word.eager);
+        assert_eq!(config.wake_word.listening_cue, ListeningCue::Phrase);
+
+        let off: Config = toml::from_str("[wake_word]\nlistening_cue = \"off\"\n").unwrap();
+        assert_eq!(off.wake_word.listening_cue, ListeningCue::Off);
+        // Unspecified fields keep their defaults.
+        assert!(off.wake_word.eager, "unspecified eager stays the default");
     }
 
     #[test]

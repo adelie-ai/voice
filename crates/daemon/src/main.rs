@@ -5,6 +5,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod cue;
 mod pipeline;
 mod tts_service;
 
@@ -46,6 +47,7 @@ async fn main() -> Result<()> {
     let wake = RustpotterWakeWordDetector::new(
         &config.wake_word.model_path,
         config.wake_word.sensitivity,
+        config.wake_word.eager,
     )?;
     let vad = SileroVad::new(&config.vad.model_path)?;
     let stt = WhisperStt::new(&config.stt.model_path, &config.stt.language)?;
@@ -128,6 +130,7 @@ async fn main() -> Result<()> {
         (config.idle_exit_timeout_ms > 0)
             .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
         config.assistant.spoken_response_hint,
+        config.wake_word.listening_cue,
     );
 
     tokio::select! {

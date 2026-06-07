@@ -27,7 +27,7 @@ mod tts_backend;
 pub use builders::{build_dictation, build_speaker};
 pub use config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
 pub use dictation::{Dictation, DictationOptions};
-pub use endpointer::{Endpoint, Endpointer};
+pub use endpointer::{Endpoint, Endpointer, PreBuffer};
 pub use speaker::Speaker;
 pub use transcriber::{MIN_SPEECH_RMS, Transcriber, rms};
 pub use tts_backend::TtsBackend;

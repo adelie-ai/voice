@@ -31,12 +31,21 @@ fn take_frame(buf: &mut Vec<f32>, frame: usize) -> Option<Vec<f32>> {
 }
 
 impl RustpotterWakeWordDetector {
-    pub fn new(model_path: &Path, sensitivity: f32) -> Result<Self, VoiceError> {
+    /// `eager`: when true, fire the moment `min_scores` partial frames clear the
+    /// threshold instead of waiting for the score to peak and fall back below it.
+    /// This trims the ~2 s tail latency of the default (non-eager) detector at
+    /// the cost of a higher false-trigger risk — tune with `sensitivity` (#50).
+    pub fn new(model_path: &Path, sensitivity: f32, eager: bool) -> Result<Self, VoiceError> {
         let mut config = RustpotterConfig::default();
         config.fmt.sample_rate = SAMPLE_RATE as usize;
         config.fmt.sample_format = SampleFormat::F32;
         config.fmt.channels = 1;
         config.detector.threshold = sensitivity;
+        // Fire as soon as `min_scores` partials clear the threshold rather than at
+        // the END of the utterance (score peak → fall-back), shaving the wake→
+        // listen latency. Off by default in rustpotter; we make it a config knob
+        // because eager trades latency for a higher false-trigger risk (#50).
+        config.detector.eager = eager;
         // Disable the averaged-score pre-gate (rustpotter default 0.2). It sits IN
         // FRONT of the per-frame `threshold`, so whenever the windowed average dips
         // below it a real wake word is silently dropped even though individual
@@ -61,6 +70,7 @@ impl RustpotterWakeWordDetector {
         tracing::info!(
             model = %model_path.display(),
             sensitivity,
+            eager,
             samples_per_frame,
             "wake word detector initialized"
         );
