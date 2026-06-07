@@ -19,10 +19,60 @@ pub enum AssistantEvent {
     },
     /// An error occurred while generating the response.
     Error { request_id: String, error: String },
+    /// The orchestrator's turn has suspended on a client-local tool call
+    /// (voice#61). The LLM decided to drive the voice session — stop listening,
+    /// keep listening, or speak a specific line — by calling one of the static
+    /// tools the daemon registered at startup. The pipeline runs the named tool
+    /// and MUST post the outcome back via
+    /// [`AssistantGateway::submit_client_tool_result`] (carrying the same
+    /// `task_id` + `tool_call_id`); until then the orchestrator turn is parked.
+    ///
+    /// Unlike the response-turn events, this is NOT keyed on the turn's
+    /// `request_id` — a suspended tool call carries the orchestrator `task_id`
+    /// instead, so the pipeline acts on every `ClientToolCall` it sees on the
+    /// stream rather than filtering by request id.
+    ClientToolCall {
+        task_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+/// A client-local tool the daemon advertises to the orchestrator so the LLM can
+/// drive the voice session (voice#61). Mirrors the orchestrator's
+/// `ClientToolRegistration` without the core crate depending on its api-model;
+/// the connector translates it on the wire.
+#[derive(Debug, Clone)]
+pub struct ClientToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the tool's input, forwarded verbatim to the LLM.
+    pub input_schema: serde_json::Value,
 }
 
 /// Outbound port for communicating with the desktop-assistant daemon.
 pub trait AssistantGateway: Send + Sync {
+    /// Advertise the set of client-local tools this connection can run
+    /// (voice#61). The orchestrator replaces any previously-registered set on
+    /// each call, so the full list is sent — re-register on every connect.
+    /// Returns the count the daemon accepted.
+    fn register_client_tools(
+        &self,
+        tools: Vec<ClientToolSpec>,
+    ) -> impl std::future::Future<Output = Result<usize, VoiceError>> + Send;
+
+    /// Deliver the outcome of a [`AssistantEvent::ClientToolCall`] back to the
+    /// orchestrator so the suspended turn can resume (voice#61). `result` is the
+    /// tool's textual outcome (`Ok`) or an error message (`Err`); pass the same
+    /// `task_id` + `tool_call_id` the event carried.
+    fn submit_client_tool_result(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        result: Result<String, String>,
+    ) -> impl std::future::Future<Output = Result<(), VoiceError>> + Send;
+
     /// Create a new conversation, returning its ID.
     fn create_conversation(
         &self,

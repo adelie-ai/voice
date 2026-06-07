@@ -23,6 +23,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "1"
 dirs = "6"
 notify = "8"
@@ -43,3 +44,7 @@ adele-voice-module = { path = "crates/module" }
 # checkout; mirrors adele-gtk↔desktop-assistant). Gives the voice service the
 # `Connector` + every orchestrator transport (UDS/WS/D-Bus).
 desktop-assistant-client-common = { path = "../desktop-assistant/crates/client-common" }
+# The orchestrator's wire types (e.g. `ClientToolRegistration`); client-common
+# doesn't re-export all of them, so the connector reaches this directly. Same
+# sibling source checkout as client-common (voice#61).
+desktop-assistant-api-model = { path = "../desktop-assistant/crates/api-model" }

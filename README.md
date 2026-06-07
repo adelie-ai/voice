@@ -145,6 +145,7 @@ Tuning knobs in `~/.config/adele-voice/config.toml` take effect **without a serv
 | `vad.speech_threshold` | hot-applied in place |
 | `vad.silence_duration_ms` | hot-applied in place |
 | `assistant.followup_timeout_ms` | hot-applied (next turn) |
+| `assistant.conversation_reuse_window_ms` | hot-applied (next fresh wake) — reuse the recent conversation within this window (0 disables) |
 | `assistant.conversation_mode` | hot-applied (next turn boundary) |
 | `idle_exit_timeout_ms` | hot-applied (next idle check) |
 | `timeouts.response_stall_ms` | hot-applied (next turn) — per-event progress-heartbeat deadline (0 disables) |
@@ -158,6 +159,29 @@ Everything else (model paths, STT/TTS backend & voice, the orchestrator transpor
 ### Turn timeouts (#58)
 
 The `[timeouts]` section bounds every otherwise-unbounded step of a turn so a wedged orchestrator, STT, or TTS backend never leaves you stuck in `Processing`. On a stall (no progress within `response_stall_ms`, resetting on each streamed chunk **or** progress status) or once the overall `turn_budget_ms` elapses, the daemon speaks a short apology and returns to Idle. Progress statuses from the orchestrator ("checking your calendar…") are narrated **sparingly** — the first immediately, then at most one per `status_narration_min_gap_ms`. Every knob accepts `0` to disable that bound. Defaults are generous (30 s stall, 120 s budget, 20 s STT/TTS, 10 s connect, 15 s narration gap) — they only fire when something is genuinely wedged.
+
+### LLM-driven session control (voice#61)
+
+At startup the daemon registers three **client-side tools** with the orchestrator so the assistant can drive the voice session itself (over the UDS/WS transports — D-Bus has no command channel for client tools). When the LLM calls one, the orchestrator suspends the turn, the daemon runs the tool locally, and the turn resumes:
+
+| Tool | Args | Effect |
+|---|---|---|
+| `stop_listening` | — | The user signalled they're done. End the session after the reply: return to wake-word-only Idle and clear the reuse-window id so the next "Hey Adele" starts fresh. |
+| `listen_for_more` | — | The reply expects an answer (e.g. it asked a question). Re-open the mic for a follow-up even outside conversation mode. |
+| `say_this` | `{ text }` | Speak this exact line aloud now — a brief LLM-driven progress note or aside, complementing the automatic progress narration. |
+
+Disable any of them per-tool under `[assistant.client_tools]` (each defaults to `true`):
+
+```toml
+[assistant.client_tools]
+stop_listening  = true
+listen_for_more = true
+say_this        = true
+```
+
+### Conversation reuse window (voice#53)
+
+`assistant.conversation_reuse_window_ms` (default `600000` = 10 min) keeps voice from opening a brand-new conversation on every wake. On a **fresh wake** (not an in-turn follow-up) within the window of the last turn's activity, the daemon's own session is continued so "what about tomorrow?" still has context; outside the window it starts fresh. `0` always starts fresh. A conversation the assistant ended via `stop_listening` (or a stop phrase) is never resurrected — the next wake always starts new. State is kept in memory, so it resets on a daemon restart.
 
 ## Text-to-speech backends
 

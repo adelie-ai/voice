@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::{SAMPLE_RATE, State, StateEvent};
-use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway};
+use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway, ClientToolSpec};
 use adele_voice_core::ports::audio::{AudioSink, AudioSource};
 use adele_voice_core::ports::stt::SpeechToText;
 use adele_voice_core::ports::tts::TextToSpeech;
@@ -95,8 +95,97 @@ enum UtteranceOutcome {
     /// Normal turn — the run loop decides whether to keep listening (in
     /// conversation mode) or return to wake-word idle.
     Continue,
-    /// The user spoke a stop phrase — end the conversation now, whatever the mode.
+    /// The user spoke a stop phrase, or the LLM called the `stop_listening`
+    /// client tool — end the conversation now, whatever the mode, and clear the
+    /// reuse-window id so the next wake starts fresh (voice#59/#61).
     EndConversation,
+    /// The LLM called the `listen_for_more` client tool — keep/extend the
+    /// listening window for a follow-up even outside conversation mode (voice#61).
+    KeepListening,
+}
+
+/// The three static session-control client tools the daemon advertises so the
+/// LLM can drive the voice session (voice#61).
+pub const TOOL_STOP_LISTENING: &str = "stop_listening";
+pub const TOOL_LISTEN_FOR_MORE: &str = "listen_for_more";
+pub const TOOL_SAY_THIS: &str = "say_this";
+
+/// Which session-control client tools to advertise (voice#61). Mirrors the
+/// `[assistant.client_tools]` config toggles without the pipeline depending on
+/// the daemon's config module.
+#[derive(Debug, Clone, Copy)]
+pub struct ClientToolToggles {
+    pub stop_listening: bool,
+    pub listen_for_more: bool,
+    pub say_this: bool,
+}
+
+impl Default for ClientToolToggles {
+    fn default() -> Self {
+        Self {
+            stop_listening: true,
+            listen_for_more: true,
+            say_this: true,
+        }
+    }
+}
+
+/// Build the [`ClientToolSpec`] registrations for the enabled session-control
+/// tools (voice#61). The descriptions are written to guide the LLM on WHEN to
+/// call each — especially `stop_listening`, which must fire when the user
+/// signals they're finished. Returned in a stable order for deterministic tests.
+pub fn session_control_tools(toggles: ClientToolToggles) -> Vec<ClientToolSpec> {
+    let no_args = || {
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        })
+    };
+    let mut tools = Vec::new();
+    if toggles.stop_listening {
+        tools.push(ClientToolSpec {
+            name: TOOL_STOP_LISTENING.to_string(),
+            description: "End the voice session. Call this when the user signals they are done — \
+                they decline further help, say goodbye, or otherwise indicate the conversation is \
+                over (e.g. you ask \"Anything else?\" and they say \"No\"). After your final \
+                reply is spoken the microphone closes and the next wake word starts a brand-new \
+                conversation. Do not call it while you still expect the user to respond."
+                .to_string(),
+            input_schema: no_args(),
+        });
+    }
+    if toggles.listen_for_more {
+        tools.push(ClientToolSpec {
+            name: TOOL_LISTEN_FOR_MORE.to_string(),
+            description: "Keep listening for the user's reply. Call this when you expect the user \
+                to respond — for example you asked them a question or offered a choice — so the \
+                microphone re-opens for their answer instead of the session ending."
+                .to_string(),
+            input_schema: no_args(),
+        });
+    }
+    if toggles.say_this {
+        tools.push(ClientToolSpec {
+            name: TOOL_SAY_THIS.to_string(),
+            description: "Speak this exact line to the user out loud right now, before the rest \
+                of your reply. Use it for a brief spoken progress note or aside (e.g. \"One \
+                moment, checking that now.\") that should be read aloud verbatim."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The exact line to speak aloud."
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        });
+    }
+    tools
 }
 
 /// Whole-utterance "stop listening" phrases, matched only against the entire
@@ -182,6 +271,15 @@ where
     conversation_title: String,
     speech_threshold: f32,
     conversation_mode: bool,
+    /// Cross-wake conversation reuse window (voice#53): on a fresh wake within
+    /// this window of the last turn's activity, the daemon's own session is
+    /// continued rather than a new conversation opened. `Duration::ZERO`
+    /// disables reuse (every wake starts fresh — the pre-#53 behaviour).
+    conversation_reuse_window: Duration,
+    /// Time of the last turn's activity on the daemon's own session, used with
+    /// `conversation_reuse_window` to decide whether a fresh wake reuses
+    /// `conversation_id`. `None` until the first own-session turn (voice#53).
+    last_own_activity: Option<Instant>,
     followup_timeout: Duration,
     idle_exit_timeout: Option<Duration>,
     spoken_response_hint: String,
@@ -198,6 +296,17 @@ where
     /// Bound on each conversation create / subscribe / send round-trip (#58).
     /// `Duration::ZERO` disables.
     connect_timeout: Duration,
+    /// Which session-control client tools to advertise to the orchestrator
+    /// (voice#61).
+    client_tools: ClientToolToggles,
+    /// Set within a turn when the LLM calls `stop_listening`: after this turn's
+    /// reply is spoken the conversation ends and the next wake starts fresh.
+    /// Reset at the start of each utterance (voice#61).
+    session_end_requested: bool,
+    /// Set within a turn when the LLM calls `listen_for_more`: keep/extend the
+    /// listening window for a follow-up even outside conversation mode. Reset at
+    /// the start of each utterance (voice#61).
+    listen_for_more_requested: bool,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -228,11 +337,13 @@ where
         silence_duration: Duration,
         speech_threshold: f32,
         conversation_mode: bool,
+        conversation_reuse_window: Duration,
         followup_timeout: Duration,
         idle_exit_timeout: Option<Duration>,
         spoken_response_hint: String,
         listening_cue: ListeningCue,
         timeouts: TurnTimeouts,
+        client_tools: ClientToolToggles,
     ) -> Self {
         let mut speaker = Speaker::new(Arc::new(tts), Arc::clone(&sink));
         speaker.set_synth_timeout(timeouts.synth);
@@ -260,6 +371,8 @@ where
             conversation_title,
             speech_threshold,
             conversation_mode,
+            conversation_reuse_window,
+            last_own_activity: None,
             followup_timeout,
             idle_exit_timeout,
             spoken_response_hint,
@@ -267,12 +380,45 @@ where
             turn_budget: timeouts.turn_budget,
             status_narration_min_gap: timeouts.status_narration_min_gap,
             connect_timeout: timeouts.connect,
+            client_tools,
+            session_end_requested: false,
+            listen_for_more_requested: false,
         }
     }
 
     fn set_state(&self, state: State) {
         let _ = self.state_tx.send(state);
         tracing::info!(state = %state, "state changed");
+    }
+
+    /// Decide, on a fresh wake (Idle→Listening, NOT an in-turn follow-up),
+    /// whether the daemon's own session is still reusable (voice#53). Drops
+    /// `conversation_id` when the last own-session activity is outside the reuse
+    /// window (or reuse is disabled / there's been no own-session turn), so the
+    /// next turn opens a brand-new conversation; keeps it (continuing the chat)
+    /// when within the window. A conversation ended via `stop_listening` / a stop
+    /// phrase already cleared the id, so it's never resurrected here (voice#59).
+    fn expire_stale_conversation_on_wake(&mut self) {
+        // Reuse disabled: every wake starts fresh (pre-#53 behaviour).
+        if self.conversation_reuse_window.is_zero() {
+            self.conversation_id = None;
+            self.last_own_activity = None;
+            return;
+        }
+        match (self.conversation_id.as_ref(), self.last_own_activity) {
+            (Some(_), Some(last)) if last.elapsed() <= self.conversation_reuse_window => {
+                tracing::info!(
+                    age_ms = last.elapsed().as_millis(),
+                    "reusing the recent conversation on this wake (voice#53)"
+                );
+            }
+            (Some(_), _) => {
+                tracing::info!("last conversation is outside the reuse window; starting fresh");
+                self.conversation_id = None;
+                self.last_own_activity = None;
+            }
+            (None, _) => {}
+        }
     }
 
     /// Play the audible "Listening" cue (#51) on entering the Listening state.
@@ -353,6 +499,13 @@ where
                 "config reload: applied assistant.followup_timeout_ms"
             );
         }
+        if let Some(ms) = plan.set_conversation_reuse_window_ms {
+            self.conversation_reuse_window = Duration::from_millis(ms);
+            tracing::info!(
+                conversation_reuse_window_ms = ms,
+                "config reload: applied assistant.conversation_reuse_window_ms"
+            );
+        }
         if let Some(mode) = plan.set_conversation_mode {
             self.conversation_mode = mode;
             tracing::info!(
@@ -413,8 +566,39 @@ where
         }
     }
 
+    /// Advertise the enabled session-control client tools to the orchestrator
+    /// (voice#61) so the LLM can stop/continue listening or speak a line. A
+    /// failure here must never stop the daemon — voice still works without the
+    /// tools (the user can stop by phrase / the follow-up timeout) — so it's
+    /// logged and swallowed.
+    async fn register_session_control_tools(&mut self) {
+        let tools = session_control_tools(self.client_tools);
+        if tools.is_empty() {
+            tracing::info!("no session-control client tools enabled; skipping registration");
+            return;
+        }
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        match self.assistant.register_client_tools(tools.clone()).await {
+            Ok(count) => tracing::info!(
+                count,
+                ?names,
+                "registered session-control client tools (voice#61)"
+            ),
+            Err(e) => tracing::warn!(
+                ?names,
+                "failed to register session-control client tools (voice still works without \
+                 them): {e}"
+            ),
+        }
+    }
+
     pub async fn run(mut self) -> anyhow::Result<()> {
         let mut audio_rx = self.source.start()?;
+
+        // Advertise the LLM-driven session-control tools once at startup
+        // (voice#61). The connection is already up (built in main), so register
+        // before listening so the very first turn can use them.
+        self.register_session_control_tools().await;
 
         let mut state = State::Idle;
         self.set_state(state);
@@ -442,6 +626,13 @@ where
                         // override can't leak in: every press overwrites it, and
                         // the wake-word entry resets it to None.)
                         self.ptt_conversation_override = target.clone();
+                        // A plain PTT (own session) is a fresh entry like a wake:
+                        // honour the reuse window — keep the recent conversation if
+                        // within it, otherwise start fresh (voice#53). A targeted
+                        // PTT uses its own id and is unaffected.
+                        if target.is_none() {
+                            self.expire_stale_conversation_on_wake();
+                        }
                         state = State::Listening;
                         self.set_state(state);
                         // Wait (lead-in) for speech to start rather than cutting
@@ -476,6 +667,7 @@ where
                                 self.set_state(state);
                             }
                             self.conversation_id = None;
+                            self.last_own_activity = None;
                             self.ptt_conversation_override = None;
                             self.endpointer.reset();
                         }
@@ -529,6 +721,10 @@ where
                                     // StopSpeaking so this utterance can't leak
                                     // into a previously dictated conversation.
                                     self.ptt_conversation_override = None;
+                                    // Honour the reuse window (voice#53): keep the
+                                    // recent conversation if this wake is within
+                                    // it, else start fresh.
+                                    self.expire_stale_conversation_on_wake();
                                     // Seed the utterance with the post-wake audio
                                     // so "hey adele <command>" said in one breath
                                     // captures the command (#50). The lead-in still
@@ -580,15 +776,30 @@ where
                                             }
                                         };
 
+                                        // Decide whether to re-listen. A
+                                        // `listen_for_more` client tool re-arms
+                                        // even outside conversation mode; a plain
+                                        // turn re-listens only in conversation
+                                        // mode; `stop_listening` / a stop phrase
+                                        // ends regardless (voice#61).
+                                        let relisten = match outcome {
+                                            UtteranceOutcome::EndConversation => false,
+                                            UtteranceOutcome::KeepListening => true,
+                                            UtteranceOutcome::Continue => self.conversation_mode,
+                                        };
                                         if outcome == UtteranceOutcome::EndConversation {
-                                            // A voice "stop" command ends the
-                                            // conversation regardless of mode.
+                                            // A stop phrase or the `stop_listening`
+                                            // tool ends the conversation regardless
+                                            // of mode AND clears the reuse-window id
+                                            // so the next wake starts fresh
+                                            // (voice#59/#61).
                                             state = State::Idle;
                                             self.set_state(state);
                                             self.conversation_id = None;
+                                            self.last_own_activity = None;
                                             self.ptt_conversation_override = None;
                                             self.endpointer.reset();
-                                        } else if self.conversation_mode {
+                                        } else if relisten {
                                             // Re-open the mic for a follow-up turn:
                                             // wait for the reply to finish playing,
                                             // then drop any audio captured during
@@ -623,12 +834,19 @@ where
                                     }
                                 }
                                 Endpoint::Timeout => {
-                                    // No follow-up speech within the timeout: end
-                                    // the conversation, return to wake-word idle.
+                                    // No follow-up speech within the timeout:
+                                    // return to wake-word idle. We KEEP the
+                                    // daemon's own `conversation_id` and its
+                                    // last-activity time so a wake within the
+                                    // reuse window resumes it rather than opening
+                                    // a fresh conversation (voice#53) — the
+                                    // reuse-window check at the next turn enforces
+                                    // the deadline. A PTT-into-conversation
+                                    // override is still dropped (the client owns
+                                    // that conversation's lifecycle).
                                     tracing::info!("conversation follow-up timed out");
                                     state = State::Idle;
                                     self.set_state(state);
-                                    self.conversation_id = None;
                                     self.ptt_conversation_override = None;
                                     self.endpointer.reset();
                                 }
@@ -674,6 +892,11 @@ where
     }
 
     async fn process_utterance(&mut self, samples: Vec<f32>) -> anyhow::Result<UtteranceOutcome> {
+        // Fresh turn: clear any session-control intent the LLM may set via a
+        // client tool during this turn (voice#61).
+        self.session_end_requested = false;
+        self.listen_for_more_requested = false;
+
         // Energy-gate + transcribe (in the module's `Transcriber`). The gate
         // discards near-silent captures — ambient noise or the tail of our own
         // playback can trip the VAD without real speech, and Whisper then
@@ -703,6 +926,10 @@ where
         // conversation; we never create it (the client owns its lifecycle).
         // Otherwise fall back to the daemon's own session, creating it lazily
         // and reusing it across turns.
+        // Whether this turn ran on the daemon's own (reusable) session vs a
+        // PTT-into-conversation override; only the own session participates in
+        // the cross-wake reuse window (voice#53).
+        let own_session = self.ptt_conversation_override.is_none();
         let conversation_id = if let Some(target) = self.ptt_conversation_override.clone() {
             target
         } else {
@@ -748,6 +975,23 @@ where
 
         self.stream_response(&mut signal_rx, &request_id).await?;
 
+        // Mark the own session active so a wake within the reuse window resumes
+        // it (voice#53). Skipped for a PTT override (the client owns that
+        // conversation) and when the LLM ended the session (cleared below).
+        if own_session {
+            self.last_own_activity = Some(Instant::now());
+        }
+
+        // Translate any session-control intent the LLM set during the turn into
+        // the run loop's outcome (voice#61). `stop_listening` ends the
+        // conversation (and the run loop clears the reuse id); `listen_for_more`
+        // keeps listening even outside conversation mode.
+        if self.session_end_requested {
+            return Ok(UtteranceOutcome::EndConversation);
+        }
+        if self.listen_for_more_requested {
+            return Ok(UtteranceOutcome::KeepListening);
+        }
         Ok(UtteranceOutcome::Continue)
     }
 
@@ -889,6 +1133,14 @@ where
                             self.speaker.say(ERROR_APOLOGY).await?;
                             break;
                         }
+                        // The LLM is driving the session via a client tool
+                        // (voice#61). NOT keyed on request_id — a suspended tool
+                        // call carries the orchestrator task id instead. Run it
+                        // and post the result back so the parked turn resumes; the
+                        // turn continues streaming after.
+                        Some(AssistantEvent::ClientToolCall { task_id, tool_call_id, tool_name, arguments }) => {
+                            self.handle_client_tool_call(&task_id, &tool_call_id, &tool_name, arguments).await;
+                        }
                         None => {
                             tracing::warn!("assistant signal stream closed before completion");
                             if first_chunk {
@@ -969,6 +1221,71 @@ where
         *last_spoken_at = Some(now);
         self.speaker.say(message).await?;
         Ok(true)
+    }
+
+    /// Run a session-control client tool the LLM called mid-turn and post the
+    /// result back so the orchestrator's suspended turn resumes (voice#61).
+    ///
+    /// The server turn is PARKED awaiting the result, so we never block on TTS
+    /// completion: `stop_listening`/`listen_for_more` only set a flag the run
+    /// loop reads after the turn, and `say_this` *queues* the line on the speaker
+    /// (synth is bounded by the per-synth timeout) before returning. The result
+    /// is always submitted — `Ok` for a handled tool, `Err("unknown tool")` for
+    /// a name we don't recognize — so the turn can never hang waiting on us. A
+    /// failed submit is logged, not propagated: it must not crash the turn.
+    async fn handle_client_tool_call(
+        &mut self,
+        task_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: serde_json::Value,
+    ) {
+        tracing::info!(tool = %tool_name, %task_id, %tool_call_id, "client tool call (voice#61)");
+        let result: Result<String, String> = match tool_name {
+            TOOL_STOP_LISTENING => {
+                // End the session after this turn's reply is spoken; the run loop
+                // returns to Idle and clears the reuse id.
+                self.session_end_requested = true;
+                Ok("stopped".to_string())
+            }
+            TOOL_LISTEN_FOR_MORE => {
+                // Keep/extend the listening window for a follow-up.
+                self.listen_for_more_requested = true;
+                Ok("listening".to_string())
+            }
+            TOOL_SAY_THIS => {
+                // Speak the exact line now — queue it, don't await playback, so
+                // the suspended turn resumes promptly.
+                let text = arguments
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if text.is_empty() {
+                    Err("say_this requires a non-empty `text` argument".to_string())
+                } else {
+                    self.set_state(State::Speaking);
+                    if let Err(e) = self.speaker.say(&text).await {
+                        tracing::warn!("say_this synthesis failed: {e}");
+                        Err(format!("failed to speak: {e}"))
+                    } else {
+                        Ok("spoken".to_string())
+                    }
+                }
+            }
+            other => {
+                tracing::warn!(tool = %other, "unknown client tool requested");
+                Err("unknown tool".to_string())
+            }
+        };
+        if let Err(e) = self
+            .assistant
+            .submit_client_tool_result(task_id, tool_call_id, result)
+            .await
+        {
+            tracing::warn!("failed to submit client tool result: {e}");
+        }
     }
 }
 
@@ -1166,10 +1483,26 @@ mod tests {
     /// (via `prompt_tx`) so tests can assert PTT routing and the
     /// prompt/refinement split, and reports the title of any conversation it
     /// created (via `created_tx`).
+    /// A client-tool result the pipeline submitted back to the gateway
+    /// (voice#61) — captured so tests can assert each tool call is acknowledged.
+    #[derive(Debug, Clone)]
+    struct SubmittedToolResult {
+        task_id: String,
+        tool_call_id: String,
+        result: Result<String, String>,
+    }
+
     struct FakeAssistant {
         tx: StdMutex<Option<mpsc::UnboundedSender<AssistantEvent>>>,
         prompt_tx: mpsc::UnboundedSender<SentPrompt>,
         created_tx: mpsc::UnboundedSender<String>,
+        /// Client tools the pipeline registered at startup (voice#61).
+        registered_tx: mpsc::UnboundedSender<Vec<String>>,
+        /// Results the pipeline submitted for client-tool calls (voice#61).
+        tool_result_tx: mpsc::UnboundedSender<SubmittedToolResult>,
+        /// Optional client-tool call to inject on the turn's signal stream right
+        /// before the `Complete`, so a test can drive the tool handler (voice#61).
+        inject_tool_call: Option<(String, serde_json::Value)>,
         /// When set, `create_conversation` errors — simulating a dropped
         /// orchestrator connection so the turn fails mid-flight.
         fail: bool,
@@ -1178,7 +1511,9 @@ mod tests {
         /// Shared recording + immediate-completion path for both send
         /// methods. Records exactly what reached the gateway (target
         /// conversation, the user-visible `prompt`, and the per-request
-        /// `system_refinement`) and pushes a matching `Complete`.
+        /// `system_refinement`) and pushes a matching `Complete` — optionally
+        /// preceded by an injected `ClientToolCall` so the tool handler runs
+        /// (voice#61).
         fn record_and_complete(
             &self,
             conversation_id: &str,
@@ -1192,6 +1527,14 @@ mod tests {
             });
             let request_id = "req".to_string();
             if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+                if let Some((tool_name, arguments)) = self.inject_tool_call.clone() {
+                    let _ = tx.send(AssistantEvent::ClientToolCall {
+                        task_id: "task-1".to_string(),
+                        tool_call_id: "call-1".to_string(),
+                        tool_name,
+                        arguments,
+                    });
+                }
                 let _ = tx.send(AssistantEvent::Complete {
                     request_id: request_id.clone(),
                     full_response: "hello".to_string(),
@@ -1201,6 +1544,28 @@ mod tests {
         }
     }
     impl AssistantGateway for FakeAssistant {
+        async fn register_client_tools(
+            &self,
+            tools: Vec<ClientToolSpec>,
+        ) -> Result<usize, adele_voice_core::VoiceError> {
+            let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            let count = names.len();
+            let _ = self.registered_tx.send(names);
+            Ok(count)
+        }
+        async fn submit_client_tool_result(
+            &self,
+            task_id: &str,
+            tool_call_id: &str,
+            result: Result<String, String>,
+        ) -> Result<(), adele_voice_core::VoiceError> {
+            let _ = self.tool_result_tx.send(SubmittedToolResult {
+                task_id: task_id.to_string(),
+                tool_call_id: tool_call_id.to_string(),
+                result,
+            });
+            Ok(())
+        }
         async fn create_conversation(
             &self,
             title: &str,
@@ -1288,6 +1653,10 @@ mod tests {
         /// Lengths of every buffer queued on the sink — the listening cue (the
         /// ding earcon) shows up here.
         sink_played: Arc<StdMutex<Vec<usize>>>,
+        /// Names of the client tools the pipeline registered at startup (voice#61).
+        registered_rx: mpsc::UnboundedReceiver<Vec<String>>,
+        /// Results the pipeline submitted for client-tool calls (voice#61).
+        tool_result_rx: mpsc::UnboundedReceiver<SubmittedToolResult>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -1295,6 +1664,7 @@ mod tests {
         enabled: bool,
         wake_detects: bool,
         conversation_mode: bool,
+        conversation_reuse_window: Duration,
         followup_timeout: Duration,
         idle_exit_timeout: Option<Duration>,
         spoken_response_hint: String,
@@ -1302,6 +1672,10 @@ mod tests {
         stt_text: String,
         assistant_fails: bool,
         listening_cue: ListeningCue,
+        /// Client tool to inject on the turn's signal stream so the tool handler
+        /// runs (voice#61): `(tool_name, arguments)`.
+        inject_tool_call: Option<(String, serde_json::Value)>,
+        client_tools: ClientToolToggles,
     }
     impl Default for Cfg {
         fn default() -> Self {
@@ -1309,6 +1683,10 @@ mod tests {
                 enabled: true,
                 wake_detects: false,
                 conversation_mode: false,
+                // A generous window by default so the legacy "reuse the own
+                // session across presses" behaviour holds; the voice#53 tests
+                // opt into a specific window (or 0 = always fresh).
+                conversation_reuse_window: Duration::from_secs(600),
                 followup_timeout: Duration::from_millis(50),
                 idle_exit_timeout: None,
                 spoken_response_hint: String::new(),
@@ -1318,6 +1696,8 @@ mod tests {
                 // Default the cue off in tests so most cases don't queue cue
                 // audio onto the recording sink; cue-specific tests opt in.
                 listening_cue: ListeningCue::Off,
+                inject_tool_call: None,
+                client_tools: ClientToolToggles::default(),
             }
         }
     }
@@ -1330,6 +1710,10 @@ mod tests {
             speech_threshold: 0.5,
             silence_duration_ms: 0,
             followup_timeout_ms: 50,
+            // A generous default so the legacy "reuse the own session across
+            // presses" behaviour holds in tests that don't set a window; the
+            // voice#53 tests set their own (0 = always fresh).
+            conversation_reuse_window_ms: 600_000,
             conversation_mode: false,
             idle_exit_timeout_ms: 0,
             wake_sensitivity: 0.5,
@@ -1364,11 +1748,19 @@ mod tests {
         build_pipeline_with(test_timeouts()).0
     }
 
-    /// Build a non-running pipeline with the given turn timeouts, returning it
-    /// alongside the texts the `Speaker` was asked to synthesize — so the #58
-    /// tests can drive `stream_response`/`maybe_narrate_status` directly and
-    /// assert exactly what was spoken (apologies, narrations) without audio.
-    fn build_pipeline_with(timeouts: TurnTimeouts) -> (FakePipeline, Arc<StdMutex<Vec<String>>>) {
+    /// Captured outputs for direct handler tests (voice#61): what the `Speaker`
+    /// was asked to say, and the client-tool results the pipeline submitted.
+    struct ToolHarness {
+        spoken: Arc<StdMutex<Vec<String>>>,
+        tool_result_rx: mpsc::UnboundedReceiver<SubmittedToolResult>,
+    }
+
+    /// Build a non-running pipeline wired to capture spoken text AND submitted
+    /// client-tool results, so a test can call `handle_client_tool_call`
+    /// directly and assert both what was spoken and the result posted back
+    /// (voice#61). Mirrors `build_pipeline_with` but keeps the tool-result
+    /// receiver instead of dropping it.
+    fn build_pipeline_for_tools(reuse_window: Duration) -> (FakePipeline, ToolHarness) {
         let (_audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(1);
         let (_enabled_tx, enabled_rx) = watch::channel(true);
         let (_ptt_tx, ptt_rx) = mpsc::channel(1);
@@ -1377,6 +1769,8 @@ mod tests {
         let (hit_tx, _transcribe_rx) = mpsc::unbounded_channel();
         let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
         let (created_tx, _created_rx) = mpsc::unbounded_channel();
+        let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
+        let (tool_result_tx, tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
         let wake_builder: WakeBuilder<FakeWake> =
             Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
@@ -1397,6 +1791,9 @@ mod tests {
                 tx: StdMutex::new(None),
                 prompt_tx,
                 created_tx,
+                registered_tx,
+                tool_result_tx,
+                inject_tool_call: None,
                 fail: false,
             },
             Arc::new(FakeSource {
@@ -1414,11 +1811,86 @@ mod tests {
             Duration::from_millis(0),
             0.5,
             false,
+            reuse_window,
+            Duration::from_millis(50),
+            None,
+            String::new(),
+            ListeningCue::Off,
+            test_timeouts(),
+            ClientToolToggles::default(),
+        );
+        (
+            pipeline,
+            ToolHarness {
+                spoken,
+                tool_result_rx,
+            },
+        )
+    }
+
+    /// Build a non-running pipeline with the given turn timeouts, returning it
+    /// alongside the texts the `Speaker` was asked to synthesize — so the #58
+    /// tests can drive `stream_response`/`maybe_narrate_status` directly and
+    /// assert exactly what was spoken (apologies, narrations) without audio.
+    fn build_pipeline_with(timeouts: TurnTimeouts) -> (FakePipeline, Arc<StdMutex<Vec<String>>>) {
+        let (_audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(1);
+        let (_enabled_tx, enabled_rx) = watch::channel(true);
+        let (_ptt_tx, ptt_rx) = mpsc::channel(1);
+        let (_stop_tx, stop_rx) = mpsc::channel(1);
+        let (state_tx, _state_rx) = watch::channel(State::Idle);
+        let (hit_tx, _transcribe_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+        let (created_tx, _created_rx) = mpsc::unbounded_channel();
+        let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
+        let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
+        let (_reload_tx, reload_rx) = mpsc::channel(4);
+        let wake_builder: WakeBuilder<FakeWake> =
+            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
+        let spoken = Arc::new(StdMutex::new(Vec::new()));
+        let pipeline = Pipeline::new(
+            FakeWake { detects: false },
+            FakeVad {
+                probs: StdMutex::new(VecDeque::new()),
+            },
+            FakeStt {
+                hit: hit_tx,
+                text: "hello".to_string(),
+            },
+            FakeRecordingTts {
+                spoken: Arc::clone(&spoken),
+            },
+            FakeAssistant {
+                tx: StdMutex::new(None),
+                prompt_tx,
+                created_tx,
+                registered_tx,
+                tool_result_tx,
+                inject_tool_call: None,
+                fail: false,
+            },
+            Arc::new(FakeSource {
+                rx: StdMutex::new(Some(audio_rx)),
+            }),
+            Arc::new(FakeSink::default()),
+            state_tx,
+            enabled_rx,
+            ptt_rx,
+            stop_rx,
+            reload_rx,
+            wake_builder,
+            test_tunables(),
+            "test".to_string(),
+            Duration::from_millis(0),
+            0.5,
+            false,
+            // Matches test_tunables() so an initial reload is a no-op.
+            Duration::from_millis(600_000),
             Duration::from_millis(50),
             None,
             String::new(),
             ListeningCue::Off,
             timeouts,
+            ClientToolToggles::default(),
         );
         (pipeline, spoken)
     }
@@ -1719,6 +2191,8 @@ mod tests {
         let (hit_tx, transcribe_rx) = mpsc::unbounded_channel();
         let (prompt_tx, prompt_rx) = mpsc::unbounded_channel();
         let (created_tx, created_rx) = mpsc::unbounded_channel();
+        let (registered_tx, registered_rx) = mpsc::unbounded_channel();
+        let (tool_result_tx, tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
 
         let wake_detects = cfg.wake_detects;
@@ -1747,6 +2221,9 @@ mod tests {
                 tx: StdMutex::new(None),
                 prompt_tx,
                 created_tx,
+                registered_tx,
+                tool_result_tx,
+                inject_tool_call: cfg.inject_tool_call,
                 fail: cfg.assistant_fails,
             },
             Arc::new(FakeSource {
@@ -1764,11 +2241,13 @@ mod tests {
             Duration::from_millis(0),
             0.5,
             cfg.conversation_mode,
+            cfg.conversation_reuse_window,
             cfg.followup_timeout,
             cfg.idle_exit_timeout,
             cfg.spoken_response_hint,
             cfg.listening_cue,
             test_timeouts(),
+            cfg.client_tools,
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;
@@ -1783,6 +2262,8 @@ mod tests {
             prompt_rx,
             created_rx,
             sink_played,
+            registered_rx,
+            tool_result_rx,
             handle,
         }
     }
@@ -2320,6 +2801,426 @@ mod tests {
         assert!(
             exited.is_err(),
             "must not idle-exit while wake word is enabled"
+        );
+    }
+
+    // --- Session-control client tools (voice#61) --------------------------
+
+    #[test]
+    fn session_control_tools_carry_when_to_call_guidance() {
+        // All three tools are advertised by default, in a stable order, each
+        // with a description that guides the LLM on WHEN to call it.
+        let tools = session_control_tools(ClientToolToggles::default());
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![TOOL_STOP_LISTENING, TOOL_LISTEN_FOR_MORE, TOOL_SAY_THIS]
+        );
+        let stop = &tools[0];
+        assert!(
+            stop.description.to_lowercase().contains("done")
+                || stop.description.to_lowercase().contains("goodbye"),
+            "stop_listening must tell the LLM to call it when the user is finished"
+        );
+        // say_this takes a `text` string; the others take no args.
+        let say = tools.iter().find(|t| t.name == TOOL_SAY_THIS).unwrap();
+        assert_eq!(say.input_schema["properties"]["text"]["type"], "string");
+    }
+
+    #[test]
+    fn per_tool_toggles_withhold_disabled_tools() {
+        // A disabled tool is not advertised; the others still are.
+        let tools = session_control_tools(ClientToolToggles {
+            stop_listening: true,
+            listen_for_more: false,
+            say_this: false,
+        });
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec![TOOL_STOP_LISTENING]);
+    }
+
+    #[tokio::test]
+    async fn registers_session_control_tools_on_startup() {
+        // voice#61: the daemon advertises the three tools to the orchestrator
+        // when the pipeline starts.
+        let mut h = spawn_pipeline(Cfg::default());
+        let registered = tokio::time::timeout(Duration::from_secs(2), h.registered_rx.recv())
+            .await
+            .expect("tools should be registered at startup")
+            .expect("registered sender open");
+        h.handle.abort();
+        assert_eq!(
+            registered,
+            vec![
+                TOOL_STOP_LISTENING.to_string(),
+                TOOL_LISTEN_FOR_MORE.to_string(),
+                TOOL_SAY_THIS.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn say_this_speaks_text_and_acks() {
+        // voice#61: say_this queues the exact line on the speaker and submits
+        // Ok("spoken"). Driven directly on the handler with a recording TTS.
+        let (mut p, mut th) = build_pipeline_for_tools(Duration::ZERO);
+        p.handle_client_tool_call(
+            "task-1",
+            "call-1",
+            TOOL_SAY_THIS,
+            serde_json::json!({ "text": "One moment, checking that now." }),
+        )
+        .await;
+        assert_eq!(
+            th.spoken.lock().unwrap().clone(),
+            vec!["One moment, checking that now.".to_string()],
+            "say_this must speak the exact line"
+        );
+        let result = th
+            .tool_result_rx
+            .try_recv()
+            .expect("a result was submitted");
+        assert_eq!(result.task_id, "task-1");
+        assert_eq!(result.tool_call_id, "call-1");
+        assert_eq!(result.result, Ok("spoken".to_string()));
+    }
+
+    #[tokio::test]
+    async fn say_this_without_text_errs() {
+        // An empty/missing `text` argument is a bad call → Err result, nothing
+        // spoken.
+        let (mut p, mut th) = build_pipeline_for_tools(Duration::ZERO);
+        p.handle_client_tool_call("task-1", "call-1", TOOL_SAY_THIS, serde_json::json!({}))
+            .await;
+        assert!(th.spoken.lock().unwrap().is_empty());
+        let result = th
+            .tool_result_rx
+            .try_recv()
+            .expect("a result was submitted");
+        assert!(result.result.is_err());
+    }
+
+    #[tokio::test]
+    async fn stop_listening_sets_end_flag_and_acks() {
+        // voice#61: stop_listening flags the session to end and acks Ok("stopped").
+        let (mut p, mut th) = build_pipeline_for_tools(Duration::ZERO);
+        p.handle_client_tool_call(
+            "task-1",
+            "call-1",
+            TOOL_STOP_LISTENING,
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            p.session_end_requested,
+            "stop_listening must request ending the session"
+        );
+        let result = th
+            .tool_result_rx
+            .try_recv()
+            .expect("a result was submitted");
+        assert_eq!(result.result, Ok("stopped".to_string()));
+    }
+
+    #[tokio::test]
+    async fn listen_for_more_sets_listen_flag_and_acks() {
+        // voice#61: listen_for_more flags re-listen and acks Ok("listening").
+        let (mut p, mut th) = build_pipeline_for_tools(Duration::ZERO);
+        p.handle_client_tool_call(
+            "task-1",
+            "call-1",
+            TOOL_LISTEN_FOR_MORE,
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            p.listen_for_more_requested,
+            "listen_for_more must request keeping the mic open"
+        );
+        let result = th
+            .tool_result_rx
+            .try_recv()
+            .expect("a result was submitted");
+        assert_eq!(result.result, Ok("listening".to_string()));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_errs_with_not_found() {
+        // voice#61: an unrecognized tool name returns Err("unknown tool") and
+        // sets no session intent.
+        let (mut p, mut th) = build_pipeline_for_tools(Duration::ZERO);
+        p.handle_client_tool_call("task-1", "call-1", "make_coffee", serde_json::json!({}))
+            .await;
+        assert!(!p.session_end_requested && !p.listen_for_more_requested);
+        let result = th
+            .tool_result_rx
+            .try_recv()
+            .expect("a result was submitted");
+        assert_eq!(result.result, Err("unknown tool".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stop_listening_during_a_turn_ends_to_idle_and_clears_reuse_id() {
+        // voice#61/#59 end-to-end through the run loop: when the LLM calls
+        // stop_listening mid-turn (even in conversation mode), the turn ends to
+        // Idle, does NOT re-listen, and clears the reuse id so the next wake
+        // starts fresh. The injected tool call also gets a result submitted.
+        let mut h = spawn_pipeline(Cfg {
+            conversation_mode: true,
+            conversation_reuse_window: Duration::from_secs(600),
+            followup_timeout: Duration::from_secs(30),
+            // Two utterances: speech/silence for turn 1, speech/(exhausted)silence
+            // for turn 2.
+            vad: vec![0.9, 0.0, 0.9],
+            inject_tool_call: Some((TOOL_STOP_LISTENING.to_string(), serde_json::json!({}))),
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process -> stop_listening tool
+
+        // Conversation mode would normally re-listen; stop_listening ends to Idle.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("stop_listening returns to Idle")
+        .unwrap();
+
+        // The tool call was acknowledged.
+        let result = tokio::time::timeout(Duration::from_secs(2), h.tool_result_rx.recv())
+            .await
+            .expect("a tool result was submitted")
+            .expect("tool-result sender open");
+        assert_eq!(result.result, Ok("stopped".to_string()));
+
+        // The reuse id is cleared: a fresh wake creates a NEW own session even
+        // though we're within the reuse window.
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("second ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        // Two creates (the first turn + the post-stop fresh turn) → reuse id was
+        // cleared by stop_listening.
+        let first_created = tokio::time::timeout(Duration::from_secs(2), h.created_rx.recv())
+            .await
+            .expect("first own session created")
+            .expect("created sender open");
+        let second_created = tokio::time::timeout(Duration::from_secs(2), h.created_rx.recv())
+            .await
+            .expect("a NEW own session is created after stop_listening")
+            .expect("created sender open");
+        h.handle.abort();
+        assert_eq!(first_created, "test");
+        assert_eq!(
+            second_created, "test",
+            "after stop_listening the next wake must NOT reuse — it creates fresh"
+        );
+    }
+
+    #[tokio::test]
+    async fn listen_for_more_relistens_outside_conversation_mode() {
+        // voice#61: listen_for_more re-opens the mic for a follow-up even when
+        // conversation_mode is off (where a normal turn would return to Idle).
+        let mut h = spawn_pipeline(Cfg {
+            conversation_mode: false,
+            followup_timeout: Duration::from_secs(5),
+            inject_tool_call: Some((TOOL_LISTEN_FOR_MORE.to_string(), serde_json::json!({}))),
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process -> listen_for_more tool
+        tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv())
+            .await
+            .expect("turn 1 should transcribe")
+            .unwrap();
+
+        // Despite conversation_mode being off, the pipeline re-opens the mic.
+        let relisten = tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await;
+        h.handle.abort();
+        assert!(
+            relisten.is_ok(),
+            "listen_for_more must re-open the mic even outside conversation mode"
+        );
+    }
+
+    // --- Conversation reuse window (voice#53) -----------------------------
+
+    #[tokio::test]
+    async fn reuse_window_continues_recent_conversation_on_next_wake() {
+        // voice#53: a second wake within the reuse window resumes the same
+        // conversation rather than creating a new one. Two PTT-into-own-session
+        // turns within the window → the own session is created ONCE.
+        let mut h = spawn_pipeline(Cfg {
+            conversation_reuse_window: Duration::from_secs(600),
+            vad: vec![0.9, 0.0, 0.9],
+            ..Default::default()
+        });
+        // Turn 1.
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("first ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        let first = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("first prompt")
+            .expect("prompt sender open");
+        assert_eq!(first.conversation_id, "own-session");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("idle after turn 1")
+        .unwrap();
+        // Turn 2 (fresh wake, within the window).
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("second ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        let second = tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("second prompt")
+            .expect("prompt sender open");
+        h.handle.abort();
+        assert_eq!(second.conversation_id, "own-session");
+        // The own session was created exactly once → the second wake reused it.
+        assert_eq!(
+            h.created_rx.try_recv().expect("own session created"),
+            "test"
+        );
+        assert!(
+            h.created_rx.try_recv().is_err(),
+            "a wake within the reuse window must NOT create a second conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn reuse_disabled_starts_fresh_each_wake() {
+        // voice#53: with the window at 0, every wake starts fresh — the own
+        // session is created on each wake.
+        let mut h = spawn_pipeline(Cfg {
+            conversation_reuse_window: Duration::ZERO,
+            vad: vec![0.9, 0.0, 0.9],
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("first ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("first prompt")
+            .expect("prompt sender open");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("idle after turn 1")
+        .unwrap();
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("second ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await;
+        send_chunk(&h).await;
+        tokio::time::timeout(Duration::from_secs(2), h.prompt_rx.recv())
+            .await
+            .expect("second prompt")
+            .expect("prompt sender open");
+        h.handle.abort();
+        // Two creates → reuse disabled, fresh each wake.
+        assert_eq!(
+            h.created_rx.try_recv().expect("first own session created"),
+            "test"
+        );
+        assert_eq!(
+            h.created_rx
+                .try_recv()
+                .expect("a second own session is created when reuse is disabled"),
+            "test"
+        );
+    }
+
+    #[test]
+    fn expire_stale_conversation_drops_id_outside_window() {
+        // Unit-level reuse decision: an id older than the window is dropped; a
+        // recent one is kept; a zero window always drops.
+        let (mut p, _th) = build_pipeline_for_tools(Duration::from_millis(50));
+        p.conversation_id = Some("c1".into());
+        p.last_own_activity = Some(Instant::now() - Duration::from_secs(1));
+        p.expire_stale_conversation_on_wake();
+        assert!(
+            p.conversation_id.is_none(),
+            "a conversation older than the window must be dropped"
+        );
+
+        let (mut p, _th) = build_pipeline_for_tools(Duration::from_secs(600));
+        p.conversation_id = Some("c2".into());
+        p.last_own_activity = Some(Instant::now());
+        p.expire_stale_conversation_on_wake();
+        assert_eq!(
+            p.conversation_id.as_deref(),
+            Some("c2"),
+            "a recent conversation within the window must be kept"
+        );
+
+        let (mut p, _th) = build_pipeline_for_tools(Duration::ZERO);
+        p.conversation_id = Some("c3".into());
+        p.last_own_activity = Some(Instant::now());
+        p.expire_stale_conversation_on_wake();
+        assert!(
+            p.conversation_id.is_none(),
+            "a zero reuse window must always start fresh"
         );
     }
 }
