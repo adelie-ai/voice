@@ -215,6 +215,14 @@ cargo install --path crates/daemon         # installs `adele-voice`
 $EDITOR ~/.config/adele-voice/config.toml  # optional; sensible defaults if absent
 ```
 
+The `[wake_word]` section also controls the wake→listen feel: `eager` (default
+`true`) fires the trigger as soon as the wake word is recognized rather than at
+the end of the phrase, so a command spoken in the same breath ("hey adele what
+time is it") is captured — set it `false` if eager raises false triggers in your
+environment. `listening_cue` sets the audible "Listening" feedback when the mic
+opens: `"ding"` (default, an instant earcon), `"phrase"` (a friendlier spoken
+micro-phrase, adds ~1 s), or `"off"`.
+
 The desktop-assistant daemon must be running and exposing `org.desktopAssistant.Conversations` for prompts to be answered.
 
 **Running as a service.** `systemd/adele-voice.service` is D-Bus-activatable (`Type=dbus`): once installed it starts on demand when anything calls `org.desktopAssistant.Voice`, and also at login. Make it on-demand-only with `systemctl --user disable adele-voice`, or turn it off entirely with `systemctl --user mask adele-voice` (after which calls fail cleanly — the service simply isn't there). Set `idle_exit_timeout_ms` in the config to have the daemon exit when idle (wake word off, nothing playing) so it isn't resident between uses — activation restarts it on the next call. The session activation file is `systemd/dbus-1/org.desktopAssistant.Voice.service` (install to `~/.local/share/dbus-1/services/`).

@@ -5,6 +5,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 mod config;
+mod cue;
 mod pipeline;
 mod tts_service;
 
@@ -49,10 +50,14 @@ async fn main() -> Result<()> {
 
     // Initialize components. The wake builder rebuilds the detector at a new
     // sensitivity on reload (rustpotter bakes the threshold in at construction).
+    // `eager` (#50) is captured at startup — changing it needs a restart.
     let wake_model_path = config.wake_word.model_path.clone();
+    let wake_eager = config.wake_word.eager;
     let wake_builder: pipeline::WakeBuilder<RustpotterWakeWordDetector> = {
         let model_path = wake_model_path.clone();
-        Box::new(move |sensitivity| RustpotterWakeWordDetector::new(&model_path, sensitivity))
+        Box::new(move |sensitivity| {
+            RustpotterWakeWordDetector::new(&model_path, sensitivity, wake_eager)
+        })
     };
     let wake = wake_builder(config.wake_word.sensitivity)?;
     let vad = SileroVad::new(&config.vad.model_path)?;
@@ -147,6 +152,7 @@ async fn main() -> Result<()> {
         (config.idle_exit_timeout_ms > 0)
             .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
         config.assistant.spoken_response_hint,
+        config.wake_word.listening_cue,
     );
 
     tokio::select! {

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adele_voice_core::VoiceError;
-use adele_voice_core::domain::{State, StateEvent};
+use adele_voice_core::domain::{SAMPLE_RATE, State, StateEvent};
 use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway};
 use adele_voice_core::ports::audio::{AudioSink, AudioSource};
 use adele_voice_core::ports::stt::SpeechToText;
@@ -11,10 +11,11 @@ use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
 use adele_voice_dbus_interface::StopRequest;
-use adele_voice_module::{Endpoint, Endpointer, Speaker, Transcriber};
+use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{self, Tunables, plan_reload};
+use crate::cue::{self, ListeningCue};
 
 /// Builds a fresh wake detector at a given sensitivity. rustpotter bakes the
 /// detection threshold in at construction, so changing it on reload (config#52)
@@ -27,6 +28,12 @@ const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that
 /// Buffered-sample floor below which a trailing silence won't close an
 /// utterance — guards against a single stray blip (50 ms at 16 kHz).
 const ENDPOINT_MIN_SAMPLES: usize = 800;
+
+/// Rolling pre-buffer length kept while idle so the wake→listen handoff can seed
+/// the utterance with the audio captured right around the trigger — the start of
+/// a command spoken in the same breath ("hey adele what time is it") that the
+/// Idle→Listening transition would otherwise drop (#50). 300 ms at 16 kHz.
+const WAKE_PREBUFFER_SAMPLES: usize = (SAMPLE_RATE as usize * 300) / 1000;
 
 /// Heuristic: does this look like an orchestrator error surfaced as reply text?
 /// The orchestrator reports LLM failures as the assistant message (so they show
@@ -96,7 +103,17 @@ where
     speaker: Speaker<T>,
     assistant: Arc<A>,
     source: Arc<dyn AudioSource>,
+    /// Direct sink handle for the raw earcon (the `ding` cue is generated PCM,
+    /// not TTS, so it bypasses the `Speaker`). Shares the same playback stream.
+    sink: Arc<dyn AudioSink>,
     endpointer: Endpointer,
+    /// Rolling window of recent idle audio, used to seed the utterance with the
+    /// post-wake speech so a command spoken in the same breath isn't dropped (#50).
+    prebuffer: PreBuffer,
+    /// Audible "Listening" cue mode (ding / phrase / off) (#51).
+    listening_cue: ListeningCue,
+    /// Free-running counter so the spoken-phrase cue rotates deterministically.
+    cue_phrase_counter: u64,
     state_tx: watch::Sender<State>,
     enabled_rx: watch::Receiver<bool>,
     ptt_rx: mpsc::Receiver<Option<String>>,
@@ -156,15 +173,20 @@ where
         followup_timeout: Duration,
         idle_exit_timeout: Option<Duration>,
         spoken_response_hint: String,
+        listening_cue: ListeningCue,
     ) -> Self {
         Self {
             wake,
             vad,
             transcriber: Transcriber::new(Arc::new(stt)),
-            speaker: Speaker::new(Arc::new(tts), sink),
+            speaker: Speaker::new(Arc::new(tts), Arc::clone(&sink)),
             assistant: Arc::new(assistant),
             source,
+            sink,
             endpointer: Endpointer::new(speech_threshold, silence_duration, ENDPOINT_MIN_SAMPLES),
+            prebuffer: PreBuffer::new(WAKE_PREBUFFER_SAMPLES),
+            listening_cue,
+            cue_phrase_counter: 0,
             state_tx,
             enabled_rx,
             ptt_rx,
@@ -186,6 +208,35 @@ where
     fn set_state(&self, state: State) {
         let _ = self.state_tx.send(state);
         tracing::info!(state = %state, "state changed");
+    }
+
+    /// Play the audible "Listening" cue (#51) on entering the Listening state.
+    ///
+    /// - `Ding`: a short generated earcon, queued straight onto the sink — no
+    ///   TTS, so it's instant and reliable.
+    /// - `Phrase`: a rotating spoken micro-phrase via the TTS `Speaker`;
+    ///   friendlier but adds the synthesis/playback latency of a short
+    ///   utterance, so it isn't the default.
+    /// - `Off`: nothing.
+    ///
+    /// A cue failure must never derail entering Listening — errors are logged
+    /// and swallowed.
+    async fn play_listening_cue(&mut self) {
+        match self.listening_cue {
+            ListeningCue::Off => {}
+            ListeningCue::Ding => {
+                if let Err(e) = self.sink.play(cue::ding_samples()) {
+                    tracing::warn!("failed to play listening ding cue: {e}");
+                }
+            }
+            ListeningCue::Phrase => {
+                let phrase = cue::phrase(self.cue_phrase_counter);
+                self.cue_phrase_counter = self.cue_phrase_counter.wrapping_add(1);
+                if let Err(e) = self.speaker.say(phrase).await {
+                    tracing::warn!("failed to speak listening phrase cue: {e}");
+                }
+            }
+        }
     }
 
     /// Re-read the config file and apply any changed tunables to the running
@@ -376,6 +427,10 @@ where
                     last_activity = Instant::now();
                     match state {
                         State::Idle => {
+                            // Keep a rolling pre-buffer of recent idle audio so a
+                            // command spoken in the same breath as the wake word
+                            // isn't dropped during the handoff (#50).
+                            self.prebuffer.push(&chunk);
                             // Feed to wake word detector
                             if self.wake.detect(&chunk)? {
                                 tracing::info!("wake word detected");
@@ -388,8 +443,17 @@ where
                                     // StopSpeaking so this utterance can't leak
                                     // into a previously dictated conversation.
                                     self.ptt_conversation_override = None;
-                                    self.endpointer.arm(Some(self.followup_timeout));
+                                    // Seed the utterance with the post-wake audio
+                                    // so "hey adele <command>" said in one breath
+                                    // captures the command (#50). The lead-in still
+                                    // applies and the VAD must still confirm speech.
+                                    let preroll = self.prebuffer.take();
+                                    self.endpointer
+                                        .arm_with_preroll(Some(self.followup_timeout), &preroll);
                                     self.vad.reset();
+                                    // Audible "Listening" cue (#51) — instant ding
+                                    // by default, optional spoken phrase, or off.
+                                    self.play_listening_cue().await;
                                 }
                             }
                         }
@@ -449,6 +513,16 @@ where
                                             while audio_rx.try_recv().is_ok() {}
                                             state = State::Listening;
                                             self.set_state(state);
+                                            // Cue the follow-up re-listen too (#51),
+                                            // then wait for the cue to finish and
+                                            // drop the echo it queued into the mic
+                                            // before arming, so it isn't captured as
+                                            // the follow-up.
+                                            self.play_listening_cue().await;
+                                            while self.speaker.is_playing() {
+                                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                            }
+                                            while audio_rx.try_recv().is_ok() {}
                                             self.endpointer.arm(Some(self.followup_timeout));
                                             self.vad.reset();
                                         } else {
@@ -933,9 +1007,15 @@ mod tests {
         }
     }
 
-    struct FakeSink;
+    /// Records the length of every buffer it was asked to play, so a test can
+    /// assert the listening cue (the ding earcon) was/wasn't queued.
+    #[derive(Default, Clone)]
+    struct FakeSink {
+        played: Arc<StdMutex<Vec<usize>>>,
+    }
     impl AudioSink for FakeSink {
-        fn play(&self, _samples: Vec<f32>) -> Result<(), adele_voice_core::VoiceError> {
+        fn play(&self, samples: Vec<f32>) -> Result<(), adele_voice_core::VoiceError> {
+            self.played.lock().unwrap().push(samples.len());
             Ok(())
         }
         fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
@@ -958,6 +1038,9 @@ mod tests {
         prompt_rx: mpsc::UnboundedReceiver<SentPrompt>,
         /// Title of each conversation the daemon asked to create.
         created_rx: mpsc::UnboundedReceiver<String>,
+        /// Lengths of every buffer queued on the sink — the listening cue (the
+        /// ding earcon) shows up here.
+        sink_played: Arc<StdMutex<Vec<usize>>>,
         handle: tokio::task::JoinHandle<()>,
     }
 
@@ -971,6 +1054,7 @@ mod tests {
         vad: Vec<f32>,
         stt_text: String,
         assistant_fails: bool,
+        listening_cue: ListeningCue,
     }
     impl Default for Cfg {
         fn default() -> Self {
@@ -984,6 +1068,9 @@ mod tests {
                 vad: vec![0.9],
                 stt_text: "hello".to_string(),
                 assistant_fails: false,
+                // Default the cue off in tests so most cases don't queue cue
+                // audio onto the recording sink; cue-specific tests opt in.
+                listening_cue: ListeningCue::Off,
             }
         }
     }
@@ -1038,7 +1125,7 @@ mod tests {
             Arc::new(FakeSource {
                 rx: StdMutex::new(Some(audio_rx)),
             }),
-            Arc::new(FakeSink),
+            Arc::new(FakeSink::default()),
             state_tx,
             enabled_rx,
             ptt_rx,
@@ -1053,6 +1140,7 @@ mod tests {
             Duration::from_millis(50),
             None,
             String::new(),
+            ListeningCue::Off,
         )
     }
 
@@ -1126,6 +1214,9 @@ mod tests {
             })
         });
 
+        let sink = FakeSink::default();
+        let sink_played = Arc::clone(&sink.played);
+
         let pipeline = Pipeline::new(
             FakeWake {
                 detects: cfg.wake_detects,
@@ -1147,7 +1238,7 @@ mod tests {
             Arc::new(FakeSource {
                 rx: StdMutex::new(Some(audio_rx)),
             }),
-            Arc::new(FakeSink),
+            Arc::new(sink),
             state_tx,
             enabled_rx,
             ptt_rx,
@@ -1162,6 +1253,7 @@ mod tests {
             cfg.followup_timeout,
             cfg.idle_exit_timeout,
             cfg.spoken_response_hint,
+            cfg.listening_cue,
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;
@@ -1175,6 +1267,7 @@ mod tests {
             transcribe_rx,
             prompt_rx,
             created_rx,
+            sink_played,
             handle,
         }
     }
@@ -1508,6 +1601,56 @@ mod tests {
             reached.is_ok(),
             "wake word must enter Listening when enabled"
         );
+    }
+
+    #[tokio::test]
+    async fn ding_cue_plays_on_wake_word_entry() {
+        // #51: with the ding cue, entering Listening queues the generated earcon
+        // (the only buffer played here, since the FakeTts produces no audio).
+        let mut h = spawn_pipeline(Cfg {
+            wake_detects: true,
+            listening_cue: ListeningCue::Ding,
+            ..Default::default()
+        });
+        send_chunk(&h).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("wake -> Listening")
+        .unwrap();
+        // Give the cue a beat to be queued after the state change.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let played = h.sink_played.lock().unwrap().clone();
+        h.handle.abort();
+        assert_eq!(
+            played,
+            vec![cue::ding_samples().len()],
+            "the ding earcon must be queued on entering Listening"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cue_plays_when_listening_cue_off() {
+        // #51: with the cue off, entering Listening must NOT queue any audio.
+        let mut h = spawn_pipeline(Cfg {
+            wake_detects: true,
+            listening_cue: ListeningCue::Off,
+            ..Default::default()
+        });
+        send_chunk(&h).await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("wake -> Listening")
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let played = h.sink_played.lock().unwrap().clone();
+        h.handle.abort();
+        assert!(played.is_empty(), "no cue must be queued when set to off");
     }
 
     #[tokio::test]

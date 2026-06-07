@@ -96,6 +96,17 @@ impl Endpointer {
         self.deadline = None;
     }
 
+    /// Begin a fresh utterance, like [`arm`](Self::arm), but PRE-SEED the capture
+    /// buffer with `preroll` (e.g. the audio captured right after a wake word).
+    /// Speech is **not** marked as started — the lead-in still applies, and the
+    /// VAD must still confirm speech — so this only ensures the pre-roll audio is
+    /// part of the eventual capture rather than dropped during the handoff (#50).
+    pub fn arm_with_preroll(&mut self, lead_in: Option<Duration>, preroll: &[f32]) {
+        self.reset();
+        self.buffer.extend_from_slice(preroll);
+        self.deadline = lead_in.map(|d| Instant::now() + d);
+    }
+
     /// Feed one captured chunk and its VAD speech probability.
     pub fn push(&mut self, chunk: &[f32], prob: f32) -> Endpoint {
         self.buffer.extend_from_slice(chunk);
@@ -124,6 +135,55 @@ impl Endpointer {
     }
 }
 
+/// A fixed-capacity rolling window of the most recently captured samples.
+///
+/// The daemon feeds every Idle chunk here while it waits for the wake word, so
+/// when the wake fires it can SEED the new utterance with the audio captured
+/// right around the trigger — the start of a command spoken in the same breath
+/// ("hey adele what time is it") that the Idle→Listening transition would
+/// otherwise drop (#50). Keeps at most `capacity` samples; oldest fall off the
+/// front. Pure (no I/O), so it unit-tests directly.
+pub struct PreBuffer {
+    capacity: usize,
+    samples: Vec<f32>,
+}
+
+impl PreBuffer {
+    /// `capacity` is the rolling-window length in samples (e.g. 300 ms at 16 kHz
+    /// = 4800). A capacity of 0 disables buffering — [`take`](Self::take) always
+    /// yields nothing.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            samples: Vec::new(),
+        }
+    }
+
+    /// Append a captured chunk, dropping the oldest samples beyond `capacity`.
+    pub fn push(&mut self, chunk: &[f32]) {
+        if self.capacity == 0 {
+            return;
+        }
+        self.samples.extend_from_slice(chunk);
+        if self.samples.len() > self.capacity {
+            let overflow = self.samples.len() - self.capacity;
+            self.samples.drain(..overflow);
+        }
+    }
+
+    /// Take and clear the buffered window — the seed for the next utterance.
+    /// Returns an empty `Vec` when nothing is buffered (or buffering is off).
+    pub fn take(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.samples)
+    }
+
+    /// Discard the buffered window without returning it (e.g. on a wake-word
+    /// fire when seeding is not wanted).
+    pub fn clear(&mut self) {
+        self.samples.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +192,44 @@ mod tests {
     /// utterance — provided the buffer cleared the `min_samples` floor.
     fn endpointer() -> Endpointer {
         Endpointer::new(0.5, Duration::from_millis(0), 800)
+    }
+
+    #[test]
+    fn pre_buffer_keeps_only_the_most_recent_capacity() {
+        let mut pb = PreBuffer::new(4);
+        pb.push(&[1.0, 2.0]);
+        pb.push(&[3.0, 4.0, 5.0]); // total 5 > cap 4 → drop the oldest (1.0)
+        assert_eq!(pb.take(), vec![2.0, 3.0, 4.0, 5.0]);
+        // take() drains it.
+        assert!(pb.take().is_empty(), "take must clear the window");
+    }
+
+    #[test]
+    fn pre_buffer_take_seeds_then_resets() {
+        let mut pb = PreBuffer::new(8);
+        pb.push(&[0.1; 3]);
+        assert_eq!(pb.take().len(), 3, "the window seeds the next utterance");
+        pb.push(&[0.2; 2]);
+        assert_eq!(
+            pb.take().len(),
+            2,
+            "a fresh window accumulates after a take"
+        );
+    }
+
+    #[test]
+    fn pre_buffer_clear_discards_without_returning() {
+        let mut pb = PreBuffer::new(8);
+        pb.push(&[0.5; 4]);
+        pb.clear();
+        assert!(pb.take().is_empty(), "clear must drop the window");
+    }
+
+    #[test]
+    fn zero_capacity_pre_buffer_never_retains() {
+        let mut pb = PreBuffer::new(0);
+        pb.push(&[1.0; 100]);
+        assert!(pb.take().is_empty(), "capacity 0 disables buffering");
     }
 
     #[test]
@@ -195,6 +293,29 @@ mod tests {
     }
 
     #[test]
+    fn arm_with_preroll_includes_seed_audio_in_capture() {
+        // #50: the post-wake pre-roll must be PART of the captured utterance,
+        // but speech must still be confirmed by the VAD (the seed alone, with no
+        // speech chunk, must NOT close on a lone silence).
+        let mut ep = Endpointer::new(0.5, Duration::from_millis(0), 800);
+        ep.arm_with_preroll(None, &vec![0.1; 500]);
+        // A silence chunk with no prior speech only accumulates — the pre-roll
+        // doesn't fake speech-started.
+        assert_eq!(ep.push(&vec![0.0; 100], 0.0), Endpoint::Accumulating);
+        // Now real speech, then silence, closes the utterance — and the captured
+        // buffer carries the 500 pre-roll + 100 + 600 = 1200 samples.
+        assert_eq!(ep.push(&vec![0.1; 600], 0.9), Endpoint::SpeechStarted);
+        match ep.push(&vec![0.1; 600], 0.0) {
+            Endpoint::Complete(samples) => assert_eq!(
+                samples.len(),
+                1800,
+                "the pre-roll seed must be included in the captured utterance"
+            ),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn set_speech_threshold_takes_effect_on_the_next_chunk() {
         // Live reload (config#52): raising the threshold mid-stream means a chunk
         // that previously read as speech no longer does.
@@ -222,6 +343,15 @@ mod tests {
             Endpoint::Complete(samples) => assert_eq!(samples.len(), 3000),
             other => panic!("expected Complete after shortening silence, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn arm_with_preroll_respects_the_lead_in() {
+        // With no speech at all, the lead-in still times out even though the
+        // buffer was pre-seeded.
+        let mut ep = Endpointer::new(0.5, Duration::from_millis(0), 800);
+        ep.arm_with_preroll(Some(Duration::from_millis(0)), &vec![0.1; 500]);
+        assert_eq!(ep.push(&vec![0.0; 100], 0.0), Endpoint::Timeout);
     }
 
     #[test]
