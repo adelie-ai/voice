@@ -29,6 +29,11 @@ const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that
 /// the user isn't left in silent Processing forever (#58).
 const STALL_APOLOGY: &str = "Sorry, that's taking too long. Let's try again.";
 
+/// Brief liveness line spoken once on a slow turn that has narrated nothing and
+/// streamed nothing yet (e.g. it declared no plan step) — so voice isn't
+/// dead-silent. Rare by design, so it stays natural rather than repetitive.
+const LIVENESS_PHRASE: &str = "One moment.";
+
 /// A short leading ack ("Got it — checking that now.") is at most this many
 /// words; longer terminal sentences are the real answer and aren't flushed
 /// early (#58).
@@ -50,6 +55,11 @@ pub struct TurnTimeouts {
     pub connect: Duration,
     /// Minimum gap between spoken status narrations within a turn.
     pub status_narration_min_gap: Duration,
+    /// Delay before speaking a brief liveness line when a turn has produced no
+    /// narration and no reply yet (a slow turn that declared no step). Fires at
+    /// most once and never once any status/chunk has arrived. `Duration::ZERO`
+    /// disables.
+    pub liveness_delay: Duration,
 }
 
 /// Wrap a future in `timeout` unless `limit` is zero (zero = unbounded), mapping
@@ -293,6 +303,10 @@ where
     /// Minimum gap between spoken status narrations within a turn (#58). The
     /// first status always speaks; later ones are rate-limited to this interval.
     status_narration_min_gap: Duration,
+    /// Delay before the safety-net liveness line on a turn that produced no
+    /// narration and no reply yet (a slow turn that declared no step). Fires at
+    /// most once; `Duration::ZERO` disables.
+    liveness_delay: Duration,
     /// Bound on each conversation create / subscribe / send round-trip (#58).
     /// `Duration::ZERO` disables.
     connect_timeout: Duration,
@@ -379,6 +393,7 @@ where
             response_stall: timeouts.response_stall,
             turn_budget: timeouts.turn_budget,
             status_narration_min_gap: timeouts.status_narration_min_gap,
+            liveness_delay: timeouts.liveness_delay,
             connect_timeout: timeouts.connect,
             client_tools,
             session_end_requested: false,
@@ -1068,6 +1083,13 @@ where
         // instant (rather than a per-iteration `timeout`) so the 100 ms
         // sentence-flush tick can't accidentally reset the stall window.
         let mut last_event_at = TokioInstant::now();
+        // Delayed-liveness safety net: if the turn narrates nothing and streams
+        // nothing within this window, speak one brief line so a slow turn that
+        // declared no plan step isn't dead-silent. Cancelled by the first status
+        // or chunk; fires at most once. `Duration::ZERO` disables.
+        let liveness_deadline =
+            (!self.liveness_delay.is_zero()).then(|| TokioInstant::now() + self.liveness_delay);
+        let mut liveness_spoken = false;
 
         loop {
             // How long to wait for the NEXT event before declaring a stall: the
@@ -1198,6 +1220,20 @@ where
                     if let Some(sentence) = sentence_buf.flush_if_timeout() {
                         self.speaker.say(&sentence).await?;
                     }
+                }
+                // Delayed-liveness safety net: a slow turn that has narrated
+                // nothing and streamed nothing yet gets one brief line so voice
+                // isn't dead-silent. The guard disables it once a status/chunk
+                // arrives or it has already fired.
+                _ = async {
+                    match liveness_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                }, if !liveness_spoken && first_chunk && last_status_spoken_at.is_none() => {
+                    liveness_spoken = true;
+                    self.set_state(State::Speaking);
+                    self.speaker.say(LIVENESS_PHRASE).await?;
                 }
             }
 
@@ -1802,6 +1838,7 @@ mod tests {
             synth: Duration::ZERO,
             connect: Duration::ZERO,
             status_narration_min_gap: Duration::ZERO,
+            liveness_delay: Duration::ZERO,
         }
     }
 
@@ -2216,6 +2253,79 @@ mod tests {
         assert_eq!(
             spoken.lock().unwrap().clone(),
             vec!["first".to_string(), "later".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_speaks_once_on_a_slow_stepless_turn() {
+        // Safety net: a turn that narrates nothing and streams nothing past the
+        // liveness delay (a slow turn that declared no step) gets one brief
+        // liveness line so voice isn't dead-silent — then it completes.
+        let liveness = Duration::from_millis(500);
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            liveness_delay: liveness,
+            response_stall: Duration::from_secs(10), // not the limiting factor
+            ..test_timeouts()
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        let feeder = tokio::spawn(async move {
+            // Nothing for well past the liveness delay, then the reply arrives.
+            tokio::time::sleep(liveness * 2).await;
+            let _ = tx.send(AssistantEvent::Complete {
+                request_id: "req".into(),
+                full_response: "the answer".into(),
+            });
+        });
+        tokio::time::timeout(Duration::from_secs(10), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("stream_response must return")
+            .expect("stream_response ok");
+        feeder.await.unwrap();
+        let said = spoken.lock().unwrap().clone();
+        assert_eq!(
+            said.iter().filter(|s| *s == LIVENESS_PHRASE).count(),
+            1,
+            "a slow stepless turn must speak the liveness line exactly once; said: {said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_suppressed_when_progress_arrives_first() {
+        // A status (a declared step) before the liveness delay cancels it — so
+        // multi-step turns and quick answers never hear the filler.
+        let liveness = Duration::from_millis(500);
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            liveness_delay: liveness,
+            response_stall: Duration::from_secs(10),
+            ..test_timeouts()
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        let feeder = tokio::spawn(async move {
+            // A step status arrives well before the liveness delay.
+            tokio::time::sleep(liveness / 5).await;
+            let _ = tx.send(AssistantEvent::Status {
+                request_id: "req".into(),
+                message: "Looking into that".into(),
+            });
+            tokio::time::sleep(liveness * 2).await;
+            let _ = tx.send(AssistantEvent::Complete {
+                request_id: "req".into(),
+                full_response: "done".into(),
+            });
+        });
+        tokio::time::timeout(Duration::from_secs(10), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("stream_response must return")
+            .expect("stream_response ok");
+        feeder.await.unwrap();
+        let said = spoken.lock().unwrap().clone();
+        assert!(
+            !said.iter().any(|s| s == LIVENESS_PHRASE),
+            "progress before the delay must suppress the liveness line; said: {said:?}"
+        );
+        assert!(
+            said.iter().any(|s| s == "Looking into that"),
+            "the real status should still be narrated; said: {said:?}"
         );
     }
 

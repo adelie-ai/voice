@@ -50,6 +50,12 @@ pub struct TimeoutConfig {
     /// speaks every status (not recommended); a very large value speaks only
     /// the first.
     pub status_narration_min_gap_ms: u64,
+    /// Delay before the voice client speaks a brief liveness line when a turn
+    /// has produced no narration and no reply yet — covers a slow turn that
+    /// declared no plan step (so step-level narration never fires) without an
+    /// always-on filler. Never fires once any status or chunk has arrived, and
+    /// fires at most once per turn. 0 disables. (Takes effect on restart.)
+    pub narration_liveness_delay_ms: u64,
 }
 
 impl Default for TimeoutConfig {
@@ -68,6 +74,10 @@ impl Default for TimeoutConfig {
             // ~15 s — enough to reassure on a long turn without narrating every
             // tool call.
             status_narration_min_gap_ms: 15_000,
+            // ~4 s: long enough that a normal turn (a quick first token or a
+            // declared step) never trips it, short enough to reassure on a
+            // genuinely slow turn that declared no step.
+            narration_liveness_delay_ms: 4_000,
         }
     }
 }
@@ -85,7 +95,9 @@ pub struct WakeWordConfig {
     /// Audible cue played the instant the daemon enters Listening (and on each
     /// conversation-mode follow-up re-listen): `"ding"` (a short earcon, the
     /// default — instant), `"phrase"` (a spoken micro-phrase like "Yes?" —
-    /// friendlier but adds ~1 s), or `"off"` (no cue) (#51).
+    /// friendlier but adds ~1 s), or `"off"` (no cue) (#51). An unrecognized
+    /// value falls back to the default instead of failing the whole parse.
+    #[serde(deserialize_with = "deserialize_listening_cue")]
     pub listening_cue: ListeningCue,
 }
 
@@ -101,6 +113,29 @@ pub enum ListeningCue {
     Phrase,
     /// No cue at all.
     Off,
+}
+
+/// Lenient deserializer for `wake_word.listening_cue`: an unrecognized value
+/// (e.g. a free-text phrase written by a mistaken editor) falls back to the
+/// default rather than failing the entire config parse, so one bad optional
+/// field can't brick the service. Warns so the bad value stays visible.
+fn deserialize_listening_cue<'de, D>(deserializer: D) -> Result<ListeningCue, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(match raw.trim().to_ascii_lowercase().as_str() {
+        "ding" => ListeningCue::Ding,
+        "phrase" => ListeningCue::Phrase,
+        "off" => ListeningCue::Off,
+        other => {
+            tracing::warn!(
+                value = %other,
+                "unrecognized wake_word.listening_cue; falling back to \"ding\" (valid: ding, phrase, off)"
+            );
+            ListeningCue::default()
+        }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -459,6 +494,19 @@ listening_cue = "phrase"
         assert_eq!(off.wake_word.listening_cue, ListeningCue::Off);
         // Unspecified fields keep their defaults.
         assert!(off.wake_word.eager, "unspecified eager stays the default");
+    }
+
+    #[test]
+    fn unrecognized_listening_cue_falls_back_instead_of_bricking() {
+        // A bad listening_cue (e.g. the free text the KCM once allowed) must NOT
+        // fail the whole config parse — it falls back to the default cue so the
+        // service still starts.
+        let cfg: Config = toml::from_str("[wake_word]\nlistening_cue = \"Hi Dave\"\n")
+            .expect("an unrecognized cue must not fail the parse");
+        assert_eq!(cfg.wake_word.listening_cue, ListeningCue::default());
+        // Recognized values are still case-insensitive and exact.
+        let upper: Config = toml::from_str("[wake_word]\nlistening_cue = \"OFF\"\n").unwrap();
+        assert_eq!(upper.wake_word.listening_cue, ListeningCue::Off);
     }
 
     #[test]

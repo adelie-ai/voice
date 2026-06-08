@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
         status_narration_min_gap: Duration::from_millis(
             config.timeouts.status_narration_min_gap_ms,
         ),
+        liveness_delay: Duration::from_millis(config.timeouts.narration_liveness_delay_ms),
     };
 
     // Build and run pipeline
