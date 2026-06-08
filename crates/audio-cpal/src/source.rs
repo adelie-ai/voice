@@ -58,6 +58,74 @@ impl CpalAudioSource {
     }
 }
 
+/// Whether an ALSA pcm id is a sound-server route (shared with other apps)
+/// rather than a raw hardware PCM. Raw cards take *exclusive* access, so an
+/// always-listening capture on one can lock the mic away from other apps — and
+/// from another logged-in user's session.
+fn is_shared_route(pcm_id: &str) -> bool {
+    matches!(pcm_id, "default" | "pipewire" | "pulse" | "jack")
+}
+
+/// The pcm id (ALSA "driver") behind a cpal device, if any.
+fn device_pcm_id(device: &cpal::Device) -> Option<String> {
+    device
+        .description()
+        .ok()
+        .and_then(|d| d.driver().map(str::to_string))
+}
+
+/// Find a sound-server input route (PipeWire preferred, then PulseAudio).
+fn find_shared_route() -> Option<cpal::Device> {
+    let host = cpal::default_host();
+    for want in ["pipewire", "pulse"] {
+        // Re-enumerate per preference — the iterator is consumed by `find`.
+        if let Some(d) = host
+            .input_devices()
+            .ok()?
+            .find(|d| device_pcm_id(d).as_deref() == Some(want))
+        {
+            return Some(d);
+        }
+    }
+    None
+}
+
+/// Resolve the configured input into a device to actually open, preferring a
+/// shared sound-server route when the configured one is a raw ALSA card and a
+/// server is available (the user opted into this). The raw card would take the
+/// mic exclusively; routing through PipeWire/Pulse lets the assistant listen
+/// without blocking other apps. `default` is left untouched — it's already the
+/// system's chosen (shared) input.
+fn resolve_input_device(name: &str) -> Result<cpal::Device, VoiceError> {
+    let device = CpalAudioSource::find_input_device(name)?;
+    if name == "default" {
+        return Ok(device);
+    }
+    let pcm_id = device_pcm_id(&device).unwrap_or_default();
+    if is_shared_route(&pcm_id) {
+        return Ok(device);
+    }
+    // Configured device is a raw card — prefer a shared route if one exists.
+    match find_shared_route() {
+        Some(shared) => {
+            let shared_id = device_pcm_id(&shared).unwrap_or_default();
+            tracing::warn!(
+                configured = %name,
+                raw_pcm = %pcm_id,
+                routing_via = %shared_id,
+                "input_device is a raw ALSA card (exclusive access — can block \
+                 other apps and other user sessions); routing via the shared \
+                 sound server instead. It now follows the system default source. \
+                 Set input_device = \"{shared_id}\" (or pick a shared device in \
+                 settings) to silence this, or set the default source to the mic \
+                 you want.",
+            );
+            Ok(shared)
+        }
+        None => Ok(device),
+    }
+}
+
 /// One supported configuration range as reported by cpal, flattened to plain
 /// values so the selection logic is pure and unit-testable.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -239,7 +307,7 @@ impl AudioSource for CpalAudioSource {
         std::thread::Builder::new()
             .name("audio-capture".into())
             .spawn(move || {
-                let device = match Self::find_input_device(&device_name) {
+                let device = match resolve_input_device(&device_name) {
                     Ok(d) => d,
                     Err(e) => {
                         let _ = result_tx.send(Err(e));
@@ -517,6 +585,20 @@ mod tests {
         // mono-i16 scores 0+2=2; stereo-f32 scores 1+0=1 -> f32 wins.
         assert_eq!(chosen.format, SampleFormat::F32);
         assert_eq!(chosen.rate, 16_000);
+    }
+
+    #[test]
+    fn shared_routes_vs_raw_cards() {
+        // Sound-server routes share the device with other apps.
+        assert!(is_shared_route("default"));
+        assert!(is_shared_route("pipewire"));
+        assert!(is_shared_route("pulse"));
+        assert!(is_shared_route("jack"));
+        // Raw hardware PCMs take exclusive access.
+        assert!(!is_shared_route("sysdefault:CARD=Mini"));
+        assert!(!is_shared_route("front:CARD=Mini,DEV=0"));
+        assert!(!is_shared_route("hw:CARD=PCH,DEV=0"));
+        assert!(!is_shared_route("plughw:CARD=Mini"));
     }
 
     #[test]
