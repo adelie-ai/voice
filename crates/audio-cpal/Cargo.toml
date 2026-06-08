@@ -9,5 +9,6 @@ adele-voice-core.workspace = true
 anyhow.workspace = true
 cpal = "0.17"
 ringbuf = "0.4"
+rubato = "2"
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
