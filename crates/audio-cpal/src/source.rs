@@ -217,6 +217,125 @@ pub fn negotiate_input_config(device: &cpal::Device) -> Result<ChosenFormat, Voi
     Ok(chosen)
 }
 
+/// A capture device as surfaced to clients (e.g. the KCM input picker).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputDeviceInfo {
+    /// The string to store as `input_device`. It's the device's friendly
+    /// description — which is exactly what [`CpalAudioSource::find_input_device`]
+    /// substring-matches — so writing it back round-trips by construction.
+    pub value: String,
+    /// Human-friendly label (same as `value` today).
+    pub label: String,
+    /// Whether this is the host's default input device.
+    pub is_default: bool,
+    /// `"server"` for a shared sound-server route (PipeWire/Pulse/JACK) or
+    /// `"card"` for a raw ALSA card (exclusive — can block other apps). Lets the
+    /// picker prefer shared routes and flag the exclusive ones.
+    pub kind: &'static str,
+    /// Whether capture can actually be opened here (after negotiate + resample).
+    pub supported: bool,
+    /// Negotiated capture rate / channels, when supported.
+    pub rate: Option<u32>,
+    pub channels: Option<u16>,
+    /// Why it's unsupported, when it isn't.
+    pub reason: Option<String>,
+}
+
+/// ALSA enumerates dozens of PCMs per card (`hw:`, `front:`, `dmix:`, `null`,
+/// HDMI, …). Offer only the server-managed routes plus one friendly entry per
+/// physical card (`sysdefault:CARD=*`); the rest are noise or duplicates that
+/// the daemon's substring match would resolve to the same hardware anyway.
+fn is_offered_pcm(pcm_id: &str) -> bool {
+    matches!(pcm_id, "pipewire" | "pulse" | "jack") || pcm_id.starts_with("sysdefault:CARD=")
+}
+
+/// Outcome of probing one device.
+enum Probe {
+    /// Opens and negotiates cleanly.
+    Ok(ChosenFormat),
+    /// Enumerated (so plugged in) but can't open right now — almost always
+    /// because something else (often this very service) holds it. Still offered.
+    InUse,
+    /// Genuinely unusable (e.g. no convertible format).
+    Bad(String),
+}
+
+fn probe_one(device: &cpal::Device, physical: bool) -> Probe {
+    match device.default_input_config() {
+        // A physical card came from enumeration, so it's plugged in; "not
+        // available" means in-use (often by this very service) — keep offering
+        // it. A server route (PipeWire/Pulse/JACK) that won't open, on the other
+        // hand, means its server isn't running, so don't offer it.
+        Err(cpal::DefaultStreamConfigError::DeviceNotAvailable) if physical => return Probe::InUse,
+        Err(e) => return Probe::Bad(e.to_string()),
+        Ok(_) => {}
+    }
+    match negotiate_input_config(device) {
+        Ok(f) => Probe::Ok(f),
+        Err(e) => Probe::Bad(e.to_string()),
+    }
+}
+
+/// Probe input devices and report which ones capture can actually open. Each
+/// candidate is run through [`negotiate_input_config`] (the same negotiation the
+/// real capture path uses), so `supported` reflects reality including the
+/// downmix/resample fallback. A device that's present but currently held by
+/// another stream is still reported as supported (just in use). Deduped by
+/// friendly name.
+pub fn probe_input_devices() -> Result<Vec<InputDeviceInfo>, VoiceError> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.description().ok().map(|x| x.name().to_string()));
+
+    let devices = host
+        .input_devices()
+        .map_err(|e| VoiceError::Audio(format!("failed to enumerate input devices: {e}")))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for device in devices {
+        // `driver` is the ALSA pcm id (e.g. "sysdefault:CARD=Mini", "pipewire");
+        // `name` is the friendly description the daemon substring-matches.
+        let Ok(desc) = device.description() else {
+            continue;
+        };
+        let Some(pcm_id) = desc.driver() else {
+            continue;
+        };
+        if !is_offered_pcm(pcm_id) {
+            continue;
+        }
+        let physical = pcm_id.starts_with("sysdefault:CARD=");
+        let kind = if physical { "card" } else { "server" };
+        let label = desc.name().to_string();
+        if !seen.insert(label.clone()) {
+            continue;
+        }
+        let (supported, rate, channels, reason) = match probe_one(&device, physical) {
+            Probe::Ok(f) => (true, Some(f.rate), Some(f.channels), None),
+            Probe::InUse => (true, None, None, Some("device is currently in use".into())),
+            Probe::Bad(e) => (false, None, None, Some(e)),
+        };
+        let is_default = default_name.as_deref() == Some(label.as_str());
+        out.push(InputDeviceInfo {
+            value: label.clone(),
+            label,
+            is_default,
+            kind,
+            supported,
+            rate,
+            channels,
+            reason,
+        });
+    }
+    // Shared sound-server routes first, then raw cards — so the picker leads
+    // with the recommended (non-exclusive) choices. Stable to keep enumeration
+    // order within each group.
+    out.sort_by_key(|d| if d.kind == "server" { 0 } else { 1 });
+    Ok(out)
+}
+
 /// Convert an interleaved slice of device samples to mono `f32`, averaging
 /// channels. Reuses `out`'s capacity so the realtime callback doesn't allocate
 /// after warm-up.
@@ -599,6 +718,21 @@ mod tests {
         assert!(!is_shared_route("front:CARD=Mini,DEV=0"));
         assert!(!is_shared_route("hw:CARD=PCH,DEV=0"));
         assert!(!is_shared_route("plughw:CARD=Mini"));
+    }
+
+    #[test]
+    fn offers_server_routes_and_per_card_default_only() {
+        assert!(is_offered_pcm("pipewire"));
+        assert!(is_offered_pcm("pulse"));
+        assert!(is_offered_pcm("jack"));
+        assert!(is_offered_pcm("sysdefault:CARD=Mini"));
+        // Raw/duplicate/noise PCMs are filtered out.
+        assert!(!is_offered_pcm("front:CARD=Mini,DEV=0"));
+        assert!(!is_offered_pcm("hw:CARD=Mini,DEV=0"));
+        assert!(!is_offered_pcm("plughw:CARD=Mini"));
+        assert!(!is_offered_pcm("dmix:CARD=PCH,DEV=0"));
+        assert!(!is_offered_pcm("null"));
+        assert!(!is_offered_pcm("default"));
     }
 
     #[test]
