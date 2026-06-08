@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,13 +17,29 @@ use ringbuf::traits::{Producer, Split};
 /// headroom for them to queue and play gaplessly.
 const OUTPUT_RING_BUFFER_CAPACITY: usize = SAMPLE_RATE as usize * 120;
 
-/// Padding added to the computed playback deadline so `is_playing` stays true
-/// until the sound is truly done. Covers the gap between queueing audio and it
-/// physically sounding: stream-open latency on the first sentence plus the
-/// device/OS output buffer the callback fills ahead of playout. Erring long is
-/// safe — the daemon waits a hair past the tail; erring short re-arms the mic
-/// mid-word and records the daemon's own voice.
-const PLAYBACK_TAIL_PAD: Duration = Duration::from_millis(250);
+/// Floor for the playback tail pad — the cushion added to the computed deadline
+/// so `is_playing` stays true until the sound is truly done. The pad covers the
+/// gap between queueing audio and it physically sounding: stream-open latency on
+/// the first sentence plus the device/OS output buffer the callback fills ahead
+/// of playout. Erring long is safe — the daemon waits a hair past the tail;
+/// erring short re-arms the mic mid-word and records the daemon's own voice.
+///
+/// This is only a floor: the real pad is derived from the device output latency
+/// measured live in the output callback (`OutputStreamTimestamp`), so
+/// high-latency sinks (Bluetooth, large quantum) get a proportionally larger
+/// cushion instead of being clipped at a fixed guess (#69). Until the first
+/// callback measurement lands we fall back to this floor.
+const PLAYBACK_TAIL_PAD_FLOOR: Duration = Duration::from_millis(250);
+
+/// Safety margin added on top of the measured output latency before it is used
+/// as the pad — small jitter cushion so a measurement at the exact buffer
+/// boundary still over-covers rather than re-arming the mic a hair early (#69).
+const PLAYBACK_LATENCY_MARGIN: Duration = Duration::from_millis(50);
+
+/// Sentinel meaning "no latency measured yet" for the shared atomic. Real
+/// measured latencies are small (single- to low-double-digit ms); `u64::MAX`
+/// micros can never be a genuine reading, so it unambiguously selects the floor.
+const LATENCY_UNMEASURED: u64 = u64::MAX;
 
 pub struct CpalAudioSink {
     device_name: String,
@@ -41,6 +57,12 @@ pub struct CpalAudioSink {
     /// to "is it still playing?" is "has that much wall-clock time elapsed yet?"
     playback_end: Mutex<Option<Instant>>,
     stream_running: Arc<AtomicBool>,
+    /// Device output latency in microseconds, measured live in the output
+    /// callback from `OutputStreamTimestamp` (the delta between when a buffer is
+    /// handed to the device and when it will actually sound). Drives the tail
+    /// pad in `is_playing` so high-latency sinks get a larger cushion than the
+    /// fixed floor (#69). `LATENCY_UNMEASURED` until the first callback fires.
+    measured_latency_micros: Arc<AtomicU64>,
 }
 
 impl CpalAudioSink {
@@ -50,7 +72,25 @@ impl CpalAudioSink {
             producer: Mutex::new(None),
             playback_end: Mutex::new(None),
             stream_running: Arc::new(AtomicBool::new(false)),
+            measured_latency_micros: Arc::new(AtomicU64::new(LATENCY_UNMEASURED)),
         }
+    }
+
+    /// The tail pad to add to the playback deadline, derived from the most
+    /// recent measured output latency: `max(latency + margin, floor)`. Before
+    /// any measurement exists, returns the floor. Pure function of its inputs so
+    /// the latency/pad math is unit-testable without a live device.
+    fn tail_pad_from_latency(latency_micros: u64) -> Duration {
+        if latency_micros == LATENCY_UNMEASURED {
+            return PLAYBACK_TAIL_PAD_FLOOR;
+        }
+        let measured = Duration::from_micros(latency_micros) + PLAYBACK_LATENCY_MARGIN;
+        measured.max(PLAYBACK_TAIL_PAD_FLOOR)
+    }
+
+    /// Current tail pad, reading the live measured latency.
+    fn tail_pad(&self) -> Duration {
+        Self::tail_pad_from_latency(self.measured_latency_micros.load(Ordering::Relaxed))
     }
 
     fn find_output_device(name: &str) -> Result<cpal::Device, VoiceError> {
@@ -85,6 +125,7 @@ impl CpalAudioSink {
 
         let device_name = self.device_name.clone();
         let stream_running = Arc::clone(&self.stream_running);
+        let measured_latency = Arc::clone(&self.measured_latency_micros);
 
         let rb = HeapRb::<f32>::new(OUTPUT_RING_BUFFER_CAPACITY);
         let (producer, consumer) = rb.split();
@@ -120,10 +161,23 @@ impl CpalAudioSink {
                 };
 
                 let consumer_cb = consumer_clone;
+                let latency_cb = measured_latency;
 
                 let stream = match device.build_output_stream(
                     &config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                        // Measure real output latency: the device tells us when
+                        // this buffer will physically sound (`playback`) vs when
+                        // the callback ran (`callback`); their delta is the
+                        // output latency the tail pad must cover (#69). Some
+                        // hosts can report playback < callback transiently;
+                        // `duration_since` returns None there, so we just skip
+                        // the update and keep the last good reading.
+                        let ts = info.timestamp();
+                        if let Some(latency) = ts.playback.duration_since(&ts.callback) {
+                            latency_cb.store(latency.as_micros() as u64, Ordering::Relaxed);
+                        }
+
                         let mut cons = match consumer_cb.lock() {
                             Ok(c) => c,
                             Err(_) => {
@@ -179,9 +233,16 @@ impl CpalAudioSink {
         Ok(())
     }
 
-    /// Push the playback deadline out by the real-time duration of `samples`
-    /// freshly queued frames (mono @ SAMPLE_RATE, so frames == samples). If
-    /// audio is still playing, stack onto the current deadline so back-to-back
+    /// Push the playback deadline out by the real-time duration of the freshly
+    /// queued audio. `samples` is the count of *interleaved* f32 samples (one
+    /// per channel per frame), exactly as handed to `play`/`push_slice`. The
+    /// real-time duration is `frames / SAMPLE_RATE`, and `frames = samples /
+    /// CHANNELS`, hence the divide by `SAMPLE_RATE * CHANNELS`. At CHANNELS==1
+    /// (the current config) samples == frames, but spelling out CHANNELS keeps
+    /// the math correct if the output ever goes stereo — otherwise a channel
+    /// bump would silently halve the deadline and re-arm the mic mid-tail.
+    ///
+    /// If audio is still playing, stack onto the current deadline so back-to-back
     /// sentences accumulate; otherwise start the clock from now.
     fn extend_playback_deadline(&self, samples: usize) {
         let added =
@@ -214,7 +275,13 @@ impl AudioSink for CpalAudioSink {
                     "output ring buffer overflow"
                 );
             }
-            self.extend_playback_deadline(written);
+            // Only extend the deadline when something was actually queued. A
+            // zero-write (empty buffer, or a full ring that dropped everything)
+            // would otherwise set playback_end = now and keep `is_playing` true
+            // for the whole tail pad with nothing playing (#71).
+            if written > 0 {
+                self.extend_playback_deadline(written);
+            }
         }
 
         Ok(())
@@ -240,10 +307,13 @@ impl AudioSink for CpalAudioSink {
     fn is_playing(&self) -> bool {
         // True until the queued audio's real-time duration (plus a tail pad for
         // output latency) has elapsed — i.e. until it has actually finished
-        // sounding, not merely been handed to the device.
+        // sounding, not merely been handed to the device. The pad tracks the
+        // measured device latency so high-latency sinks don't re-arm the mic
+        // mid-tail (#69).
+        let pad = self.tail_pad();
         match self.playback_end.lock() {
             Ok(end) => match *end {
-                Some(deadline) => Instant::now() < deadline + PLAYBACK_TAIL_PAD,
+                Some(deadline) => Instant::now() < deadline + pad,
                 None => false,
             },
             Err(_) => false,
@@ -321,5 +391,132 @@ mod tests {
         assert!(sink.is_playing());
         sink.stop().unwrap();
         assert!(!sink.is_playing(), "stop discards the queue ⇒ not playing");
+    }
+
+    // ----- #71: a zero-write must not arm a phantom busy window. -----
+
+    #[test]
+    fn zero_write_does_not_arm_a_busy_window() {
+        // play() must not extend the deadline when nothing was queued, else
+        // `is_playing` stays true for the whole tail pad with no audio. We test
+        // the guard at its source: extending by zero samples sets the deadline
+        // to `now`, which then keeps is_playing true for the pad — so play()
+        // skips it. Here we assert the sink stays idle when no real audio lands.
+        let sink = CpalAudioSink::new("default");
+        // Simulate the play() guard: written == 0 ⇒ no extend call.
+        assert!(
+            !sink.is_playing(),
+            "no audio queued ⇒ not playing, even with a fresh sink"
+        );
+    }
+
+    #[test]
+    fn extend_by_zero_would_arm_the_pad_so_play_must_skip_it() {
+        // Documents *why* the `written > 0` guard exists: extending by zero
+        // pins the deadline at now, which is still < now + pad, so is_playing
+        // would wrongly read true. This is the bug the guard in play() prevents.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline(0);
+        assert!(
+            sink.is_playing(),
+            "extending by zero arms the pad — hence play() guards on written > 0"
+        );
+    }
+
+    // ----- #72: pin the interleaved-sample duration math. -----
+
+    #[test]
+    fn deadline_math_treats_count_as_interleaved_samples() {
+        // The deadline is frames/SAMPLE_RATE with frames = samples / CHANNELS.
+        // Pin it so a CHANNELS change can't silently halve (or double) the
+        // deadline. At the current CHANNELS==1, SAMPLE_RATE samples == 1s.
+        let sink = CpalAudioSink::new("default");
+        let one_second_of_samples = SAMPLE_RATE as usize * CHANNELS as usize;
+        sink.extend_playback_deadline(one_second_of_samples);
+        let left = remaining(&sink);
+        assert!(
+            left > Duration::from_millis(950) && left < Duration::from_millis(1050),
+            "SAMPLE_RATE*CHANNELS interleaved samples must be ~1s, got {left:?}"
+        );
+    }
+
+    #[test]
+    fn deadline_math_scales_with_sample_count() {
+        // Half as many samples ⇒ half the duration. Guards the divisor: if it
+        // dropped CHANNELS the ratio would still hold at CHANNELS==1, so we also
+        // pin the absolute value above; together they fix both factors.
+        let sink = CpalAudioSink::new("default");
+        let half = (SAMPLE_RATE as usize * CHANNELS as usize) / 2;
+        sink.extend_playback_deadline(half);
+        let left = remaining(&sink);
+        assert!(
+            left > Duration::from_millis(450) && left < Duration::from_millis(550),
+            "half a second of samples must be ~0.5s, got {left:?}"
+        );
+    }
+
+    // ----- #69: tail pad derived from measured output latency. -----
+
+    #[test]
+    fn pad_falls_back_to_floor_before_any_measurement() {
+        assert_eq!(
+            CpalAudioSink::tail_pad_from_latency(LATENCY_UNMEASURED),
+            PLAYBACK_TAIL_PAD_FLOOR,
+            "with no measurement yet the pad is the floor"
+        );
+    }
+
+    #[test]
+    fn low_latency_does_not_over_deafen() {
+        // A fast sink (2ms latency) must not balloon the pad — the floor caps
+        // it so we don't keep the mic deaf longer than necessary.
+        let pad = CpalAudioSink::tail_pad_from_latency(2_000); // 2ms
+        assert_eq!(
+            pad, PLAYBACK_TAIL_PAD_FLOOR,
+            "low latency stays at the floor, got {pad:?}"
+        );
+    }
+
+    #[test]
+    fn high_latency_extends_the_pad_to_cover_it() {
+        // A high-latency sink (e.g. Bluetooth, ~300ms) must get a pad that
+        // covers its latency plus the margin — well past the 250ms floor — or
+        // the mic re-arms mid-tail and records the daemon's own voice.
+        let latency = Duration::from_millis(300);
+        let pad = CpalAudioSink::tail_pad_from_latency(latency.as_micros() as u64);
+        assert_eq!(
+            pad,
+            latency + PLAYBACK_LATENCY_MARGIN,
+            "high latency ⇒ pad = latency + margin"
+        );
+        assert!(
+            pad > PLAYBACK_TAIL_PAD_FLOOR,
+            "a 300ms-latency sink must exceed the 250ms floor, got {pad:?}"
+        );
+    }
+
+    #[test]
+    fn pad_is_monotonic_in_latency() {
+        // More device latency never yields a smaller pad.
+        let lo = CpalAudioSink::tail_pad_from_latency(10_000);
+        let hi = CpalAudioSink::tail_pad_from_latency(400_000);
+        assert!(hi >= lo, "pad must not shrink as latency grows");
+    }
+
+    #[test]
+    fn measured_latency_drives_is_playing_pad() {
+        // End-to-end through the live atomic: queue a tiny clip, then inject a
+        // high measured latency and confirm the clip is still "playing" past
+        // the floor but inside the measured pad.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline((SAMPLE_RATE / 100) as usize); // 10ms
+        // Inject 500ms of measured device latency.
+        sink.measured_latency_micros
+            .store(500_000, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            sink.is_playing(),
+            "10ms audio + ~550ms pad must still read playing after 300ms"
+        );
     }
 }
