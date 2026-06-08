@@ -41,6 +41,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if std::env::args().skip(1).any(|a| a == "list-devices") {
+        list_devices();
+        return Ok(());
+    }
+
     tracing::info!("adele-voice starting");
 
     // Snapshot the live-applicable knobs now, before fields move into the
@@ -299,6 +304,53 @@ fn binary_resolves(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
         .unwrap_or(false)
+}
+
+/// Print the input devices capture can actually open, as JSON, for the KCM
+/// picker (adele-kde). Each entry is probed through the real capture negotiation
+/// so `supported` accounts for the downmix/resample fallback. Run with
+/// `adele-voice list-devices`.
+fn list_devices() {
+    use serde_json::json;
+
+    // The synthetic "default" route is always valid: capture special-cases it to
+    // the host default input device.
+    let mut arr = vec![json!({
+        "value": "default",
+        "label": "Follow system default (recommended)",
+        "is_default": true,
+        "kind": "default",
+        "supported": true,
+        "rate": serde_json::Value::Null,
+        "channels": serde_json::Value::Null,
+        "reason": serde_json::Value::Null,
+    })];
+
+    match adele_voice_audio_cpal::probe_input_devices() {
+        Ok(devices) => {
+            for d in devices {
+                arr.push(json!({
+                    "value": d.value,
+                    "label": d.label,
+                    "is_default": d.is_default,
+                    "kind": d.kind,
+                    "supported": d.supported,
+                    "rate": d.rate,
+                    "channels": d.channels,
+                    "reason": d.reason,
+                }));
+            }
+        }
+        Err(e) => {
+            eprintln!("adele-voice: device probe failed: {e}");
+        }
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+            .unwrap_or_else(|_| "[]".into())
+    );
 }
 
 /// Print which backends are provisioned/available, which one is configured, and

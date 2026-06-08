@@ -65,4 +65,4 @@ mod sink;
 mod source;
 
 pub use sink::CpalAudioSink;
-pub use source::CpalAudioSource;
+pub use source::{CpalAudioSource, InputDeviceInfo, probe_input_devices};
