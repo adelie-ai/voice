@@ -20,4 +20,14 @@ pub trait AudioSink: Send + Sync {
 
     /// Returns true if audio is currently being played.
     fn is_playing(&self) -> bool;
+
+    /// Whether playback is in its *tail pad* — the queued audio's real-time
+    /// duration has elapsed (the audio deadline has passed) but we're still
+    /// inside the latency cushion that keeps `is_playing` true. During this
+    /// window nothing fresh is sounding, so same-breath mic audio can be
+    /// pre-buffered (without running wake detect) instead of dropped (#70).
+    /// Defaults to `false` so sinks that don't model a pad opt out cleanly.
+    fn in_tail_pad(&self) -> bool {
+        false
+    }
 }

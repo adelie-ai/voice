@@ -725,11 +725,22 @@ where
                             // playback. A single-shot reply returns to Idle while
                             // its audio is still sounding, and any cue/SayText
                             // plays into a mic that hears the speakers; an eager
-                            // detector trips on that echo. While playback is
+                            // detector trips on that echo. While *real* audio is
                             // outstanding, skip wake detection AND don't seed the
                             // prebuffer with echo — `is_playing` stays true (with
                             // its tail pad) until the sound is truly gone.
+                            //
+                            // Once the audio deadline has passed but we're still
+                            // inside the tail pad (#70), nothing fresh is
+                            // sounding — only the latency cushion remains. Keep
+                            // seeding the prebuffer (still WITHOUT running wake
+                            // detect, since residual echo in the cushion could
+                            // trip it) so same-breath audio at the very tail
+                            // isn't dropped if the wake then fires a chunk later.
                             if self.speaker.is_playing() {
+                                if self.speaker.in_tail_pad() {
+                                    self.prebuffer.push(&chunk);
+                                }
                                 continue;
                             }
                             // Keep a rolling pre-buffer of recent idle audio so a
@@ -1656,6 +1667,11 @@ mod tests {
     struct FakeSink {
         played: Arc<StdMutex<Vec<usize>>>,
         playing: Arc<std::sync::atomic::AtomicBool>,
+        /// Models `in_tail_pad`: the audio deadline has passed but we're still
+        /// inside the latency cushion (#70). Independent of `playing` so a test
+        /// can put the sink in "real audio" (playing && !in_pad) or "tail pad"
+        /// (playing && in_pad) states.
+        in_pad: Arc<std::sync::atomic::AtomicBool>,
         stopped: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl AudioSink for FakeSink {
@@ -1668,10 +1684,15 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.playing
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.in_pad
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         fn is_playing(&self) -> bool {
             self.playing.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn in_tail_pad(&self) -> bool {
+            self.in_pad.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1693,6 +1714,10 @@ mod tests {
         /// Drives the fake sink's `is_playing`: set true to mimic outstanding
         /// TTS (#68). Cleared by the sink's `stop()`.
         sink_playing: Arc<std::sync::atomic::AtomicBool>,
+        /// Drives the fake sink's `in_tail_pad`: set true (with `sink_playing`)
+        /// to mimic the latency-cushion tail where same-breath audio should
+        /// still be pre-buffered (#70). Cleared by `stop()`.
+        sink_in_pad: Arc<std::sync::atomic::AtomicBool>,
         /// Count of `stop()` calls the pipeline made on the sink (#68).
         sink_stopped: Arc<std::sync::atomic::AtomicUsize>,
         /// Names of the client tools the pipeline registered at startup (voice#61).
@@ -2247,6 +2272,7 @@ mod tests {
         let sink = FakeSink::default();
         let sink_played = Arc::clone(&sink.played);
         let sink_playing = Arc::clone(&sink.playing);
+        let sink_in_pad = Arc::clone(&sink.in_pad);
         let sink_stopped = Arc::clone(&sink.stopped);
 
         let pipeline = Pipeline::new(
@@ -2307,6 +2333,7 @@ mod tests {
             created_rx,
             sink_played,
             sink_playing,
+            sink_in_pad,
             sink_stopped,
             registered_rx,
             tool_result_rx,
@@ -2661,6 +2688,34 @@ mod tests {
             got.is_err(),
             "a near-silent capture must be discarded before transcription"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_in_tail_pad_seeds_prebuffer_without_waking() {
+        // #70: during the tail pad (audio deadline passed, latency cushion
+        // still running) the daemon must NOT run wake detect — residual echo
+        // could trip it — but should keep seeding the prebuffer so same-breath
+        // audio at the very tail isn't lost. Here we assert the gate half:
+        // with an always-firing detector, a chunk delivered while in the pad
+        // must NOT transition out of Idle.
+        use std::sync::atomic::Ordering;
+        let h = spawn_pipeline(Cfg {
+            wake_detects: true,
+            ..Default::default()
+        });
+        // Mimic "playing, in the tail pad".
+        h.sink_playing.store(true, Ordering::SeqCst);
+        h.sink_in_pad.store(true, Ordering::SeqCst);
+
+        h.audio_tx.send(vec![0.1f32; 1000]).await.unwrap();
+        // Give the pipeline time to process the chunk.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *h.state_rx.borrow(),
+            State::Idle,
+            "wake detect must stay gated during the tail pad despite an always-firing detector"
+        );
+        h.handle.abort();
     }
 
     #[tokio::test]

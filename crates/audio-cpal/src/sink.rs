@@ -319,6 +319,22 @@ impl AudioSink for CpalAudioSink {
             Err(_) => false,
         }
     }
+
+    fn in_tail_pad(&self) -> bool {
+        // The audio deadline has passed (nothing fresh is sounding) but we're
+        // still inside the latency cushion that keeps `is_playing` true (#70).
+        let pad = self.tail_pad();
+        match self.playback_end.lock() {
+            Ok(end) => match *end {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    now >= deadline && now < deadline + pad
+                }
+                None => false,
+            },
+            Err(_) => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +517,41 @@ mod tests {
         let lo = CpalAudioSink::tail_pad_from_latency(10_000);
         let hi = CpalAudioSink::tail_pad_from_latency(400_000);
         assert!(hi >= lo, "pad must not shrink as latency grows");
+    }
+
+    // ----- #70: distinguish real audio from the tail pad. -----
+
+    #[test]
+    fn in_tail_pad_is_false_during_real_audio() {
+        // 1s of audio queued: the deadline is in the future, so we're playing
+        // real audio, not in the pad.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline(SAMPLE_RATE as usize);
+        assert!(sink.is_playing());
+        assert!(
+            !sink.in_tail_pad(),
+            "while real audio is sounding we are not in the tail pad"
+        );
+    }
+
+    #[test]
+    fn in_tail_pad_is_true_after_deadline_but_within_pad() {
+        // A 10ms clip: after ~150ms the audio deadline has passed but the
+        // 250ms floor pad still keeps is_playing true — that is the tail pad.
+        let sink = CpalAudioSink::new("default");
+        sink.extend_playback_deadline((SAMPLE_RATE / 100) as usize); // 10ms
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(sink.is_playing(), "still inside the pad");
+        assert!(
+            sink.in_tail_pad(),
+            "deadline passed but within the pad ⇒ in the tail pad"
+        );
+    }
+
+    #[test]
+    fn in_tail_pad_is_false_when_idle() {
+        let sink = CpalAudioSink::new("default");
+        assert!(!sink.in_tail_pad(), "nothing queued ⇒ not in a pad");
     }
 
     #[test]
