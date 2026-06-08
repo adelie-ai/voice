@@ -616,9 +616,25 @@ where
                 // conversation (the in-chat mic button).
                 Some(target) = self.ptt_rx.recv() => {
                     if state == State::Idle || state == State::Speaking {
-                        if state == State::Speaking {
+                        // Stop any outstanding playback before arming the mic.
+                        // A single-shot reply drops to Idle while its TTS is
+                        // still sounding (playback_end in the future), so gating
+                        // stop() on State::Speaking let a PTT press in Idle skip
+                        // it — leaving `is_playing` true with no drain and
+                        // recording the daemon's own voice (#68). Stop whenever
+                        // anything is playing, regardless of state; stop() is the
+                        // only thing that clears playback_end.
+                        if self.speaker.is_playing() {
                             self.speaker.stop()?;
                         }
+                        // Belt-and-suspenders: wait out any residual tail and
+                        // drop the echo it queued into the mic before arming, so
+                        // no in-flight TTS leaks into the PTT utterance — matching
+                        // the relisten path.
+                        while self.speaker.is_playing() {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        while audio_rx.try_recv().is_ok() {}
                         // Route this PTT session: `Some(id)` dictates into that
                         // conversation; `None` (plain PushToTalk) falls back to
                         // the daemon's own session, which — like the wake word —
@@ -705,6 +721,28 @@ where
                     last_activity = Instant::now();
                     match state {
                         State::Idle => {
+                            // Don't let the daemon wake itself on its own
+                            // playback. A single-shot reply returns to Idle while
+                            // its audio is still sounding, and any cue/SayText
+                            // plays into a mic that hears the speakers; an eager
+                            // detector trips on that echo. While *real* audio is
+                            // outstanding, skip wake detection AND don't seed the
+                            // prebuffer with echo — `is_playing` stays true (with
+                            // its tail pad) until the sound is truly gone.
+                            //
+                            // Once the audio deadline has passed but we're still
+                            // inside the tail pad (#70), nothing fresh is
+                            // sounding — only the latency cushion remains. Keep
+                            // seeding the prebuffer (still WITHOUT running wake
+                            // detect, since residual echo in the cushion could
+                            // trip it) so same-breath audio at the very tail
+                            // isn't dropped if the wake then fires a chunk later.
+                            if self.speaker.is_playing() {
+                                if self.speaker.in_tail_pad() {
+                                    self.prebuffer.push(&chunk);
+                                }
+                                continue;
+                            }
                             // Keep a rolling pre-buffer of recent idle audio so a
                             // command spoken in the same breath as the wake word
                             // isn't dropped during the handoff (#50).
@@ -1620,10 +1658,21 @@ mod tests {
     }
 
     /// Records the length of every buffer it was asked to play, so a test can
-    /// assert the listening cue (the ding earcon) was/wasn't queued.
+    /// assert the listening cue (the ding earcon) was/wasn't queued. Also models
+    /// a controllable "is playing" state and a stop counter so the PTT
+    /// self-recording fix (#68) can be exercised: a test sets `playing` to mimic
+    /// outstanding TTS, and `stop()` clears it (as the real sink does by
+    /// dropping the queue) while bumping `stopped` so the test can assert it ran.
     #[derive(Default, Clone)]
     struct FakeSink {
         played: Arc<StdMutex<Vec<usize>>>,
+        playing: Arc<std::sync::atomic::AtomicBool>,
+        /// Models `in_tail_pad`: the audio deadline has passed but we're still
+        /// inside the latency cushion (#70). Independent of `playing` so a test
+        /// can put the sink in "real audio" (playing && !in_pad) or "tail pad"
+        /// (playing && in_pad) states.
+        in_pad: Arc<std::sync::atomic::AtomicBool>,
+        stopped: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl AudioSink for FakeSink {
         fn play(&self, samples: Vec<f32>) -> Result<(), adele_voice_core::VoiceError> {
@@ -1631,10 +1680,19 @@ mod tests {
             Ok(())
         }
         fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            self.stopped
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.playing
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.in_pad
+                .store(false, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         fn is_playing(&self) -> bool {
-            false
+            self.playing.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn in_tail_pad(&self) -> bool {
+            self.in_pad.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -1653,6 +1711,15 @@ mod tests {
         /// Lengths of every buffer queued on the sink — the listening cue (the
         /// ding earcon) shows up here.
         sink_played: Arc<StdMutex<Vec<usize>>>,
+        /// Drives the fake sink's `is_playing`: set true to mimic outstanding
+        /// TTS (#68). Cleared by the sink's `stop()`.
+        sink_playing: Arc<std::sync::atomic::AtomicBool>,
+        /// Drives the fake sink's `in_tail_pad`: set true (with `sink_playing`)
+        /// to mimic the latency-cushion tail where same-breath audio should
+        /// still be pre-buffered (#70). Cleared by `stop()`.
+        sink_in_pad: Arc<std::sync::atomic::AtomicBool>,
+        /// Count of `stop()` calls the pipeline made on the sink (#68).
+        sink_stopped: Arc<std::sync::atomic::AtomicUsize>,
         /// Names of the client tools the pipeline registered at startup (voice#61).
         registered_rx: mpsc::UnboundedReceiver<Vec<String>>,
         /// Results the pipeline submitted for client-tool calls (voice#61).
@@ -2204,6 +2271,9 @@ mod tests {
 
         let sink = FakeSink::default();
         let sink_played = Arc::clone(&sink.played);
+        let sink_playing = Arc::clone(&sink.playing);
+        let sink_in_pad = Arc::clone(&sink.in_pad);
+        let sink_stopped = Arc::clone(&sink.stopped);
 
         let pipeline = Pipeline::new(
             FakeWake {
@@ -2262,6 +2332,9 @@ mod tests {
             prompt_rx,
             created_rx,
             sink_played,
+            sink_playing,
+            sink_in_pad,
+            sink_stopped,
             registered_rx,
             tool_result_rx,
             handle,
@@ -2340,6 +2413,64 @@ mod tests {
             matches!(got, Ok(Some(()))),
             "transcription must run for a push-to-talk utterance while wake word is disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn ptt_in_idle_with_playback_stops_tts_before_listening() {
+        // #68: a single-shot reply drops to Idle while its TTS is still
+        // sounding (playback_end in the future). A PTT press in that window
+        // must stop the outstanding playback — otherwise the mic arms with no
+        // echo-drain and records the daemon's own voice. Pre-fix `stop()` was
+        // gated on State::Speaking and skipped here.
+        use std::sync::atomic::Ordering;
+        let mut h = spawn_pipeline(Cfg::default());
+
+        // Mimic outstanding TTS while the pipeline sits in Idle.
+        h.sink_playing.store(true, Ordering::SeqCst);
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt in Idle-with-playback must reach Listening")
+        .unwrap();
+
+        assert!(
+            h.sink_stopped.load(Ordering::SeqCst) >= 1,
+            "PTT in Idle with playback outstanding must stop the TTS before arming"
+        );
+        assert!(
+            !h.sink_playing.load(Ordering::SeqCst),
+            "playback must be cleared before Listening so no TTS leaks into the utterance"
+        );
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ptt_in_idle_without_playback_does_not_stop() {
+        // #68 converse: with nothing playing, PTT must not call stop() — the
+        // fix only stops when `is_playing()` is true, so the common path stays
+        // a no-op and doesn't churn the sink/stream.
+        use std::sync::atomic::Ordering;
+        let mut h = spawn_pipeline(Cfg::default());
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        assert_eq!(
+            h.sink_stopped.load(Ordering::SeqCst),
+            0,
+            "PTT with nothing playing must not stop the sink"
+        );
+        h.handle.abort();
     }
 
     #[tokio::test]
@@ -2557,6 +2688,34 @@ mod tests {
             got.is_err(),
             "a near-silent capture must be discarded before transcription"
         );
+    }
+
+    #[tokio::test]
+    async fn idle_in_tail_pad_seeds_prebuffer_without_waking() {
+        // #70: during the tail pad (audio deadline passed, latency cushion
+        // still running) the daemon must NOT run wake detect — residual echo
+        // could trip it — but should keep seeding the prebuffer so same-breath
+        // audio at the very tail isn't lost. Here we assert the gate half:
+        // with an always-firing detector, a chunk delivered while in the pad
+        // must NOT transition out of Idle.
+        use std::sync::atomic::Ordering;
+        let h = spawn_pipeline(Cfg {
+            wake_detects: true,
+            ..Default::default()
+        });
+        // Mimic "playing, in the tail pad".
+        h.sink_playing.store(true, Ordering::SeqCst);
+        h.sink_in_pad.store(true, Ordering::SeqCst);
+
+        h.audio_tx.send(vec![0.1f32; 1000]).await.unwrap();
+        // Give the pipeline time to process the chunk.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            *h.state_rx.borrow(),
+            State::Idle,
+            "wake detect must stay gated during the tail pad despite an always-firing detector"
+        );
+        h.handle.abort();
     }
 
     #[tokio::test]

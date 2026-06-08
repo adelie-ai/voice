@@ -102,6 +102,12 @@ impl<T: TextToSpeech> Speaker<T> {
     pub fn is_playing(&self) -> bool {
         self.sink.is_playing()
     }
+
+    /// Whether playback is in its tail pad (audio done, latency cushion still
+    /// running). See `AudioSink::in_tail_pad` (#70).
+    pub fn in_tail_pad(&self) -> bool {
+        self.sink.in_tail_pad()
+    }
 }
 
 #[cfg(test)]
