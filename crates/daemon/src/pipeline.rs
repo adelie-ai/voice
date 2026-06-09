@@ -607,8 +607,48 @@ where
         }
     }
 
+    /// Wait in the no-capture (degraded) state, servicing control channels so
+    /// the daemon stays alive — keeping the separately-spawned TTS (`SayText`)
+    /// and D-Bus services up — and a reload can retry capture. Returns `true` to
+    /// retry `source.start()`, `false` if every control channel has closed (so
+    /// `run()` shuts down cleanly). The `select!` awaits, so there is no
+    /// busy-spin while degraded.
+    async fn await_capture_retry(&mut self) -> bool {
+        loop {
+            tokio::select! {
+                Some(()) = self.reload_rx.recv() => { self.reload(); return true; }
+                Some(_target) = self.ptt_rx.recv() => {
+                    tracing::warn!("push-to-talk ignored: voice capture is unavailable");
+                }
+                Some(_req) = self.stop_rx.recv() => { /* nothing capturing to stop */ }
+                else => return false,
+            }
+        }
+    }
+
     pub async fn run(mut self) -> anyhow::Result<()> {
-        let mut audio_rx = self.source.start()?;
+        // A capture-device failure must NOT crash the daemon (#79): on `Err`,
+        // log an actionable message and drop into the degraded loop, which keeps
+        // the control channels (and thus the separate TTS/D-Bus tasks) serving
+        // until a reload makes capture available again or everything shuts down.
+        let mut audio_rx = loop {
+            match self.source.start() {
+                Ok(rx) => break rx,
+                Err(e) => {
+                    tracing::error!(
+                        "voice capture unavailable: {e} — speech output (SayText) and D-Bus stay \
+                         up; wake-word and dictation are disabled until the input device is fixed. \
+                         A config device-name change needs a restart; a transient device return \
+                         recovers on reload."
+                    );
+                    // Degraded: stay alive, keep serving control channels, retry
+                    // capture on reload.
+                    if !self.await_capture_retry().await {
+                        return Ok(()); // all control channels closed → clean shutdown
+                    }
+                }
+            }
+        };
 
         // Advertise the LLM-driven session-control tools once at startup
         // (voice#61). The connection is already up (built in main), so register
