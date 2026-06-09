@@ -626,14 +626,15 @@ where
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        // A capture-device failure must NOT crash the daemon (#79): on `Err`,
-        // log an actionable message and drop into the degraded loop, which keeps
-        // the control channels (and thus the separate TTS/D-Bus tasks) serving
-        // until a reload makes capture available again or everything shuts down.
-        let mut audio_rx = loop {
+    /// Start (or restart) capture, degrading on failure (#79): on `Err`, log an
+    /// actionable message and drop into the degraded loop, which keeps the
+    /// control channels (and thus the separate TTS/D-Bus tasks) serving until a
+    /// reload makes capture available again or everything shuts down. Returns
+    /// `None` when every control channel has closed (clean shutdown).
+    async fn acquire_capture(&mut self) -> Option<mpsc::Receiver<Vec<f32>>> {
+        loop {
             match self.source.start() {
-                Ok(rx) => break rx,
+                Ok(rx) => return Some(rx),
                 Err(e) => {
                     tracing::error!(
                         "voice capture unavailable: {e} — speech output (SayText) and D-Bus stay \
@@ -644,10 +645,17 @@ where
                     // Degraded: stay alive, keep serving control channels, retry
                     // capture on reload.
                     if !self.await_capture_retry().await {
-                        return Ok(()); // all control channels closed → clean shutdown
+                        return None; // all control channels closed → clean shutdown
                     }
                 }
             }
+        }
+    }
+
+    pub async fn run(mut self) -> anyhow::Result<()> {
+        let mut audio_rx = match self.acquire_capture().await {
+            Some(rx) => rx,
+            None => return Ok(()),
         };
 
         // Advertise the LLM-driven session-control tools once at startup
@@ -753,7 +761,39 @@ where
                 }
 
                 // Process audio chunks
-                Some(chunk) = audio_rx.recv() => {
+                chunk = audio_rx.recv() => {
+                    // The capture thread died AFTER a successful start (device
+                    // unplug, drain/resample error) — the channel closing is the
+                    // only signal we get (V-1). Don't go silently deaf: stop the
+                    // source so its `running` latch clears, surface the loss,
+                    // and restart capture — immediately if the device opens
+                    // again, otherwise via the same degraded loop as startup.
+                    let Some(chunk) = chunk else {
+                        tracing::error!(
+                            "voice capture channel closed (capture thread died) — \
+                             restarting capture; wake-word and dictation are \
+                             unavailable until it recovers"
+                        );
+                        let _ = self.speaker.stop();
+                        if state != State::Idle {
+                            state = State::Idle;
+                            self.set_state(state);
+                        }
+                        self.endpointer.reset();
+                        // Clear the adapter's running latch so start() can
+                        // succeed (the cpal source refuses to double-start).
+                        if let Err(e) = self.source.stop() {
+                            tracing::warn!("source stop after capture death failed: {e}");
+                        }
+                        match self.acquire_capture().await {
+                            Some(rx) => {
+                                audio_rx = rx;
+                                tracing::info!("voice capture recovered after capture-thread death");
+                                continue;
+                            }
+                            None => break, // all control channels closed
+                        }
+                    };
                     // `enabled` governs only always-on wake-word listening:
                     // push-to-talk (and SayText) must work even when "Hey
                     // Adele" is off, so the gate is scoped to the Idle state
@@ -3571,8 +3611,7 @@ mod tests {
                 .ok_or_else(|| adele_voice_core::VoiceError::Audio("no receiver scripted".into()))
         }
         fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
-            self.stops
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
