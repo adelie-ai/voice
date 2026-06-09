@@ -3492,4 +3492,211 @@ mod tests {
             "a zero reuse window must always start fresh"
         );
     }
+
+    // --- Capture-device hardening (#79) ---------------------------------
+    //
+    // A capture (`source.start()`) failure must NOT crash the daemon: it
+    // enters a degraded loop that keeps the control channels serviced (so the
+    // separately-spawned TTS/D-Bus stay up) and retries on reload.
+
+    /// `AudioSource` whose `start()` fails its first `fail_first` calls (so the
+    /// pipeline enters the degraded loop) and then hands over the receiver. With
+    /// `fail_first == usize::MAX` it always errors, modelling a permanently bad
+    /// device. `starts` counts every `start()` call so a test can assert the
+    /// retry actually happened.
+    struct FlakySource {
+        rx: StdMutex<Option<mpsc::Receiver<Vec<f32>>>>,
+        fail_first: usize,
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl AudioSource for FlakySource {
+        fn start(&self) -> Result<mpsc::Receiver<Vec<f32>>, adele_voice_core::VoiceError> {
+            let n = self
+                .starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.fail_first {
+                return Err(adele_voice_core::VoiceError::Audio(
+                    "input device 'bogus' not found".to_string(),
+                ));
+            }
+            self.rx
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| adele_voice_core::VoiceError::Audio("already started".to_string()))
+        }
+        fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            Ok(())
+        }
+    }
+
+    /// Drives the channels of a real `run()` over a `FlakySource`, keeping the
+    /// reload/ptt/stop senders the normal `spawn_pipeline` helper drops — the
+    /// degraded loop is fed exactly through those control channels.
+    struct DegradedHarness {
+        audio_tx: mpsc::Sender<Vec<f32>>,
+        ptt_tx: mpsc::Sender<Option<String>>,
+        stop_tx: mpsc::Sender<StopRequest>,
+        reload_tx: mpsc::Sender<()>,
+        state_rx: watch::Receiver<State>,
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    fn spawn_degraded(fail_first: usize) -> DegradedHarness {
+        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(64);
+        let (_enabled_tx, enabled_rx) = watch::channel(true);
+        let (ptt_tx, ptt_rx) = mpsc::channel(1);
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        let (state_tx, state_rx) = watch::channel(State::Idle);
+        let (hit_tx, _transcribe_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+        let (created_tx, _created_rx) = mpsc::unbounded_channel();
+        let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
+        let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
+        let (reload_tx, reload_rx) = mpsc::channel(4);
+        let wake_builder: WakeBuilder<FakeWake> =
+            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = Pipeline::new(
+            FakeWake { detects: false },
+            FakeVad {
+                probs: StdMutex::new(VecDeque::new()),
+            },
+            FakeStt {
+                hit: hit_tx,
+                text: "hello".to_string(),
+            },
+            FakeTts,
+            FakeAssistant {
+                tx: StdMutex::new(None),
+                prompt_tx,
+                created_tx,
+                registered_tx,
+                tool_result_tx,
+                inject_tool_call: None,
+                fail: false,
+            },
+            Arc::new(FlakySource {
+                rx: StdMutex::new(Some(audio_rx)),
+                fail_first,
+                starts: Arc::clone(&starts),
+            }),
+            Arc::new(FakeSink::default()),
+            state_tx,
+            enabled_rx,
+            ptt_rx,
+            stop_rx,
+            reload_rx,
+            wake_builder,
+            test_tunables(),
+            "test".to_string(),
+            Duration::from_millis(0),
+            0.5,
+            false,
+            Duration::from_secs(600),
+            Duration::from_millis(50),
+            None,
+            String::new(),
+            ListeningCue::Off,
+            test_timeouts(),
+            ClientToolToggles::default(),
+        );
+        let handle = tokio::spawn(pipeline.run());
+        DegradedHarness {
+            audio_tx,
+            ptt_tx,
+            stop_tx,
+            reload_tx,
+            state_rx,
+            starts,
+            handle,
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_failure_recovers_on_reload() {
+        // start() errors once (degraded), then a reload retries it and the
+        // pipeline proceeds into the normal capture loop — provably, by driving
+        // a PTT to Listening, which only the normal loop services.
+        let mut h = spawn_degraded(1);
+
+        // Nudge the degraded loop with a reload so it re-tries start().
+        h.reload_tx.send(()).await.unwrap();
+
+        // The normal loop is now running: PTT must drive Idle -> Listening.
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("after reload, the normal loop must service PTT -> Listening")
+        .unwrap();
+
+        assert!(
+            h.starts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "start() must have been retried after the reload"
+        );
+
+        // Terminate run() cleanly for the test: closing the audio source ends
+        // the normal loop's `audio_rx.recv()` branch.
+        drop(h.audio_tx);
+        let _ = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
+    }
+
+    #[tokio::test]
+    async fn capture_failure_then_closed_channels_shuts_down_cleanly() {
+        // start() always errors and there's no reload; once every control
+        // channel closes, run() returns Ok(()) — it did NOT propagate the
+        // capture error or crash the process.
+        let h = spawn_degraded(usize::MAX);
+
+        // Drop the audio sender too (irrelevant in degraded mode) and every
+        // control sender so the degraded select! hits its `else` arm.
+        drop(h.audio_tx);
+        drop(h.ptt_tx);
+        drop(h.stop_tx);
+        drop(h.reload_tx);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), h.handle)
+            .await
+            .expect("run() must return after all control channels close")
+            .expect("join");
+        assert!(
+            result.is_ok(),
+            "a permanent capture failure must yield Ok(()), not an error: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ptt_during_degraded_mode_is_ignored() {
+        // A PTT press while capture is unavailable must be logged/ignored — no
+        // hang, no crash, no state change — and the daemon stays up until the
+        // channels close (then clean Ok(())).
+        let mut h = spawn_degraded(usize::MAX);
+
+        h.ptt_tx.send(None).await.unwrap();
+        // State must stay Idle: PTT can't arm the (absent) mic.
+        let res = tokio::time::timeout(
+            Duration::from_millis(200),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await;
+        assert!(
+            res.is_err(),
+            "PTT in degraded mode must NOT transition to Listening"
+        );
+
+        // Still alive: close the channels and confirm a clean shutdown.
+        drop(h.audio_tx);
+        drop(h.ptt_tx);
+        drop(h.stop_tx);
+        drop(h.reload_tx);
+        let result = tokio::time::timeout(Duration::from_secs(2), h.handle)
+            .await
+            .expect("run() must return after channels close")
+            .expect("join");
+        assert!(result.is_ok(), "degraded run() must end with Ok(())");
+    }
 }
