@@ -3539,33 +3539,40 @@ mod tests {
     // enters a degraded loop that keeps the control channels serviced (so the
     // separately-spawned TTS/D-Bus stay up) and retries on reload.
 
-    /// `AudioSource` whose `start()` fails its first `fail_first` calls (so the
-    /// pipeline enters the degraded loop) and then hands over the receiver. With
-    /// `fail_first == usize::MAX` it always errors, modelling a permanently bad
-    /// device. `starts` counts every `start()` call so a test can assert the
-    /// retry actually happened.
+    /// `AudioSource` whose `start()` follows a per-call script: call indices in
+    /// `fail_calls` (0-based) error, modelling a bad/absent device; successful
+    /// calls hand over the next queued receiver (so a test can model capture
+    /// dying and a *fresh* capture channel coming up on restart — V-1). Calls
+    /// past the queue error too. `starts`/`stops` count every call so a test
+    /// can assert the retry/cleanup actually happened.
     struct FlakySource {
-        rx: StdMutex<Option<mpsc::Receiver<Vec<f32>>>>,
+        rxs: StdMutex<VecDeque<mpsc::Receiver<Vec<f32>>>>,
+        fail_calls: Vec<usize>,
+        /// All calls below this index fail (legacy "fail the first N" shorthand;
+        /// `usize::MAX` = always fail).
         fail_first: usize,
         starts: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl AudioSource for FlakySource {
         fn start(&self) -> Result<mpsc::Receiver<Vec<f32>>, adele_voice_core::VoiceError> {
             let n = self
                 .starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if n < self.fail_first {
+            if n < self.fail_first || self.fail_calls.contains(&n) {
                 return Err(adele_voice_core::VoiceError::Audio(
                     "input device 'bogus' not found".to_string(),
                 ));
             }
-            self.rx
+            self.rxs
                 .lock()
                 .unwrap()
-                .take()
-                .ok_or_else(|| adele_voice_core::VoiceError::Audio("already started".to_string()))
+                .pop_front()
+                .ok_or_else(|| adele_voice_core::VoiceError::Audio("no receiver scripted".into()))
         }
         fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            self.stops
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -3574,17 +3581,36 @@ mod tests {
     /// reload/ptt/stop senders the normal `spawn_pipeline` helper drops — the
     /// degraded loop is fed exactly through those control channels.
     struct DegradedHarness {
-        audio_tx: mpsc::Sender<Vec<f32>>,
+        /// One sender per scripted capture channel, in hand-out order. Dropping
+        /// the live one models the capture thread dying (V-1).
+        audio_txs: Vec<mpsc::Sender<Vec<f32>>>,
         ptt_tx: mpsc::Sender<Option<String>>,
         stop_tx: mpsc::Sender<StopRequest>,
         reload_tx: mpsc::Sender<()>,
         state_rx: watch::Receiver<State>,
         starts: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
         handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     }
 
     fn spawn_degraded(fail_first: usize) -> DegradedHarness {
-        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(64);
+        spawn_capture_harness(fail_first, vec![], 1)
+    }
+
+    /// Spawn `run()` over a `FlakySource` scripted with `channels` fresh capture
+    /// channels and the given failure script (see [`FlakySource`]).
+    fn spawn_capture_harness(
+        fail_first: usize,
+        fail_calls: Vec<usize>,
+        channels: usize,
+    ) -> DegradedHarness {
+        let mut audio_txs = Vec::new();
+        let mut audio_rxs = VecDeque::new();
+        for _ in 0..channels {
+            let (tx, rx) = mpsc::channel::<Vec<f32>>(64);
+            audio_txs.push(tx);
+            audio_rxs.push_back(rx);
+        }
         let (_enabled_tx, enabled_rx) = watch::channel(true);
         let (ptt_tx, ptt_rx) = mpsc::channel(1);
         let (stop_tx, stop_rx) = mpsc::channel(1);
@@ -3598,6 +3624,7 @@ mod tests {
         let wake_builder: WakeBuilder<FakeWake> =
             Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pipeline = Pipeline::new(
             FakeWake { detects: false },
             FakeVad {
@@ -3618,9 +3645,11 @@ mod tests {
                 fail: false,
             },
             Arc::new(FlakySource {
-                rx: StdMutex::new(Some(audio_rx)),
+                rxs: StdMutex::new(audio_rxs),
+                fail_calls,
                 fail_first,
                 starts: Arc::clone(&starts),
+                stops: Arc::clone(&stops),
             }),
             Arc::new(FakeSink::default()),
             state_tx,
@@ -3644,14 +3673,31 @@ mod tests {
         );
         let handle = tokio::spawn(pipeline.run());
         DegradedHarness {
-            audio_tx,
+            audio_txs,
             ptt_tx,
             stop_tx,
             reload_tx,
             state_rx,
             starts,
+            stops,
             handle,
         }
+    }
+
+    /// Poll an atomic counter until it reaches `n` (or fail after 2s).
+    async fn wait_for_count(counter: &Arc<std::sync::atomic::AtomicUsize>, n: usize, what: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while counter.load(std::sync::atomic::Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "{what}: expected count >= {n}, got {}",
+                counter.load(std::sync::atomic::Ordering::SeqCst)
+            )
+        });
     }
 
     #[tokio::test]
@@ -3679,10 +3725,7 @@ mod tests {
             "start() must have been retried after the reload"
         );
 
-        // Terminate run() cleanly for the test: closing the audio source ends
-        // the normal loop's `audio_rx.recv()` branch.
-        drop(h.audio_tx);
-        let _ = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
+        h.handle.abort();
     }
 
     #[tokio::test]
@@ -3694,7 +3737,7 @@ mod tests {
 
         // Drop the audio sender too (irrelevant in degraded mode) and every
         // control sender so the degraded select! hits its `else` arm.
-        drop(h.audio_tx);
+        drop(h.audio_txs);
         drop(h.ptt_tx);
         drop(h.stop_tx);
         drop(h.reload_tx);
@@ -3729,7 +3772,7 @@ mod tests {
         );
 
         // Still alive: close the channels and confirm a clean shutdown.
-        drop(h.audio_tx);
+        drop(h.audio_txs);
         drop(h.ptt_tx);
         drop(h.stop_tx);
         drop(h.reload_tx);
@@ -3738,5 +3781,94 @@ mod tests {
             .expect("run() must return after channels close")
             .expect("join");
         assert!(result.is_ok(), "degraded run() must end with Ok(())");
+    }
+
+    // --- V-1: capture-thread death AFTER a successful start ------------------
+    //
+    // The #79 degraded loop only guarded the *initial* start(). If the capture
+    // thread dies later (device unplug, resample error → the audio channel
+    // closes), the daemon went permanently, silently deaf: the closed channel
+    // merely disabled its select arm. The pipeline must instead stop the source
+    // (so its `running` flag clears and a restart can succeed) and restart
+    // capture — immediately when the device is back, else via the same degraded
+    // loop as startup.
+
+    #[tokio::test]
+    async fn capture_thread_death_restarts_capture() {
+        // Two scripted capture channels: the first dies (sender dropped), the
+        // pipeline must stop() the source and start() again, then serve voice
+        // from the second channel (proven by PTT → Listening).
+        let mut h = spawn_capture_harness(0, vec![], 2);
+        wait_for_count(&h.starts, 1, "initial capture start").await;
+
+        // Kill the live capture channel — the capture thread died.
+        drop(h.audio_txs.remove(0));
+
+        // The pipeline must restart capture on its own (no reload needed for a
+        // transient death when the device opens fine again)...
+        wait_for_count(&h.starts, 2, "capture restart after channel close").await;
+        // ...and must have stop()ed the source first so the real adapter's
+        // `running` latch is cleared and start() can succeed.
+        assert!(
+            h.stops.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "source.stop() must run before the restart so `running` clears"
+        );
+
+        // The fresh channel is live: PTT drives Idle → Listening.
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("after capture restart, PTT must reach Listening")
+        .unwrap();
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn capture_death_mid_listening_degrades_then_recovers_on_reload() {
+        // Unhappy path: capture dies while LISTENING and the immediate restart
+        // also fails (device really gone). The pipeline must drop back to Idle
+        // (not stay stuck half-Listening), survive in the degraded loop, and
+        // recover when a reload retries with the device back.
+        let mut h = spawn_capture_harness(0, vec![1], 2); // call 1 (the restart) fails
+        wait_for_count(&h.starts, 1, "initial capture start").await;
+
+        // Enter Listening via PTT on the live channel.
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+
+        // Capture dies mid-listening; the immediate restart fails (scripted).
+        drop(h.audio_txs.remove(0));
+        wait_for_count(&h.starts, 2, "restart attempt after channel close").await;
+
+        // The pipeline must surface the loss: back to Idle, not wedged Listening.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("capture death must return the pipeline to Idle")
+        .unwrap();
+
+        // A reload (device is back) recovers capture; PTT works again.
+        h.reload_tx.send(()).await.unwrap();
+        wait_for_count(&h.starts, 3, "retry after reload").await;
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("after recovery, PTT must reach Listening")
+        .unwrap();
+        h.handle.abort();
     }
 }
