@@ -409,6 +409,22 @@ impl StreamingResampler {
     }
 }
 
+/// Clears the shared `running` flag when dropped, whatever the exit path.
+///
+/// The capture thread used to leave `running` latched true when its drain loop
+/// exited on an error (resample failure, receiver dropped) or a panic — only an
+/// explicit `stop()` cleared it, so every later `start()` failed with "capture
+/// already running" forever (V-1). Tying the reset to `Drop` makes the latch
+/// follow the thread's actual lifetime: any exit — clean stop, error, or panic
+/// unwind — leaves the source restartable.
+struct RunningGuard(Arc<AtomicBool>);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl AudioSource for CpalAudioSource {
     fn start(&self) -> Result<mpsc::Receiver<Vec<f32>>, VoiceError> {
         if self.running.load(Ordering::SeqCst) {
@@ -542,6 +558,12 @@ impl AudioSource for CpalAudioSource {
                 }
 
                 running_clone.store(true, Ordering::SeqCst);
+                // From here on the `running` latch must track the THREAD's
+                // lifetime, not just explicit stop(): if the drain loop exits on
+                // an error (or panics), the guard clears the flag so a later
+                // start() can succeed instead of erroring "capture already
+                // running" forever (V-1).
+                let _running_guard = RunningGuard(Arc::clone(&running_clone));
                 let _ = result_tx.send(Ok(()));
 
                 // Drain loop: pull src-rate mono from the ring buffer, resample
@@ -733,6 +755,41 @@ mod tests {
         assert!(!is_offered_pcm("dmix:CARD=PCH,DEV=0"));
         assert!(!is_offered_pcm("null"));
         assert!(!is_offered_pcm("default"));
+    }
+
+    // --- V-1: the `running` latch must clear on EVERY capture-thread exit ---
+
+    #[test]
+    fn running_guard_clears_flag_on_normal_exit() {
+        // Models the drain loop exiting on an error path (resample failure,
+        // receiver dropped): when the thread scope ends, `running` must clear
+        // so a later start() can succeed.
+        let running = Arc::new(AtomicBool::new(false));
+        {
+            running.store(true, Ordering::SeqCst);
+            let _guard = RunningGuard(Arc::clone(&running));
+            assert!(running.load(Ordering::SeqCst), "thread is running");
+        }
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "guard must clear `running` when the capture scope exits"
+        );
+    }
+
+    #[test]
+    fn running_guard_clears_flag_on_panic() {
+        // Even a panicking capture thread must leave the source restartable.
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&running);
+        let handle = std::thread::spawn(move || {
+            let _guard = RunningGuard(flag);
+            panic!("simulated capture-thread crash");
+        });
+        assert!(handle.join().is_err(), "the thread panicked as scripted");
+        assert!(
+            !running.load(Ordering::SeqCst),
+            "guard must clear `running` on panic unwind"
+        );
     }
 
     #[test]
