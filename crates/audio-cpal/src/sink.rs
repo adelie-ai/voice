@@ -41,6 +41,18 @@ const PLAYBACK_LATENCY_MARGIN: Duration = Duration::from_millis(50);
 /// micros can never be a genuine reading, so it unambiguously selects the floor.
 const LATENCY_UNMEASURED: u64 = u64::MAX;
 
+/// Clears a playback generation's stop flag when dropped, whatever the exit
+/// path. Held by the playback thread so a build/play error return — or a panic
+/// unwind — leaves no phantom "armed" generation behind, mirroring the source's
+/// `RunningGuard` (V-4, cf. V-1).
+struct StopFlagGuard(Arc<AtomicBool>);
+
+impl Drop for StopFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 pub struct CpalAudioSink {
     device_name: String,
     producer: Mutex<Option<ringbuf::HeapProd<f32>>>,
@@ -56,7 +68,16 @@ pub struct CpalAudioSink {
     /// samples have a known duration (count / sample_rate), so the honest answer
     /// to "is it still playing?" is "has that much wall-clock time elapsed yet?"
     playback_end: Mutex<Option<Instant>>,
-    stream_running: Arc<AtomicBool>,
+    /// Stop flag for the *current* playback generation. Each `open()` mints a
+    /// fresh `Arc<AtomicBool>` and hands a clone to its playback thread; `stop()`
+    /// clears it. It is deliberately per-generation rather than one shared flag
+    /// on the struct: with a single flag a fast `stop()`→`play()` race could
+    /// store `true` back into the very flag the old (still-polling) thread was
+    /// watching, resurrecting a generation that `stop()` had told to die and
+    /// leaving its cpal output stream orphaned forever (V-4). A new generation's
+    /// flag is a different allocation, so the old thread keeps observing the
+    /// `false` it was given and exits cleanly. `None` before the first `open()`.
+    current_stop_flag: Mutex<Option<Arc<AtomicBool>>>,
     /// Device output latency in microseconds, measured live in the output
     /// callback from `OutputStreamTimestamp` (the delta between when a buffer is
     /// handed to the device and when it will actually sound). Drives the tail
@@ -71,7 +92,7 @@ impl CpalAudioSink {
             device_name: device_name.to_string(),
             producer: Mutex::new(None),
             playback_end: Mutex::new(None),
-            stream_running: Arc::new(AtomicBool::new(false)),
+            current_stop_flag: Mutex::new(None),
             measured_latency_micros: Arc::new(AtomicU64::new(LATENCY_UNMEASURED)),
         }
     }
@@ -91,6 +112,36 @@ impl CpalAudioSink {
     /// Current tail pad, reading the live measured latency.
     fn tail_pad(&self) -> Duration {
         Self::tail_pad_from_latency(self.measured_latency_micros.load(Ordering::Relaxed))
+    }
+
+    /// Stand down whatever playback generation is currently armed (if any) and
+    /// install a fresh stop flag for the next one. Returns the new flag, a clone
+    /// of which the caller hands to the new playback thread.
+    ///
+    /// Felling the previous flag *before* swapping in the new one is what makes
+    /// the stop()→play() race harmless: the old thread polls the old allocation,
+    /// which we leave `false`, while the new thread polls a brand-new allocation
+    /// we leave `true`. The two can never alias, so no `open()` can resurrect a
+    /// stopped generation (V-4).
+    fn begin_playback_generation(&self) -> Arc<AtomicBool> {
+        let new_flag = Arc::new(AtomicBool::new(true));
+        if let Ok(mut cur) = self.current_stop_flag.lock() {
+            if let Some(old) = cur.take() {
+                old.store(false, Ordering::SeqCst);
+            }
+            *cur = Some(Arc::clone(&new_flag));
+        }
+        new_flag
+    }
+
+    /// Signal the current playback generation to stop, without arming a new one.
+    /// Idempotent: a no-op when nothing is running.
+    fn signal_stop_current_generation(&self) {
+        if let Ok(mut cur) = self.current_stop_flag.lock()
+            && let Some(flag) = cur.take()
+        {
+            flag.store(false, Ordering::SeqCst);
+        }
     }
 
     fn find_output_device(name: &str) -> Result<cpal::Device, VoiceError> {
@@ -124,7 +175,10 @@ impl CpalAudioSink {
         }
 
         let device_name = self.device_name.clone();
-        let stream_running = Arc::clone(&self.stream_running);
+        // Mint this generation's own stop flag (fells any prior generation),
+        // then hand a clone to the playback thread. The struct holds the other
+        // clone so stop()/the next open() can fell exactly this thread (V-4).
+        let stop_flag = self.begin_playback_generation();
         let measured_latency = Arc::clone(&self.measured_latency_micros);
 
         let rb = HeapRb::<f32>::new(OUTPUT_RING_BUFFER_CAPACITY);
@@ -137,9 +191,15 @@ impl CpalAudioSink {
 
         // cpal::Stream is !Send, so manage it on a dedicated thread
         let consumer_clone = Arc::clone(&consumer);
+        let thread_stop = Arc::clone(&stop_flag);
         std::thread::Builder::new()
             .name("audio-playback".into())
             .spawn(move || {
+                // Clear this generation's flag on EVERY exit — error returns
+                // below as well as the normal stop — so a build/play failure
+                // can't leave a phantom "armed" generation around (V-4).
+                let _stop_guard = StopFlagGuard(thread_stop);
+
                 let device = match Self::find_output_device(&device_name) {
                     Ok(d) => d,
                     Err(e) => {
@@ -212,11 +272,15 @@ impl CpalAudioSink {
                     return;
                 }
 
-                stream_running.store(true, Ordering::SeqCst);
+                // The generation flag was minted `true` by
+                // begin_playback_generation(); the stream is live now, so just
+                // signal readiness and poll our own flag until felled.
                 let _ = result_tx.send(Ok(()));
 
-                // Keep the stream alive until stopped
-                while stream_running.load(Ordering::SeqCst) {
+                // Keep the stream alive until this generation is stopped. We poll
+                // *our* flag (`stop_flag`), which no later open() can re-arm —
+                // that is what fixes the orphaned-thread race (V-4).
+                while stop_flag.load(Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
 
@@ -288,7 +352,10 @@ impl AudioSink for CpalAudioSink {
     }
 
     fn stop(&self) -> Result<(), VoiceError> {
-        self.stream_running.store(false, Ordering::SeqCst);
+        // Fell the current playback generation's own flag (no struct-wide flag a
+        // later open() could revive). The old thread, polling this exact flag,
+        // sees `false` and exits, releasing its cpal output stream (V-4).
+        self.signal_stop_current_generation();
         // Barge-in/stop discards the queue, so nothing is outstanding.
         if let Ok(mut end) = self.playback_end.lock() {
             *end = None;
@@ -552,6 +619,71 @@ mod tests {
     fn in_tail_pad_is_false_when_idle() {
         let sink = CpalAudioSink::new("default");
         assert!(!sink.in_tail_pad(), "nothing queued ⇒ not in a pad");
+    }
+
+    // ----- V-4: stop()→play() must not orphan the prior playback thread. -----
+
+    #[test]
+    fn each_open_gets_its_own_stop_flag() {
+        // The bug: a single shared `stream_running` flag meant a new open()
+        // could store `true` back into the same flag the old thread polls,
+        // resurrecting a generation that stop() had told to die. Each open()
+        // must mint a fresh flag so a stale thread can never be revived.
+        let sink = CpalAudioSink::new("default");
+        let gen1 = sink.begin_playback_generation();
+        let gen2 = sink.begin_playback_generation();
+        assert!(
+            !Arc::ptr_eq(&gen1, &gen2),
+            "consecutive generations must own distinct stop flags"
+        );
+    }
+
+    #[test]
+    fn stop_kills_only_the_current_generation_and_a_later_open_cannot_revive_it() {
+        // Reproduce the race deterministically without hardware: gen1 is the old
+        // playback thread's flag; stop() must fell it; a subsequent open() (gen2)
+        // installs a brand-new flag and must NOT flip gen1 back to running. The
+        // old thread, polling gen1, therefore sees `false` and exits.
+        let sink = CpalAudioSink::new("default");
+
+        let gen1 = sink.begin_playback_generation();
+        assert!(gen1.load(Ordering::SeqCst), "a fresh generation runs");
+
+        // stop() before the old thread has observed the flag (the 100ms poll
+        // window the real bug raced inside).
+        sink.signal_stop_current_generation();
+        assert!(
+            !gen1.load(Ordering::SeqCst),
+            "stop fells the live generation"
+        );
+
+        // A new open() races in.
+        let gen2 = sink.begin_playback_generation();
+        assert!(gen2.load(Ordering::SeqCst), "the new generation runs");
+        assert!(
+            !gen1.load(Ordering::SeqCst),
+            "the new generation must NOT resurrect the old, stopped one"
+        );
+        assert!(
+            !Arc::ptr_eq(&gen1, &gen2),
+            "the new generation must be a distinct flag, not the revived old one"
+        );
+    }
+
+    #[test]
+    fn beginning_a_new_generation_fells_the_previous_one() {
+        // Defense in depth: even without an explicit stop(), opening a fresh
+        // generation must stand the prior one down so two live cpal streams
+        // can't coexist. (open() is idempotent at the producer level, but the
+        // flag bookkeeping must still never leave an orphan armed.)
+        let sink = CpalAudioSink::new("default");
+        let gen1 = sink.begin_playback_generation();
+        assert!(gen1.load(Ordering::SeqCst));
+        let _gen2 = sink.begin_playback_generation();
+        assert!(
+            !gen1.load(Ordering::SeqCst),
+            "starting a new generation must fell the previous flag"
+        );
     }
 
     #[test]
