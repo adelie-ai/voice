@@ -336,6 +336,46 @@ pub fn probe_input_devices() -> Result<Vec<InputDeviceInfo>, VoiceError> {
     Ok(out)
 }
 
+/// Worst-case mono frames a single capture callback can deliver, used to
+/// pre-size the downmix scratch so `to_mono_f32` never reallocates inside the
+/// realtime callback (V-8). cpal's `BufferSize::Default` doesn't pin a size, so
+/// we reserve a generous quantum — 250ms at the negotiated rate — which dwarfs
+/// any realistic ALSA/PipeWire period (single- to low-double-digit ms) while
+/// staying a fixed, bounded allocation. Floored at 2048 (the old warm-up guess)
+/// so we never under-reserve for very low rates.
+fn max_capture_frames(rate: u32) -> usize {
+    (rate as usize / 4).max(2048)
+}
+
+/// Lock-free tally of capture-callback ring-buffer overflows. The callback must
+/// never `tracing::debug!` (it can lock/allocate) so on overflow it just bumps
+/// this counter; the drain thread reads-and-resets it and logs out of band
+/// (V-8). Counts *samples* dropped, summed across callbacks since the last read.
+/// `Clone` shares the same tally — the callback holds one clone, the drain loop
+/// the other.
+#[derive(Clone)]
+struct OverflowCounter(Arc<std::sync::atomic::AtomicUsize>);
+
+impl OverflowCounter {
+    fn new() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+    }
+
+    /// Add `n` dropped samples (no-op for the common `n == 0` path). RT-safe:
+    /// a single relaxed fetch-add, no locks or allocation.
+    fn add(&self, n: usize) {
+        if n > 0 {
+            self.0.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Read the accumulated drop count and reset to zero, so the drain thread's
+    /// periodic log doesn't double-count.
+    fn take(&self) -> usize {
+        self.0.swap(0, Ordering::Relaxed)
+    }
+}
+
 /// Convert an interleaved slice of device samples to mono `f32`, averaging
 /// channels. Reuses `out`'s capacity so the realtime callback doesn't allocate
 /// after warm-up.
@@ -482,7 +522,13 @@ impl AudioSource for CpalAudioSource {
                 let rb = HeapRb::<f32>::new(rb_cap);
                 let (mut producer, mut consumer) = rb.split();
 
-                let mut scratch: Vec<f32> = Vec::with_capacity(2048);
+                // Pre-size the downmix scratch to the negotiated worst-case so
+                // the realtime callback never reallocates (V-8).
+                let mut scratch: Vec<f32> = Vec::with_capacity(max_capture_frames(fmt.rate));
+                // Overflow accounting moves out of the callback: it bumps this
+                // counter; the drain thread logs and resets it (V-8).
+                let overflow = OverflowCounter::new();
+                let overflow_cb = overflow.clone();
                 let stream = match device.build_input_stream_raw(
                     &stream_config,
                     fmt.format,
@@ -516,12 +562,10 @@ impl AudioSource for CpalAudioSource {
                             _ => return,
                         }
                         let written = producer.push_slice(&scratch);
-                        if written < scratch.len() {
-                            tracing::debug!(
-                                dropped = scratch.len() - written,
-                                "input ring buffer overflow"
-                            );
-                        }
+                        // RT-safe: no logging/alloc here — just tally the drop
+                        // (the drain thread logs it). `add` is a no-op when
+                        // nothing was dropped (V-8).
+                        overflow_cb.add(scratch.len() - written);
                     },
                     move |err| {
                         tracing::error!("input stream error: {err}");
@@ -571,8 +615,24 @@ impl AudioSource for CpalAudioSource {
                 // of audio is drained each tick.
                 let read_cap = (fmt.rate as usize / 25).max(CHUNK_FRAMES);
                 let mut read_buf = vec![0.0f32; read_cap];
+                // Flush the callback's overflow tally roughly once a second so a
+                // persistently overrun mic logs without the RT callback ever
+                // touching tracing (V-8). ~1s / 20ms tick = 50 ticks.
+                let mut ticks_since_overflow_log: u32 = 0;
                 'drain: while running_clone.load(Ordering::SeqCst) {
                     std::thread::sleep(std::time::Duration::from_millis(20));
+
+                    ticks_since_overflow_log += 1;
+                    if ticks_since_overflow_log >= 50 {
+                        ticks_since_overflow_log = 0;
+                        let dropped = overflow.take();
+                        if dropped > 0 {
+                            tracing::debug!(
+                                dropped,
+                                "input ring buffer overflow (drain lagging capture)"
+                            );
+                        }
+                    }
 
                     loop {
                         let popped = consumer.pop_slice(&mut read_buf);
@@ -812,7 +872,10 @@ mod tests {
             "48kHz worst-case must cover at least a 250ms period, got {hi}"
         );
         // Never below the old hand-picked warm-up floor.
-        assert!(lo >= 2048, "must not regress below the 2048 warm-up, got {lo}");
+        assert!(
+            lo >= 2048,
+            "must not regress below the 2048 warm-up, got {lo}"
+        );
     }
 
     #[test]
@@ -845,7 +908,11 @@ mod tests {
         counter.add(7); // one overflowing callback dropped 7 samples
         counter.add(3); // another dropped 3
         assert_eq!(counter.take(), 10, "accumulates across callbacks");
-        assert_eq!(counter.take(), 0, "take() resets so logs don't double-count");
+        assert_eq!(
+            counter.take(),
+            0,
+            "take() resets so logs don't double-count"
+        );
     }
 
     #[test]
