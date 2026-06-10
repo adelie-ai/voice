@@ -137,10 +137,10 @@ impl CpalAudioSink {
     /// Signal the current playback generation to stop, without arming a new one.
     /// Idempotent: a no-op when nothing is running.
     fn signal_stop_current_generation(&self) {
-        if let Ok(mut cur) = self.current_stop_flag.lock() {
-            if let Some(flag) = cur.take() {
-                flag.store(false, Ordering::SeqCst);
-            }
+        if let Ok(mut cur) = self.current_stop_flag.lock()
+            && let Some(flag) = cur.take()
+        {
+            flag.store(false, Ordering::SeqCst);
         }
     }
 
