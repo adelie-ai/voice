@@ -792,6 +792,71 @@ mod tests {
         );
     }
 
+    // --- V-8: real-time-safety in the capture callback ---
+
+    #[test]
+    fn max_capture_frames_is_generous_and_scales_with_rate() {
+        // The mono scratch must be pre-sized so the callback never reallocates.
+        // A 48kHz device gets a proportionally larger worst-case than 16kHz, and
+        // both comfortably exceed any realistic single-callback period (cpal's
+        // Default buffer is typically a few ms–tens of ms).
+        let lo = max_capture_frames(16_000);
+        let hi = max_capture_frames(48_000);
+        assert!(hi > lo, "higher rate ⇒ larger worst-case frame count");
+        assert!(
+            lo >= 16_000 / 4,
+            "16kHz worst-case must cover at least a 250ms period, got {lo}"
+        );
+        assert!(
+            hi >= 48_000 / 4,
+            "48kHz worst-case must cover at least a 250ms period, got {hi}"
+        );
+        // Never below the old hand-picked warm-up floor.
+        assert!(lo >= 2048, "must not regress below the 2048 warm-up, got {lo}");
+    }
+
+    #[test]
+    fn presized_scratch_does_not_reallocate_within_capacity() {
+        // With scratch pre-sized to the negotiated worst-case, a normal-sized
+        // callback's downmix must not grow the Vec (no in-callback allocation).
+        let cap = max_capture_frames(48_000);
+        let mut scratch: Vec<f32> = Vec::with_capacity(cap);
+        let before = scratch.capacity();
+
+        // A realistic stereo callback: 480 frames (10ms @ 48kHz), interleaved.
+        let interleaved: Vec<f32> = (0..480 * 2).map(|i| i as f32 * 0.001).collect();
+        to_mono_f32(&interleaved, 2, &mut scratch);
+
+        assert_eq!(scratch.len(), 480, "downmixed to mono frame count");
+        assert_eq!(
+            scratch.capacity(),
+            before,
+            "downmix must not reallocate when within pre-sized capacity"
+        );
+    }
+
+    #[test]
+    fn overflow_counter_accumulates_and_drains() {
+        // Replaces the in-callback `tracing::debug!`: the callback bumps an
+        // atomic, the drain thread reads-and-resets it to log out of band.
+        let counter = OverflowCounter::new();
+        assert_eq!(counter.take(), 0, "starts empty");
+
+        counter.add(7); // one overflowing callback dropped 7 samples
+        counter.add(3); // another dropped 3
+        assert_eq!(counter.take(), 10, "accumulates across callbacks");
+        assert_eq!(counter.take(), 0, "take() resets so logs don't double-count");
+    }
+
+    #[test]
+    fn overflow_counter_add_zero_is_noop() {
+        // The common (no-overflow) path adds zero; it must stay at zero so the
+        // drain thread doesn't log phantom overflows.
+        let counter = OverflowCounter::new();
+        counter.add(0);
+        assert_eq!(counter.take(), 0);
+    }
+
     #[test]
     fn resampler_48k_to_16k_thirds_the_length() {
         let mut r = StreamingResampler::new(48_000, 16_000).unwrap();
