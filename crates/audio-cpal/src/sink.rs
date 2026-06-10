@@ -554,6 +554,68 @@ mod tests {
         assert!(!sink.in_tail_pad(), "nothing queued ⇒ not in a pad");
     }
 
+    // ----- V-4: stop()→play() must not orphan the prior playback thread. -----
+
+    #[test]
+    fn each_open_gets_its_own_stop_flag() {
+        // The bug: a single shared `stream_running` flag meant a new open()
+        // could store `true` back into the same flag the old thread polls,
+        // resurrecting a generation that stop() had told to die. Each open()
+        // must mint a fresh flag so a stale thread can never be revived.
+        let sink = CpalAudioSink::new("default");
+        let gen1 = sink.begin_playback_generation();
+        let gen2 = sink.begin_playback_generation();
+        assert!(
+            !Arc::ptr_eq(&gen1, &gen2),
+            "consecutive generations must own distinct stop flags"
+        );
+    }
+
+    #[test]
+    fn stop_kills_only_the_current_generation_and_a_later_open_cannot_revive_it() {
+        // Reproduce the race deterministically without hardware: gen1 is the old
+        // playback thread's flag; stop() must fell it; a subsequent open() (gen2)
+        // installs a brand-new flag and must NOT flip gen1 back to running. The
+        // old thread, polling gen1, therefore sees `false` and exits.
+        let sink = CpalAudioSink::new("default");
+
+        let gen1 = sink.begin_playback_generation();
+        assert!(gen1.load(Ordering::SeqCst), "a fresh generation runs");
+
+        // stop() before the old thread has observed the flag (the 100ms poll
+        // window the real bug raced inside).
+        sink.signal_stop_current_generation();
+        assert!(!gen1.load(Ordering::SeqCst), "stop fells the live generation");
+
+        // A new open() races in.
+        let gen2 = sink.begin_playback_generation();
+        assert!(gen2.load(Ordering::SeqCst), "the new generation runs");
+        assert!(
+            !gen1.load(Ordering::SeqCst),
+            "the new generation must NOT resurrect the old, stopped one"
+        );
+        assert!(
+            !Arc::ptr_eq(&gen1, &gen2),
+            "the new generation must be a distinct flag, not the revived old one"
+        );
+    }
+
+    #[test]
+    fn beginning_a_new_generation_fells_the_previous_one() {
+        // Defense in depth: even without an explicit stop(), opening a fresh
+        // generation must stand the prior one down so two live cpal streams
+        // can't coexist. (open() is idempotent at the producer level, but the
+        // flag bookkeeping must still never leave an orphan armed.)
+        let sink = CpalAudioSink::new("default");
+        let gen1 = sink.begin_playback_generation();
+        assert!(gen1.load(Ordering::SeqCst));
+        let _gen2 = sink.begin_playback_generation();
+        assert!(
+            !gen1.load(Ordering::SeqCst),
+            "starting a new generation must fell the previous flag"
+        );
+    }
+
     #[test]
     fn measured_latency_drives_is_playing_pad() {
         // End-to-end through the live atomic: queue a tiny clip, then inject a
