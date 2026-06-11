@@ -60,6 +60,13 @@ impl ConnectorAssistantGateway {
         Arc::clone(&self.connector.lock().unwrap())
     }
 
+    /// Test-only hook to drive the reconnect path directly (voice#83 regression
+    /// test). Production code reaches `reconnect` via a failed send.
+    #[doc(hidden)]
+    pub async fn reconnect_for_test(&self) {
+        self.reconnect().await;
+    }
+
     /// Best-effort reconnect after a failed call, so the next turn talks to a
     /// live orchestrator (e.g. one that just restarted). If it's still down the
     /// next call simply fails and retries — the daemon never crashes over it.
