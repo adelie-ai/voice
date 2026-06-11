@@ -25,24 +25,57 @@ pub use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
 /// Voice's assistant gateway, backed by a transport-agnostic [`Connector`].
 ///
-/// The connection lives behind a `Mutex<Arc<Connector>>` so it can be rebuilt
-/// after the orchestrator restarts: a raw UDS/WS socket dies with the peer, so
-/// the gateway reconnects on a failed call and the next turn uses a fresh link.
-/// (D-Bus re-resolves its well-known name on its own, but reconnecting is
-/// harmless there too.)
+/// The connection lives behind a `Mutex<Option<Arc<Connector>>>` so it can be
+/// (re)built lazily: a raw UDS/WS socket dies with the peer, so the gateway
+/// reconnects on a failed call and the next turn uses a fresh link. (D-Bus
+/// re-resolves its well-known name on its own, but reconnecting is harmless
+/// there too.)
+///
+/// The `Option` lets the gateway start in a DISCONNECTED state when the
+/// orchestrator isn't up yet (voice#86): the daemon must keep serving — wake
+/// word, D-Bus, TTS — and connect lazily once the orchestrator appears, rather
+/// than dying at startup and crash-looping under systemd during a session-start
+/// race. A call made while disconnected dials on demand; if that fails it
+/// returns a recoverable error (the pipeline apologizes and the next turn
+/// retries) — never a crash.
 pub struct ConnectorAssistantGateway {
     config: ConnectionConfig,
-    connector: Mutex<Arc<Connector>>,
+    connector: Mutex<Option<Arc<Connector>>>,
 }
 
 impl ConnectorAssistantGateway {
-    /// Connect to the orchestrator over the transport named by `config`.
+    /// Connect to the orchestrator over the transport named by `config`,
+    /// failing if it isn't reachable. Prefer [`connect_or_degrade`] in the
+    /// daemon so a missing orchestrator doesn't kill startup (voice#86).
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, VoiceError> {
         let connector = Self::dial(config).await?;
         Ok(Self {
             config: config.clone(),
-            connector: Mutex::new(Arc::new(connector)),
+            connector: Mutex::new(Some(Arc::new(connector))),
         })
+    }
+
+    /// Build the gateway WITHOUT requiring the orchestrator to be up (voice#86).
+    /// Tries to connect; on failure logs and returns a gateway in the
+    /// disconnected state that connects lazily on the first call. The daemon
+    /// uses this so an orchestrator that isn't ready at startup degrades the
+    /// voice turn (apology, retried next turn) instead of crash-looping the
+    /// whole service.
+    pub async fn connect_or_degrade(config: &ConnectionConfig) -> Self {
+        let connector = match Self::dial(config).await {
+            Ok(connector) => Some(Arc::new(connector)),
+            Err(e) => {
+                tracing::warn!(
+                    "orchestrator not reachable at startup ({e}); voice will keep running and \
+                     connect when it appears"
+                );
+                None
+            }
+        };
+        Self {
+            config: config.clone(),
+            connector: Mutex::new(connector),
+        }
     }
 
     async fn dial(config: &ConnectionConfig) -> Result<Connector, VoiceError> {
@@ -56,8 +89,19 @@ impl ConnectorAssistantGateway {
         Ok(connector)
     }
 
-    fn current(&self) -> Arc<Connector> {
-        Arc::clone(&self.connector.lock().unwrap())
+    /// The live connector, dialing lazily if the gateway is still disconnected
+    /// (voice#86). On a successful lazy dial the connection is cached for
+    /// subsequent calls; if the orchestrator is still down this returns a
+    /// recoverable error rather than panicking.
+    async fn current(&self) -> Result<Arc<Connector>, VoiceError> {
+        if let Some(connector) = self.connector.lock().unwrap().as_ref() {
+            return Ok(Arc::clone(connector));
+        }
+        // Disconnected: dial now (outside the lock — Connector::connect awaits).
+        let connector = Arc::new(Self::dial(&self.config).await?);
+        let mut guard = self.connector.lock().unwrap();
+        // Another task may have connected while we were dialing; keep the first.
+        Ok(Arc::clone(guard.get_or_insert(connector)))
     }
 
     /// Best-effort reconnect after a failed call, so the next turn talks to a
@@ -65,7 +109,7 @@ impl ConnectorAssistantGateway {
     /// next call simply fails and retries — the daemon never crashes over it.
     async fn reconnect(&self) {
         match Self::dial(&self.config).await {
-            Ok(connector) => *self.connector.lock().unwrap() = Arc::new(connector),
+            Ok(connector) => *self.connector.lock().unwrap() = Some(Arc::new(connector)),
             Err(e) => tracing::warn!("orchestrator reconnect failed: {e}"),
         }
     }
@@ -123,7 +167,7 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
 
 impl AssistantGateway for ConnectorAssistantGateway {
     async fn create_conversation(&self, title: &str) -> Result<String, VoiceError> {
-        let connector = self.current();
+        let connector = self.current().await?;
         match connector.create_conversation(title).await {
             Ok(id) => Ok(id),
             Err(e) => {
@@ -136,7 +180,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
     }
 
     async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String, VoiceError> {
-        let connector = self.current();
+        let connector = self.current().await?;
         match connector.send_prompt(conversation_id, prompt).await {
             Ok(id) => Ok(id),
             Err(e) => {
@@ -163,6 +207,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
         let idempotency_key = uuid::Uuid::new_v4().to_string();
         match self
             .current()
+            .await?
             .send_prompt_with_system_refinement_idempotent(
                 conversation_id,
                 prompt,
@@ -178,7 +223,13 @@ impl AssistantGateway for ConnectorAssistantGateway {
                      idempotency key"
                 );
                 self.reconnect().await;
-                self.current()
+                let connector = self.current().await.map_err(|retry_err| {
+                    VoiceError::Assistant(format!(
+                        "send_prompt_with_system_refinement failed; reconnect before retry \
+                         also failed: {first_err}; reconnect error: {retry_err}"
+                    ))
+                })?;
+                connector
                     .send_prompt_with_system_refinement_idempotent(
                         conversation_id,
                         prompt,
@@ -206,6 +257,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
             })
             .collect();
         self.current()
+            .await?
             .register_client_tools(registrations)
             .await
             .map_err(|e| VoiceError::Assistant(format!("register_client_tools failed: {e}")))
@@ -218,6 +270,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
         result: Result<String, String>,
     ) -> Result<(), VoiceError> {
         self.current()
+            .await?
             .submit_client_tool_result(task_id, tool_call_id, result)
             .await
             .map_err(|e| VoiceError::Assistant(format!("submit_client_tool_result failed: {e}")))
@@ -226,7 +279,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
     async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<AssistantEvent>, VoiceError> {
         // Take a fresh slice of the current connector's fanned-out signal stream
         // and forward the response-turn events, mapped into the voice domain.
-        let mut signals = self.current().subscribe();
+        let mut signals = self.current().await?.subscribe();
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(event) = signals.recv().await {

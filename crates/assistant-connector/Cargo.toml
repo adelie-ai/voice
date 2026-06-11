@@ -22,3 +22,12 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 serde_json.workspace = true
+# Integration test (voice#86): start with an unreachable orchestrator (no
+# crash), then bring the real UDS orchestrator server up in-process and assert
+# the gateway connects lazily on the next call.
+desktop-assistant-uds = { path = "../../../desktop-assistant/crates/uds-interface" }
+desktop-assistant-application = { path = "../../../desktop-assistant/crates/application" }
+desktop-assistant-auth-jwt = { path = "../../../desktop-assistant/crates/auth-jwt" }
+async-trait = "0.1"
+tempfile = "3"
+uuid = { version = "1", features = ["v4"] }

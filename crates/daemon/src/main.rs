@@ -81,9 +81,14 @@ async fn main() -> Result<()> {
     // cloud). The conversation pipeline and the SayText service share it.
     let tts = TtsBackend::from_config(&config.tts).await;
     // Reach the orchestrator over the configured transport — local UDS by
-    // default, or a remote WebSocket / legacy D-Bus (voice#31).
+    // default, or a remote WebSocket / legacy D-Bus (voice#31). An orchestrator
+    // that isn't up yet must NOT kill the daemon (voice#86): we'd crash-loop
+    // under systemd during a session-start race even though the gateway already
+    // reconnects per-call. `connect_or_degrade` starts disconnected if needed
+    // and connects lazily once the orchestrator appears, so wake word, D-Bus and
+    // TTS keep serving meanwhile.
     let connection_config = config.assistant.connection_config();
-    let assistant = ConnectorAssistantGateway::connect(&connection_config).await?;
+    let assistant = ConnectorAssistantGateway::connect_or_degrade(&connection_config).await;
 
     let source = Arc::new(CpalAudioSource::new(&config.audio.input_device));
     let sink: Arc<dyn AudioSink> = Arc::new(CpalAudioSink::new(&config.audio.output_device));
