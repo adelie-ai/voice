@@ -11,7 +11,7 @@
 //! [`AssistantEvent`]s; only the response-turn signals (chunk / complete /
 //! error) are relevant to the voice pipeline.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use adele_voice_core::VoiceError;
 use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway, ClientToolSpec};
@@ -25,14 +25,18 @@ pub use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
 /// Voice's assistant gateway, backed by a transport-agnostic [`Connector`].
 ///
-/// The connection lives behind a `Mutex<Arc<Connector>>` so it can be rebuilt
-/// after the orchestrator restarts: a raw UDS/WS socket dies with the peer, so
-/// the gateway reconnects on a failed call and the next turn uses a fresh link.
-/// (D-Bus re-resolves its well-known name on its own, but reconnecting is
-/// harmless there too.)
+/// We hold a SINGLE [`Connector`] for the gateway's whole life and never swap it
+/// out (voice#83). The Connector already owns a persistent, auto-reconnecting
+/// signal fan-out (#246) plus a supervisor that reconnects its transport *in
+/// place* on a drop and keeps feeding the same stream. Swapping in a fresh
+/// Connector on a failed call (the old behaviour) built a NEW fan-out and
+/// orphaned the pipeline's existing event subscription — so a recovered turn
+/// streamed invisibly and the user heard the stall apology though it succeeded.
+/// Keeping one Connector, letting its supervisor heal the link, and handing out
+/// a [`subscribe`](AssistantGateway::subscribe) receiver that re-registers
+/// across a drop keeps the subscription live through a reconnect.
 pub struct ConnectorAssistantGateway {
-    config: ConnectionConfig,
-    connector: Mutex<Arc<Connector>>,
+    connector: Arc<Connector>,
 }
 
 impl ConnectorAssistantGateway {
@@ -40,8 +44,7 @@ impl ConnectorAssistantGateway {
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, VoiceError> {
         let connector = Self::dial(config).await?;
         Ok(Self {
-            config: config.clone(),
-            connector: Mutex::new(Arc::new(connector)),
+            connector: Arc::new(connector),
         })
     }
 
@@ -56,8 +59,8 @@ impl ConnectorAssistantGateway {
         Ok(connector)
     }
 
-    fn current(&self) -> Arc<Connector> {
-        Arc::clone(&self.connector.lock().unwrap())
+    fn current(&self) -> &Connector {
+        &self.connector
     }
 
     /// Test-only hook to drive the reconnect path directly (voice#83 regression
@@ -67,16 +70,29 @@ impl ConnectorAssistantGateway {
         self.reconnect().await;
     }
 
-    /// Best-effort reconnect after a failed call, so the next turn talks to a
-    /// live orchestrator (e.g. one that just restarted). If it's still down the
-    /// next call simply fails and retries — the daemon never crashes over it.
+    /// Give the orchestrator a moment to come back after a failed call, so a
+    /// retry (or the next turn) talks to a live connection — e.g. after the
+    /// orchestrator restarted.
+    ///
+    /// We deliberately do NOT force a transport reconnect here (voice#83): the
+    /// `Connector` already runs its own reconnect supervisor that reconnects the
+    /// SAME transport in place on a drop and keeps the persistent event fan-out
+    /// alive. Forcing a second, concurrent reconnect from here would race that
+    /// supervisor (two sockets, swapped writers) and lose the streamed reply.
+    /// Instead we back off briefly and let the supervisor heal the link; the
+    /// retry then rides the reconnected transport, and the durable subscription
+    /// handed out by [`subscribe`](AssistantGateway::subscribe) re-registers
+    /// across the drop so the reply still reaches the pipeline. If the
+    /// orchestrator is still down the retry simply fails and the next call tries
+    /// again — the daemon never crashes over it.
     async fn reconnect(&self) {
-        match Self::dial(&self.config).await {
-            Ok(connector) => *self.connector.lock().unwrap() = Arc::new(connector),
-            Err(e) => tracing::warn!("orchestrator reconnect failed: {e}"),
-        }
+        tokio::time::sleep(RECONNECT_GRACE).await;
     }
 }
+
+/// Brief pause after a failed call before retrying, giving the Connector's
+/// reconnect supervisor time to heal the transport in place (voice#83).
+const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Map an orchestrator signal to a voice turn event. The response-turn signals
 /// (chunk / complete / error) and the per-turn progress `Status` matter to the
@@ -231,16 +247,56 @@ impl AssistantGateway for ConnectorAssistantGateway {
     }
 
     async fn subscribe(&self) -> Result<mpsc::UnboundedReceiver<AssistantEvent>, VoiceError> {
-        // Take a fresh slice of the current connector's fanned-out signal stream
-        // and forward the response-turn events, mapped into the voice domain.
-        let mut signals = self.current().subscribe();
+        // Hand the pipeline ONE durable subscription that survives a reconnect
+        // (voice#83).
+        //
+        // The Connector keeps a single persistent, auto-reconnecting fan-out —
+        // but on every transport drop its supervisor DRAINS the current
+        // subscribers (sending each a terminal `Disconnected`) on purpose, since
+        // a turn waiting across the drop is lost. So a raw `Connector::subscribe`
+        // receiver goes dead the instant the socket drops. The pipeline
+        // subscribes *before* sending, so an idempotent send-retry that
+        // reconnects mid-turn would orphan that subscription and the recovered
+        // turn would stream invisibly (the user hears the stall apology even
+        // though the turn succeeded).
+        //
+        // We forward through a task that, on a `Disconnected`, RE-REGISTERS a
+        // fresh slice of the (reconnected-in-place) fan-out and keeps going — so
+        // the pipeline holds one receiver for the whole turn and never sees the
+        // gap.
+        let connector = Arc::clone(&self.connector);
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            while let Some(event) = signals.recv().await {
-                if let Some(mapped) = map_signal(event)
-                    && tx.send(mapped).is_err()
-                {
-                    break; // the pipeline dropped this subscription
+            let mut signals = connector.subscribe();
+            loop {
+                match signals.recv().await {
+                    Some(SignalEvent::Disconnected { reason }) => {
+                        // The fan-out unstuck us on a drop/stall. The Connector's
+                        // supervisor reconnects the transport in place and keeps
+                        // feeding the same persistent stream; re-register so the
+                        // new connection's events reach the pipeline. (Swallowed,
+                        // not surfaced: a `Disconnected` maps to nothing and would
+                        // otherwise just be skipped — but we must re-subscribe, or
+                        // the drained registration delivers no further events.)
+                        tracing::debug!(
+                            %reason,
+                            "assistant event stream disconnected; re-subscribing across reconnect"
+                        );
+                        // Yield briefly so a same-tick supervisor reconnect can
+                        // make progress before we re-register; the fan-out is
+                        // persistent, so re-registering even slightly early is
+                        // safe (we still receive the post-reconnect events).
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        signals = connector.subscribe();
+                    }
+                    Some(event) => {
+                        if let Some(mapped) = map_signal(event)
+                            && tx.send(mapped).is_err()
+                        {
+                            break; // the pipeline dropped this subscription
+                        }
+                    }
+                    None => break, // fan-out gone (Connector dropped) — terminal
                 }
             }
         });
