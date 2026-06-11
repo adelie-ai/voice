@@ -258,6 +258,11 @@ where
     listening_cue: ListeningCue,
     /// Free-running counter so the spoken-phrase cue rotates deterministically.
     cue_phrase_counter: u64,
+    /// The pipeline's current state. The single in-process source of truth,
+    /// mutated ONLY through `apply` (which validates against the `state.rs`
+    /// table and publishes to `state_tx`). Before voice#82 this was a local in
+    /// `run()` that drifted from the published value mid-turn.
+    state: State,
     state_tx: watch::Sender<State>,
     enabled_rx: watch::Receiver<bool>,
     ptt_rx: mpsc::Receiver<Option<String>>,
@@ -373,6 +378,7 @@ where
             prebuffer: PreBuffer::new(WAKE_PREBUFFER_SAMPLES),
             listening_cue,
             cue_phrase_counter: 0,
+            state: State::Idle,
             state_tx,
             enabled_rx,
             ptt_rx,
@@ -401,9 +407,37 @@ where
         }
     }
 
-    fn set_state(&self, state: State) {
-        let _ = self.state_tx.send(state);
-        tracing::info!(state = %state, "state changed");
+    /// The single state-mutation chokepoint (voice#82). Apply `event` to the
+    /// current state: on a legal transition, update `self.state`, publish to the
+    /// watch channel, log, and return `true`. On an illegal one, warn (and
+    /// `debug_assert!` in tests so the harness catches an illegal published
+    /// sequence) and return `false` without mutating. A no-op transition (the
+    /// table maps to the same state — e.g. `ResponseStarted` while already
+    /// Speaking, or `Stopped` while Idle) returns `true` silently.
+    fn apply(&mut self, event: StateEvent) -> bool {
+        match self.state.transition(&event) {
+            Some(next) => {
+                if next != self.state {
+                    self.state = next;
+                    let _ = self.state_tx.send(next);
+                    tracing::info!(state = %next, ?event, "state changed");
+                }
+                true
+            }
+            None => {
+                tracing::warn!(
+                    state = %self.state,
+                    ?event,
+                    "illegal state transition requested; ignoring"
+                );
+                debug_assert!(
+                    false,
+                    "illegal state transition {:?} from {}",
+                    event, self.state
+                );
+                false
+            }
+        }
     }
 
     /// Decide, on a fresh wake (Idle→Listening, NOT an in-turn follow-up),
@@ -663,8 +697,10 @@ where
         // before listening so the very first turn can use them.
         self.register_session_control_tools().await;
 
-        let mut state = State::Idle;
-        self.set_state(state);
+        // Publish the initial Idle so subscribers see a value (the watch channel
+        // already holds Idle, but emit explicitly for the log line / parity).
+        self.state = State::Idle;
+        let _ = self.state_tx.send(State::Idle);
 
         // For idle-exit (#5): time of the last activity other than idle-while-
         // wake-disabled. (Utterance accumulation and the follow-up/lead-in
@@ -678,7 +714,7 @@ where
                 // session, `Some(id)` routes the utterance to that orchestrator
                 // conversation (the in-chat mic button).
                 Some(target) = self.ptt_rx.recv() => {
-                    if state == State::Idle || state == State::Speaking {
+                    if self.state == State::Idle || self.state == State::Speaking {
                         // Stop any outstanding playback before arming the mic.
                         // A single-shot reply drops to Idle while its TTS is
                         // still sounding (playback_end in the future), so gating
@@ -712,8 +748,7 @@ where
                         if target.is_none() {
                             self.expire_stale_conversation_on_wake();
                         }
-                        state = State::Listening;
-                        self.set_state(state);
+                        self.apply(StateEvent::PttPressed);
                         // Wait (lead-in) for speech to start rather than cutting
                         // on the silence timer from the moment of the press; only
                         // cut after speech-then-silence, or if the lead-in elapses.
@@ -731,19 +766,17 @@ where
                 Some(req) = self.stop_rx.recv() => {
                     match req {
                         StopRequest::Speaking => {
-                            if state == State::Speaking {
+                            if self.state == State::Speaking {
                                 self.speaker.stop()?;
-                                state = State::Idle;
-                                self.set_state(state);
+                                self.apply(StateEvent::Stopped);
                             }
                         }
                         StopRequest::Conversation => {
                             // "Stop listening": end the session now without
                             // waiting out the silence timeout.
-                            if state != State::Idle {
+                            if self.state != State::Idle {
                                 let _ = self.speaker.stop();
-                                state = State::Idle;
-                                self.set_state(state);
+                                self.apply(StateEvent::Stopped);
                             }
                             self.conversation_id = None;
                             self.last_own_activity = None;
@@ -775,9 +808,8 @@ where
                              unavailable until it recovers"
                         );
                         let _ = self.speaker.stop();
-                        if state != State::Idle {
-                            state = State::Idle;
-                            self.set_state(state);
+                        if self.state != State::Idle {
+                            self.apply(StateEvent::Stopped);
                         }
                         self.endpointer.reset();
                         // Clear the adapter's running latch so start() can
@@ -798,7 +830,7 @@ where
                     // push-to-talk (and SayText) must work even when "Hey
                     // Adele" is off, so the gate is scoped to the Idle state
                     // rather than the whole handler (#3).
-                    if state == State::Idle && !*self.enabled_rx.borrow() {
+                    if self.state == State::Idle && !*self.enabled_rx.borrow() {
                         // Idle-exit (#5): with wake listening off and nothing
                         // playing, exit after the configured idle window so
                         // D-Bus activation can restart the daemon on demand.
@@ -814,7 +846,7 @@ where
                         continue;
                     }
                     last_activity = Instant::now();
-                    match state {
+                    match self.state {
                         State::Idle => {
                             // Don't let the daemon wake itself on its own
                             // playback. A single-shot reply returns to Idle while
@@ -845,9 +877,7 @@ where
                             // Feed to wake word detector
                             if self.wake.detect(&chunk)? {
                                 tracing::info!("wake word detected");
-                                if let Some(new_state) = state.transition(&StateEvent::WakeWordDetected) {
-                                    state = new_state;
-                                    self.set_state(state);
+                                if self.apply(StateEvent::WakeWordDetected) {
                                     // Wake word always uses the daemon's own
                                     // session; clear any push-to-talk target
                                     // left over from a session ended via
@@ -887,12 +917,7 @@ where
                                         samples = samples.len(),
                                         "silence detected, transitioning to processing"
                                     );
-                                    if let Some(new_state) =
-                                        state.transition(&StateEvent::SilenceDetected)
-                                    {
-                                        state = new_state;
-                                        self.set_state(state);
-
+                                    if self.apply(StateEvent::SilenceDetected) {
                                         // A failed turn must NOT crash the
                                         // daemon. The orchestrator may have
                                         // restarted and dropped the connection;
@@ -903,7 +928,7 @@ where
                                             Ok(outcome) => outcome,
                                             Err(e) => {
                                                 tracing::error!("voice turn failed: {e}");
-                                                self.set_state(State::Speaking);
+                                                self.apply(StateEvent::ResponseStarted);
                                                 let _ = self.speaker.say(ERROR_APOLOGY).await;
                                                 UtteranceOutcome::EndConversation
                                             }
@@ -926,8 +951,7 @@ where
                                             // of mode AND clears the reuse-window id
                                             // so the next wake starts fresh
                                             // (voice#59/#61).
-                                            state = State::Idle;
-                                            self.set_state(state);
+                                            self.apply(StateEvent::TurnEnded);
                                             self.conversation_id = None;
                                             self.last_own_activity = None;
                                             self.ptt_conversation_override = None;
@@ -941,8 +965,7 @@ where
                                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                             }
                                             while audio_rx.try_recv().is_ok() {}
-                                            state = State::Listening;
-                                            self.set_state(state);
+                                            self.apply(StateEvent::RelistenArmed);
                                             // Cue the follow-up re-listen too (#51),
                                             // then wait for the cue to finish and
                                             // drop the echo it queued into the mic
@@ -960,8 +983,7 @@ where
                                             // Drop any PTT-into-conversation target
                                             // so the next own-session turn doesn't
                                             // inherit it.
-                                            state = State::Idle;
-                                            self.set_state(state);
+                                            self.apply(StateEvent::TurnEnded);
                                             self.ptt_conversation_override = None;
                                         }
                                     }
@@ -978,8 +1000,7 @@ where
                                     // override is still dropped (the client owns
                                     // that conversation's lifecycle).
                                     tracing::info!("conversation follow-up timed out");
-                                    state = State::Idle;
-                                    self.set_state(state);
+                                    self.apply(StateEvent::ListeningTimedOut);
                                     self.ptt_conversation_override = None;
                                     self.endpointer.reset();
                                 }
@@ -992,21 +1013,16 @@ where
                             if prob >= self.speech_threshold {
                                 tracing::info!("barge-in detected");
                                 self.speaker.stop()?;
-                                if let Some(new_state) = state.transition(&StateEvent::BargeIn) {
-                                    state = new_state;
-                                    self.set_state(state);
+                                if self.apply(StateEvent::BargeIn) {
                                     // Seed the endpointer mid-speech so the next
                                     // silence closes this barge-in utterance.
                                     self.endpointer.arm_speaking(&chunk);
                                     self.vad.reset();
                                 }
                             } else if !self.speaker.is_playing()
-                                && let Some(new_state) =
-                                    state.transition(&StateEvent::PlaybackComplete)
+                                && self.apply(StateEvent::PlaybackComplete)
                             {
                                 // Playback finished naturally
-                                state = new_state;
-                                self.set_state(state);
                             }
                         }
 
@@ -1048,7 +1064,7 @@ where
         // wake-word idle instead of sending it to the assistant.
         if is_stop_phrase(&transcript.text) {
             tracing::info!(text = %transcript.text, "stop phrase — ending conversation");
-            self.set_state(State::Speaking);
+            self.apply(StateEvent::ResponseStarted);
             self.speaker.say("Okay.").await?;
             return Ok(UtteranceOutcome::EndConversation);
         }
@@ -1208,13 +1224,13 @@ where
                         Some(AssistantEvent::Chunk { request_id: rid, text }) if rid == request_id => {
                             if first_chunk && is_error_response(&text) {
                                 tracing::error!(chunk = %text, "assistant streamed an error message; speaking a short apology instead");
-                                self.set_state(State::Speaking);
+                                self.apply(StateEvent::ResponseStarted);
                                 self.speaker.say(ERROR_APOLOGY).await?;
                                 break;
                             }
                             if first_chunk {
                                 first_chunk = false;
-                                self.set_state(State::Speaking);
+                                self.apply(StateEvent::ResponseStarted);
                             }
 
                             let sentences = sentence_buf.push(&text);
@@ -1245,7 +1261,7 @@ where
                             } else if first_chunk && !full_response.trim().is_empty() {
                                 // Nothing was streamed as chunks — e.g. a
                                 // tool-using reply delivered as one final block.
-                                self.set_state(State::Speaking);
+                                self.apply(StateEvent::ResponseStarted);
                                 if is_error_response(&full_response) {
                                     // The orchestrator surfaces LLM failures as
                                     // the reply text (so they show in chat);
@@ -1269,7 +1285,7 @@ where
                         }
                         Some(AssistantEvent::Error { request_id: rid, error }) if rid == request_id => {
                             tracing::error!(error = %error, "assistant response error; speaking a short apology");
-                            self.set_state(State::Speaking);
+                            self.apply(StateEvent::ResponseStarted);
                             self.speaker.say(ERROR_APOLOGY).await?;
                             break;
                         }
@@ -1287,7 +1303,7 @@ where
                                 // The reply stream dropped before any content
                                 // arrived (e.g. the orchestrator restarted
                                 // mid-turn) — don't leave the user in silence.
-                                self.set_state(State::Speaking);
+                                self.apply(StateEvent::ResponseStarted);
                                 self.speaker.say(ERROR_APOLOGY).await?;
                             }
                             break;
@@ -1312,7 +1328,7 @@ where
                     }
                 }, if !liveness_spoken && first_chunk && last_status_spoken_at.is_none() => {
                     liveness_spoken = true;
-                    self.set_state(State::Speaking);
+                    self.apply(StateEvent::ResponseStarted);
                     self.speaker.say(LIVENESS_PHRASE).await?;
                 }
             }
@@ -1338,7 +1354,7 @@ where
     /// timeout into a crash) and move to Speaking so the run loop returns to
     /// Idle when playback finishes (#58).
     async fn speak_stall_apology(&mut self) {
-        self.set_state(State::Speaking);
+        self.apply(StateEvent::ResponseStarted);
         if let Err(e) = self.speaker.say(STALL_APOLOGY).await {
             tracing::warn!("failed to speak stall apology: {e}");
         }
@@ -1370,7 +1386,7 @@ where
         // narration plays (and the user hears progress) rather than sitting in
         // silent Processing.
         if *first_chunk {
-            self.set_state(State::Speaking);
+            self.apply(StateEvent::ResponseStarted);
         }
         *last_spoken_at = Some(now);
         self.speaker.say(message).await?;
@@ -1419,7 +1435,7 @@ where
                 if text.is_empty() {
                     Err("say_this requires a non-empty `text` argument".to_string())
                 } else {
-                    self.set_state(State::Speaking);
+                    self.apply(StateEvent::ResponseStarted);
                     if let Err(e) = self.speaker.say(&text).await {
                         tracing::warn!("say_this synthesis failed: {e}");
                         Err(format!("failed to speak: {e}"))
@@ -2003,6 +2019,12 @@ mod tests {
             test_timeouts(),
             ClientToolToggles::default(),
         );
+        let mut pipeline = pipeline;
+        // These tests drive `handle_client_tool_call` directly; in production a
+        // client tool only fires mid-turn, i.e. from Processing/Speaking. Set
+        // the precondition so a `say_this`-style `ResponseStarted` is a legal
+        // transition rather than an illegal-from-Idle assert (voice#82).
+        pipeline.state = State::Processing;
         (
             pipeline,
             ToolHarness {
@@ -2076,6 +2098,12 @@ mod tests {
             timeouts,
             ClientToolToggles::default(),
         );
+        let mut pipeline = pipeline;
+        // These tests drive `stream_response` / `maybe_narrate_status` directly;
+        // in production those only run after the Listening→Processing
+        // transition, so start in Processing — the precondition that makes the
+        // first `ResponseStarted` (Processing→Speaking) legal (voice#82).
+        pipeline.state = State::Processing;
         (pipeline, spoken)
     }
 
@@ -3034,6 +3062,107 @@ mod tests {
             relisten.is_ok(),
             "conversation mode must re-open the mic for a follow-up turn"
         );
+    }
+
+    #[tokio::test]
+    async fn published_state_sequence_is_reachable_and_idle_bracketed() {
+        // voice#82: the watch channel must only ever publish states reachable
+        // through the `state.rs` table. (The primary illegal-publish guard is
+        // the `debug_assert!` inside `apply`, which aborts ANY of these tests on
+        // an illegal transition; this test adds a coarse end-to-end check that
+        // the published sequence stays within the legal graph and brackets the
+        // turn with Idle. The watch channel coalesces, so we assert
+        // reachability — `to` reachable from `from` in ≥1 legal step — rather
+        // than single-step adjacency.)
+        let observed = Arc::new(StdMutex::new(Vec::<State>::new()));
+        let mut h = spawn_pipeline(Cfg {
+            conversation_mode: false,
+            ..Default::default()
+        });
+        let mut watch_rx = h.state_rx.clone();
+        observed.lock().unwrap().push(*watch_rx.borrow());
+        let recorder = {
+            let observed = Arc::clone(&observed);
+            tokio::spawn(async move {
+                while watch_rx.changed().await.is_ok() {
+                    observed.lock().unwrap().push(*watch_rx.borrow());
+                }
+            })
+        };
+
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process -> reply -> Idle
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Idle),
+        )
+        .await
+        .expect("turn completes back to Idle")
+        .unwrap();
+
+        h.handle.abort();
+        recorder.abort();
+
+        let seq = observed.lock().unwrap().clone();
+        assert_eq!(
+            seq.first(),
+            Some(&State::Idle),
+            "seq must start Idle: {seq:?}"
+        );
+        assert_eq!(seq.last(), Some(&State::Idle), "seq must end Idle: {seq:?}");
+        assert!(
+            seq.contains(&State::Listening),
+            "a driven turn must pass through Listening: {seq:?}"
+        );
+        let all_events = [
+            StateEvent::WakeWordDetected,
+            StateEvent::PttPressed,
+            StateEvent::SilenceDetected,
+            StateEvent::ListeningTimedOut,
+            StateEvent::ResponseStarted,
+            StateEvent::PlaybackComplete,
+            StateEvent::BargeIn,
+            StateEvent::TurnEnded,
+            StateEvent::RelistenArmed,
+            StateEvent::Stopped,
+        ];
+        // Reachability: `to` must be reachable from `from` within the legal
+        // graph (bounded BFS over a 4-state machine).
+        let reachable = |from: State, to: State| -> bool {
+            let mut frontier = vec![from];
+            for _ in 0..4 {
+                let mut next = Vec::new();
+                for s in &frontier {
+                    if *s == to {
+                        return true;
+                    }
+                    for e in &all_events {
+                        if let Some(n) = s.transition(e)
+                            && n != *s
+                        {
+                            next.push(n);
+                        }
+                    }
+                }
+                frontier = next;
+            }
+            frontier.contains(&to)
+        };
+        for pair in seq.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            assert!(
+                reachable(from, to),
+                "watch channel published an unreachable step {from} -> {to} (full seq {seq:?})"
+            );
+        }
     }
 
     #[tokio::test]
