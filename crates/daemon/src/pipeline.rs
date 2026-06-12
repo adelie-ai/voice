@@ -10,7 +10,7 @@ use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
-use adele_voice_dbus_interface::StopRequest;
+use adele_voice_dbus_interface::{StopRequest, VoiceSignal};
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
@@ -321,6 +321,10 @@ where
     /// listening window for a follow-up even outside conversation mode. Reset at
     /// the start of each utterance (voice#61).
     listen_for_more_requested: bool,
+    /// Best-effort sink for per-turn text events (transcript / speaking) that the
+    /// D-Bus layer forwards as `TranscriptReady` / `SpeakingText` signals
+    /// (voice#85). `None` when no D-Bus forwarder is attached (e.g. in tests).
+    signal_tx: Option<mpsc::Sender<VoiceSignal>>,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -398,7 +402,35 @@ where
             client_tools,
             session_end_requested: false,
             listen_for_more_requested: false,
+            signal_tx: None,
         }
+    }
+
+    /// Attach the D-Bus signal sink so the pipeline emits `TranscriptReady` /
+    /// `SpeakingText` as it transcribes and speaks (voice#85). Best-effort: a
+    /// full or closed channel just drops the event (signals are advisory).
+    pub fn with_signal_tx(mut self, signal_tx: mpsc::Sender<VoiceSignal>) -> Self {
+        self.signal_tx = Some(signal_tx);
+        self
+    }
+
+    /// Best-effort emit of a per-turn text signal (voice#85). Uses `try_send` so
+    /// a slow/absent D-Bus consumer never stalls the speech pipeline.
+    fn emit_signal(&self, signal: VoiceSignal) {
+        if let Some(tx) = &self.signal_tx
+            && let Err(e) = tx.try_send(signal)
+        {
+            tracing::trace!(error = %e, "dropped a voice D-Bus signal (consumer busy/absent)");
+        }
+    }
+
+    /// Speak a sentence of Adele's reply, first announcing it as `SpeakingText`
+    /// so clients can display it without polling (voice#85). Used for spoken
+    /// REPLY content; cues/apologies use `speaker.say` directly (not reply text).
+    async fn speak_reply(&mut self, text: &str) -> anyhow::Result<()> {
+        self.emit_signal(VoiceSignal::SpeakingText(text.to_string()));
+        self.speaker.say(text).await?;
+        Ok(())
     }
 
     fn set_state(&self, state: State) {
@@ -1042,6 +1074,9 @@ where
             None => return Ok(UtteranceOutcome::Continue),
         };
         tracing::info!(text = %transcript.text, "transcribed");
+        // Let clients (the KDE widget) show what was heard without polling
+        // (voice#85).
+        self.emit_signal(VoiceSignal::TranscriptReady(transcript.text.clone()));
 
         // A whole-utterance stop phrase ("stop", "never mind", "that's all", …)
         // ends the conversation hands-free: acknowledge briefly and return to
@@ -1219,14 +1254,14 @@ where
 
                             let sentences = sentence_buf.push(&text);
                             for sentence in sentences {
-                                self.speaker.say(&sentence).await?;
+                                self.speak_reply(&sentence).await?;
                             }
                             // Speak a short leading ack the instant it looks
                             // complete (a terminal opener like "Got it —
                             // checking that now." that the boundary scan won't
                             // split until the next token), without waiting (#58).
                             if let Some(ack) = sentence_buf.take_leading_ack(ACK_MAX_WORDS) {
-                                self.speaker.say(&ack).await?;
+                                self.speak_reply(&ack).await?;
                             }
                         }
                         Some(AssistantEvent::Status { request_id: rid, message }) if rid == request_id => {
@@ -1240,7 +1275,7 @@ where
                             if sentence_buf.has_content() {
                                 let remaining = sentence_buf.flush();
                                 if !remaining.is_empty() {
-                                    self.speaker.say(&remaining).await?;
+                                    self.speak_reply(&remaining).await?;
                                 }
                             } else if first_chunk && !full_response.trim().is_empty() {
                                 // Nothing was streamed as chunks — e.g. a
@@ -1256,11 +1291,11 @@ where
                                     // Speak the full response instead of dropping it.
                                     let sentences = sentence_buf.push(&full_response);
                                     for sentence in sentences {
-                                        self.speaker.say(&sentence).await?;
+                                        self.speak_reply(&sentence).await?;
                                     }
                                     let remaining = sentence_buf.flush();
                                     if !remaining.is_empty() {
-                                        self.speaker.say(&remaining).await?;
+                                        self.speak_reply(&remaining).await?;
                                     }
                                 }
                             }
@@ -1298,7 +1333,7 @@ where
                 // Check for timeout flush while waiting for chunks
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {
                     if let Some(sentence) = sentence_buf.flush_if_timeout() {
-                        self.speaker.say(&sentence).await?;
+                        self.speak_reply(&sentence).await?;
                     }
                 }
                 // Delayed-liveness safety net: a slow turn that has narrated
@@ -1420,6 +1455,7 @@ where
                     Err("say_this requires a non-empty `text` argument".to_string())
                 } else {
                     self.set_state(State::Speaking);
+                    self.emit_signal(VoiceSignal::SpeakingText(text.clone()));
                     if let Err(e) = self.speaker.say(&text).await {
                         tracing::warn!("say_this synthesis failed: {e}");
                         Err(format!("failed to speak: {e}"))
@@ -2406,6 +2442,46 @@ mod tests {
         assert!(
             said.iter().any(|s| s == "Looking into that"),
             "the real status should still be narrated; said: {said:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn emits_speaking_text_signal_for_reply_sentences() {
+        // voice#85: the pipeline must emit a SpeakingText signal for each spoken
+        // reply sentence so clients (the KDE widget) needn't poll.
+        let (mut p, spoken) = build_pipeline_with(test_timeouts());
+        let (signal_tx, mut signal_rx) = mpsc::channel::<VoiceSignal>(16);
+        p = p.with_signal_tx(signal_tx);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        tx.send(AssistantEvent::Complete {
+            request_id: "req".into(),
+            full_response: "Hello there.".into(),
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), p.stream_response(&mut rx, "req"))
+            .await
+            .expect("stream_response must return")
+            .expect("stream_response ok");
+
+        // It was spoken AND announced as a SpeakingText signal.
+        assert!(
+            spoken
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| s.contains("Hello there")),
+            "the reply should have been spoken"
+        );
+        let mut signals = Vec::new();
+        while let Ok(sig) = signal_rx.try_recv() {
+            signals.push(sig);
+        }
+        assert!(
+            signals
+                .iter()
+                .any(|s| matches!(s, VoiceSignal::SpeakingText(t) if t.contains("Hello there"))),
+            "a SpeakingText signal must be emitted for the spoken reply; got: {signals:?}"
         );
     }
 

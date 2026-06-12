@@ -10,3 +10,11 @@ anyhow.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 zbus.workspace = true
+
+[dev-dependencies]
+# Hermetic signal-emission test (voice#85): a peer-to-peer zbus connection pair
+# over an in-process socket, so we assert the signals actually go out without
+# touching the live session bus / daemon. `rt` to spawn the forwarder.
+zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
+futures-util = "0.3"

@@ -76,6 +76,7 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "anyhow",
+ "futures-util",
  "tokio",
  "tracing",
  "zbus",
