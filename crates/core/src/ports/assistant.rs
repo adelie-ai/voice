@@ -79,13 +79,6 @@ pub trait AssistantGateway: Send + Sync {
         title: &str,
     ) -> impl std::future::Future<Output = Result<String, VoiceError>> + Send;
 
-    /// Send a prompt to an existing conversation, returning a request ID.
-    fn send_prompt(
-        &self,
-        conversation_id: &str,
-        prompt: &str,
-    ) -> impl std::future::Future<Output = Result<String, VoiceError>> + Send;
-
     /// Send a prompt with a per-request `system_refinement` — a one-turn
     /// addition to the assistant's system prompt (empty = none).
     ///
@@ -94,13 +87,13 @@ pub trait AssistantGateway: Send + Sync {
     /// chat WITHOUT prepending it to the user's message, so the visible
     /// transcript records only the clean `prompt`. The orchestrator
     /// appends the refinement to the system prompt for this LLM call only
-    /// and never stores it.
+    /// and never stores it. Pass an empty `system_refinement` for an
+    /// ordinary prompt. Returns a request ID.
     ///
     /// Implementations talking to an orchestrator that predates the
     /// refinement-aware D-Bus method must fall back gracefully (prepend
-    /// the refinement to the prompt and call [`send_prompt`]) so an
-    /// un-upgraded daemon still answers. Returns a request ID like
-    /// [`send_prompt`].
+    /// the refinement to the prompt on the older send path) so an
+    /// un-upgraded daemon still answers.
     fn send_prompt_with_system_refinement(
         &self,
         conversation_id: &str,

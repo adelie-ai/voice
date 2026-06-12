@@ -2065,13 +2065,6 @@ mod tests {
             let _ = self.created_tx.send(title.to_string());
             Ok("own-session".to_string())
         }
-        async fn send_prompt(
-            &self,
-            conversation_id: &str,
-            prompt: &str,
-        ) -> Result<String, adele_voice_core::VoiceError> {
-            Ok(self.record_and_complete(conversation_id, prompt, ""))
-        }
         async fn send_prompt_with_system_refinement(
             &self,
             conversation_id: &str,

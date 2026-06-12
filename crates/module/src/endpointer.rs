@@ -176,12 +176,6 @@ impl PreBuffer {
     pub fn take(&mut self) -> Vec<f32> {
         std::mem::take(&mut self.samples)
     }
-
-    /// Discard the buffered window without returning it (e.g. on a wake-word
-    /// fire when seeding is not wanted).
-    pub fn clear(&mut self) {
-        self.samples.clear();
-    }
 }
 
 #[cfg(test)]
@@ -215,14 +209,6 @@ mod tests {
             2,
             "a fresh window accumulates after a take"
         );
-    }
-
-    #[test]
-    fn pre_buffer_clear_discards_without_returning() {
-        let mut pb = PreBuffer::new(8);
-        pb.push(&[0.5; 4]);
-        pb.clear();
-        assert!(pb.take().is_empty(), "clear must drop the window");
     }
 
     #[test]
