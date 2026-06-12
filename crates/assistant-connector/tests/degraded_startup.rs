@@ -141,9 +141,12 @@ async fn degrades_when_orchestrator_unreachable_at_startup() {
 
     // A turn attempted while degraded surfaces a recoverable error (the pipeline
     // apologizes and retries next turn), NOT a crash.
-    let result = timeout(Duration::from_secs(3), gateway.send_prompt("conv-1", "hi"))
-        .await
-        .expect("call must not hang while degraded");
+    let result = timeout(
+        Duration::from_secs(3),
+        gateway.send_prompt_with_system_refinement("conv-1", "hi", ""),
+    )
+    .await
+    .expect("call must not hang while degraded");
     assert!(
         result.is_err(),
         "a send while the orchestrator is down should error, not succeed"
@@ -170,10 +173,13 @@ async fn connects_lazily_once_orchestrator_appears() {
     // absorb the connect race).
     let mut ok = false;
     for _ in 0..10 {
-        if timeout(Duration::from_secs(3), gateway.send_prompt("conv-1", "hi"))
-            .await
-            .expect("call must not hang")
-            .is_ok()
+        if timeout(
+            Duration::from_secs(3),
+            gateway.send_prompt_with_system_refinement("conv-1", "hi", ""),
+        )
+        .await
+        .expect("call must not hang")
+        .is_ok()
         {
             ok = true;
             break;

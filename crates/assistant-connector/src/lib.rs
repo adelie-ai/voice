@@ -230,17 +230,6 @@ impl AssistantGateway for ConnectorAssistantGateway {
         }
     }
 
-    async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String, VoiceError> {
-        let connector = self.current().await?;
-        match connector.send_prompt(conversation_id, prompt).await {
-            Ok(id) => Ok(id),
-            Err(e) => {
-                self.reconnect().await;
-                Err(VoiceError::Assistant(format!("send_prompt failed: {e}")))
-            }
-        }
-    }
-
     async fn send_prompt_with_system_refinement(
         &self,
         conversation_id: &str,

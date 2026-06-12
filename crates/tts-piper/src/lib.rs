@@ -1,8 +1,7 @@
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::SAMPLE_RATE;
 use adele_voice_core::ports::tts::TextToSpeech;
-use rubato::Resampler;
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
+use adele_voice_core::resample;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncWriteExt;
@@ -134,43 +133,6 @@ impl TextToSpeech for PiperTts {
 
         Ok(resampled)
     }
-}
-
-/// Resample mono f32 audio between integer sample rates using rubato's
-/// FFT-based synchronous resampler. Anti-aliased, suitable for batch
-/// (one-shot) conversion of TTS output.
-fn resample(input: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>, VoiceError> {
-    // 1024-frame chunks balance memory and FFT cost; process_all_into_buffer
-    // loops over the input internally.
-    let chunk_size = 1024;
-    let mut resampler = rubato::Fft::<f32>::new(
-        src_rate as usize,
-        dst_rate as usize,
-        chunk_size,
-        1,
-        1,
-        rubato::FixedSync::Input,
-    )
-    .map_err(|e| VoiceError::Tts(format!("resampler init: {e}")))?;
-
-    let input_len = input.len();
-    let output_len = resampler.process_all_needed_output_len(input_len);
-
-    let input_data = vec![input.to_vec()];
-    let mut output_data = vec![vec![0.0f32; output_len]];
-
-    let in_adapter = SequentialSliceOfVecs::new(&input_data, 1, input_len)
-        .map_err(|e| VoiceError::Tts(format!("resampler input adapter: {e}")))?;
-    let mut out_adapter = SequentialSliceOfVecs::new_mut(&mut output_data, 1, output_len)
-        .map_err(|e| VoiceError::Tts(format!("resampler output adapter: {e}")))?;
-
-    let (_, nbr_out) = resampler
-        .process_all_into_buffer(&in_adapter, &mut out_adapter, input_len, None)
-        .map_err(|e| VoiceError::Tts(format!("resampler process: {e}")))?;
-
-    let mut out = output_data.into_iter().next().unwrap();
-    out.truncate(nbr_out);
-    Ok(out)
 }
 
 #[cfg(test)]

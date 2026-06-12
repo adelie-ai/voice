@@ -7,6 +7,5 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 adele-voice-core = { workspace = true }
 ort = "2.0.0-rc.12"
-rubato = "2"
 tokio = { workspace = true }
 tracing = { workspace = true }

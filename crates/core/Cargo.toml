@@ -9,3 +9,4 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 serde_json.workspace = true
 pulldown-cmark.workspace = true
+rubato.workspace = true
