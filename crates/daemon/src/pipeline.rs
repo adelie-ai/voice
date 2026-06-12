@@ -627,13 +627,18 @@ where
     ///
     /// A cue failure must never derail entering Listening — errors are logged
     /// and swallowed.
-    async fn play_listening_cue(&mut self) {
+    ///
+    /// Returns `true` if a cue was actually queued (Ding/Phrase) so the caller
+    /// knows there is playback to wait out and drain before arming the mic
+    /// (V-7/#87); `false` for `Off`, where there is nothing to drain.
+    async fn play_listening_cue(&mut self) -> bool {
         match self.listening_cue {
-            ListeningCue::Off => {}
+            ListeningCue::Off => false,
             ListeningCue::Ding => {
                 if let Err(e) = self.sink.play(cue::ding_samples()) {
                     tracing::warn!("failed to play listening ding cue: {e}");
                 }
+                true
             }
             ListeningCue::Phrase => {
                 let phrase = cue::phrase(self.cue_phrase_counter);
@@ -641,6 +646,7 @@ where
                 if let Err(e) = self.speaker.say(phrase).await {
                     tracing::warn!("failed to speak listening phrase cue: {e}");
                 }
+                true
             }
         }
     }
@@ -989,17 +995,35 @@ where
                                     // recent conversation if this wake is within
                                     // it, else start fresh.
                                     self.expire_stale_conversation_on_wake();
-                                    // Seed the utterance with the post-wake audio
-                                    // so "hey adele <command>" said in one breath
-                                    // captures the command (#50). The lead-in still
-                                    // applies and the VAD must still confirm speech.
+                                    // Capture the same-breath preroll NOW (#50) —
+                                    // the audio spoken right after the wake word,
+                                    // before the cue sounds — so "hey adele
+                                    // <command>" in one breath keeps the command.
                                     let preroll = self.prebuffer.take();
-                                    self.endpointer
-                                        .arm_with_preroll(Some(self.followup_timeout), &preroll);
                                     self.vad.reset();
                                     // Audible "Listening" cue (#51) — instant ding
                                     // by default, optional spoken phrase, or off.
-                                    self.play_listening_cue().await;
+                                    let cue_played = self.play_listening_cue().await;
+                                    // V-7/#87: the cue plays INTO the open mic, so
+                                    // its audio (especially a spoken "How can I
+                                    // help?") would otherwise be endpointed as the
+                                    // user's utterance. Wait the cue out and drop
+                                    // the echo it queued before arming — matching
+                                    // the relisten path. Arming AFTER the cue also
+                                    // starts the lead-in from when the user can
+                                    // actually speak, not from before the cue
+                                    // (which a ~1 s phrase would otherwise burn
+                                    // through, timing out the turn). The preroll
+                                    // captured above is still seeded into the
+                                    // buffer, so only post-cue echo is dropped.
+                                    // Only drain when a cue actually played: with
+                                    // the cue Off there's no echo, and draining
+                                    // would eat same-breath speech already queued.
+                                    if cue_played {
+                                        self.drain_playback_echo(&mut audio_rx).await;
+                                    }
+                                    self.endpointer
+                                        .arm_with_preroll(Some(self.followup_timeout), &preroll);
                                 }
                             }
                         }
@@ -1909,14 +1933,14 @@ mod tests {
     struct FakeStt {
         hit: mpsc::UnboundedSender<()>,
         text: String,
-        captured_lens: Arc<StdMutex<Vec<usize>>>,
+        captured: Arc<StdMutex<Vec<Vec<f32>>>>,
     }
     impl SpeechToText for FakeStt {
         async fn transcribe(
             &self,
             samples: &[f32],
         ) -> Result<Transcript, adele_voice_core::VoiceError> {
-            self.captured_lens.lock().unwrap().push(samples.len());
+            self.captured.lock().unwrap().push(samples.to_vec());
             let _ = self.hit.send(());
             Ok(Transcript {
                 text: self.text.clone(),
@@ -2188,10 +2212,10 @@ mod tests {
         /// Lengths of every buffer queued on the sink — the listening cue (the
         /// ding earcon) shows up here.
         sink_played: Arc<StdMutex<Vec<usize>>>,
-        /// Lengths of every buffer handed to STT — i.e. the captured utterances.
-        /// Lets a test prove a phrase listening-cue's echo did NOT land in the
-        /// transcribed audio (V-7/#87).
-        stt_captured_lens: Arc<StdMutex<Vec<usize>>>,
+        /// Every buffer handed to STT — i.e. the captured utterances. Lets a test
+        /// prove a phrase listening-cue's echo did NOT land in the transcribed
+        /// audio (V-7/#87) by inspecting the sample content.
+        stt_captured: Arc<StdMutex<Vec<Vec<f32>>>>,
         /// Drives the fake sink's `is_playing`: set true to mimic outstanding
         /// TTS (#68). Cleared by the sink's `stop()`.
         sink_playing: Arc<std::sync::atomic::AtomicBool>,
@@ -2355,7 +2379,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: "hello".to_string(),
-                captured_lens: Arc::new(StdMutex::new(Vec::new())),
+                captured: Arc::new(StdMutex::new(Vec::new())),
             },
             FakeRecordingTts {
                 spoken: Arc::clone(&spoken),
@@ -2436,7 +2460,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: "hello".to_string(),
-                captured_lens: Arc::new(StdMutex::new(Vec::new())),
+                captured: Arc::new(StdMutex::new(Vec::new())),
             },
             FakeRecordingTts {
                 spoken: Arc::clone(&spoken),
@@ -2927,12 +2951,10 @@ mod tests {
             })
         });
 
-        let stt_captured_lens = Arc::new(StdMutex::new(Vec::new()));
+        let stt_captured = Arc::new(StdMutex::new(Vec::new()));
         let sink = FakeSink::default();
         let cue_tts = SpawnTts {
-            set_playing: cfg
-                .cue_plays_audio
-                .then(|| Arc::clone(&sink.playing)),
+            set_playing: cfg.cue_plays_audio.then(|| Arc::clone(&sink.playing)),
         };
         let sink_played = Arc::clone(&sink.played);
         let sink_playing = Arc::clone(&sink.playing);
@@ -2949,7 +2971,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: cfg.stt_text,
-                captured_lens: Arc::clone(&stt_captured_lens),
+                captured: Arc::clone(&stt_captured),
             },
             cue_tts,
             FakeAssistant {
@@ -3005,7 +3027,7 @@ mod tests {
             registered_rx,
             tool_result_rx,
             events_rx,
-            stt_captured_lens,
+            stt_captured,
             handle,
         }
     }
@@ -3493,6 +3515,10 @@ mod tests {
             cue_plays_audio: true,
             // turn-1: one speech chunk (0.9) then silence (0.0) closes it.
             vad: vec![0.9],
+            // A generous lead-in so the post-cue arm doesn't time out before the
+            // (test-paced) user speech arrives. The point is which audio is
+            // captured, not lead-in timing.
+            followup_timeout: Duration::from_secs(5),
             ..Default::default()
         });
 
@@ -3508,18 +3534,25 @@ mod tests {
         .expect("wake -> Listening")
         .unwrap();
 
-        // While the cue is sounding, its echo arrives on the mic. With the fix the
-        // pipeline is waiting out playback and draining these, so they never reach
-        // the endpointer.
+        // While the cue is sounding, its echo arrives on the mic, tagged with a
+        // distinct sentinel amplitude so we can detect it in the captured buffer.
+        // With the fix the pipeline is waiting out playback and draining these, so
+        // they never reach the endpointer.
+        const ECHO: f32 = 0.7;
         for _ in 0..3 {
-            h.audio_tx.send(vec![0.2f32; 1000]).await.unwrap();
+            h.audio_tx.send(vec![ECHO; 1000]).await.unwrap();
         }
         // Give the drain a beat, then end the cue's playback.
         tokio::time::sleep(Duration::from_millis(120)).await;
         h.sink_playing.store(false, Ordering::SeqCst);
 
-        // Now the real user speaks: one speech chunk then silence closes the
-        // utterance and triggers transcription.
+        // Let the drain finish (wait out playback + try_recv the echo) and re-arm
+        // BEFORE the user speaks, so the user's chunks aren't swept up by the same
+        // drain pass that empties the echo.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Now the real user speaks (a different amplitude): one speech chunk then
+        // silence closes the utterance and triggers transcription.
         h.audio_tx.send(vec![0.3f32; 1000]).await.unwrap(); // VAD 0.9 -> speech
         h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap(); // VAD 0.0 -> silence
 
@@ -3529,20 +3562,29 @@ mod tests {
             .expect("transcription must run")
             .expect("hit");
 
-        let captured = h.stt_captured_lens.lock().unwrap().clone();
+        let captured = h.stt_captured.lock().unwrap().clone();
         h.handle.abort();
 
-        // Exactly one utterance was transcribed.
-        assert_eq!(captured.len(), 1, "one utterance transcribed; got {captured:?}");
-        // It must NOT contain the 3 cue-echo chunks (3000 samples). The captured
-        // buffer is the preroll/same-breath chunk plus the user's speech chunk
-        // (the trailing silence isn't accumulated past the cut), i.e. ~2000
-        // samples. The bug would balloon it past 4000 by swallowing the echo.
+        // No utterance handed to STT may contain the cue echo. Pre-fix the echo is
+        // endpointed as the (first) utterance; the assertion fails. Post-fix the
+        // only captured audio is the preroll + the user's real speech.
+        let echo_in_capture = captured
+            .iter()
+            .any(|buf| buf.iter().any(|&s| (s - ECHO).abs() < 1e-6));
         assert!(
-            captured[0] < 3000,
-            "the phrase-cue echo (3×1000 samples) must be drained, not captured; \
-             captured {} samples",
-            captured[0]
+            !echo_in_capture,
+            "the phrase listening-cue echo must be drained, not captured as the \
+             utterance; captured buffers (lens) = {:?}",
+            captured.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        // And the user's real speech WAS captured (sanity: the fix didn't just
+        // drop everything).
+        let user_speech_captured = captured
+            .iter()
+            .any(|buf| buf.iter().any(|&s| (s - 0.3).abs() < 1e-6));
+        assert!(
+            user_speech_captured,
+            "the user's real speech must still be captured"
         );
     }
 
@@ -4321,7 +4363,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: "hello".to_string(),
-                captured_lens: Arc::new(StdMutex::new(Vec::new())),
+                captured: Arc::new(StdMutex::new(Vec::new())),
             },
             FakeTts,
             FakeAssistant {
