@@ -1330,6 +1330,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "desktop-assistant-api-model",
+ "desktop-assistant-frame-codec",
  "futures",
  "reqwest",
  "rustls",
@@ -1360,6 +1361,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-frame-codec"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
+
+[[package]]
 name = "desktop-assistant-transport-dispatch"
 version = "0.1.0"
 dependencies = [
@@ -1385,6 +1393,7 @@ dependencies = [
  "desktop-assistant-api-model",
  "desktop-assistant-application",
  "desktop-assistant-core",
+ "desktop-assistant-frame-codec",
  "desktop-assistant-transport-dispatch",
  "futures",
  "serde",

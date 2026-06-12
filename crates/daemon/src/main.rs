@@ -198,22 +198,22 @@ async fn main() -> Result<()> {
         stop_rx,
         reload_rx,
         wake_builder,
-        tunables,
-        config.assistant.conversation_title,
-        Duration::from_millis(config.vad.silence_duration_ms),
-        config.vad.speech_threshold,
-        config.assistant.conversation_mode,
-        Duration::from_millis(config.assistant.conversation_reuse_window_ms),
-        Duration::from_millis(config.assistant.followup_timeout_ms),
-        (config.idle_exit_timeout_ms > 0)
-            .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
-        config.assistant.spoken_response_hint,
-        config.wake_word.listening_cue,
-        turn_timeouts,
-        pipeline::ClientToolToggles {
-            stop_listening: config.assistant.client_tools.stop_listening,
-            listen_for_more: config.assistant.client_tools.listen_for_more,
-            say_this: config.assistant.client_tools.say_this,
+        pipeline::PipelineConfig {
+            tunables,
+            conversation_title: config.assistant.conversation_title,
+            silence_duration: Duration::from_millis(config.vad.silence_duration_ms),
+            speech_threshold: config.vad.speech_threshold,
+            conversation_mode: config.assistant.conversation_mode,
+            conversation_reuse_window: Duration::from_millis(
+                config.assistant.conversation_reuse_window_ms,
+            ),
+            followup_timeout: Duration::from_millis(config.assistant.followup_timeout_ms),
+            idle_exit_timeout: (config.idle_exit_timeout_ms > 0)
+                .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
+            spoken_response_hint: config.assistant.spoken_response_hint,
+            listening_cue: config.wake_word.listening_cue,
+            timeouts: turn_timeouts,
+            client_tools: config.assistant.client_tools,
         },
     )
     .with_signal_tx(signal_tx);

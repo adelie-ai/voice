@@ -14,7 +14,7 @@ use adele_voice_dbus_interface::{StopRequest, VoiceSignal};
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
-use crate::config::{self, Tunables, plan_reload};
+use crate::config::{self, ClientToolsConfig, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
 
 /// Builds a fresh wake detector at a given sensitivity. rustpotter bakes the
@@ -60,6 +60,38 @@ pub struct TurnTimeouts {
     /// most once and never once any status/chunk has arrived. `Duration::ZERO`
     /// disables.
     pub liveness_delay: Duration,
+}
+
+/// The non-wiring configuration for a [`Pipeline`], grouped so `Pipeline::new`
+/// takes one options struct instead of a dozen positional scalars (voice#89).
+/// The audio backends, channels, and `wake_builder` stay positional arguments —
+/// they're wiring, not tunables — while everything here is plain config the
+/// constructor stores or forwards.
+pub struct PipelineConfig {
+    /// Reloadable tunables snapshot (the on-disk truth we diff against).
+    pub tunables: Tunables,
+    /// Title used when the daemon lazily creates its own conversation.
+    pub conversation_title: String,
+    /// Post-speech silence that closes an utterance.
+    pub silence_duration: Duration,
+    /// VAD speech-probability threshold.
+    pub speech_threshold: f32,
+    /// Keep the mic open for follow-up turns after a reply.
+    pub conversation_mode: bool,
+    /// Window within which a fresh wake reuses the recent conversation (voice#53).
+    pub conversation_reuse_window: Duration,
+    /// Lead-in before a turn cuts on silence with no speech.
+    pub followup_timeout: Duration,
+    /// Idle-exit timeout when wake-word listening is off (`None` = never exit).
+    pub idle_exit_timeout: Option<Duration>,
+    /// Per-request system refinement attached to voice turns (empty = none).
+    pub spoken_response_hint: String,
+    /// Audible "Listening" cue mode (#51).
+    pub listening_cue: ListeningCue,
+    /// Per-turn timeout bounds (#58).
+    pub timeouts: TurnTimeouts,
+    /// Which session-control client tools to advertise (voice#61).
+    pub client_tools: ClientToolsConfig,
 }
 
 /// Wrap a future in `timeout` unless `limit` is zero (zero = unbounded), mapping
@@ -160,31 +192,11 @@ pub const TOOL_STOP_LISTENING: &str = "stop_listening";
 pub const TOOL_LISTEN_FOR_MORE: &str = "listen_for_more";
 pub const TOOL_SAY_THIS: &str = "say_this";
 
-/// Which session-control client tools to advertise (voice#61). Mirrors the
-/// `[assistant.client_tools]` config toggles without the pipeline depending on
-/// the daemon's config module.
-#[derive(Debug, Clone, Copy)]
-pub struct ClientToolToggles {
-    pub stop_listening: bool,
-    pub listen_for_more: bool,
-    pub say_this: bool,
-}
-
-impl Default for ClientToolToggles {
-    fn default() -> Self {
-        Self {
-            stop_listening: true,
-            listen_for_more: true,
-            say_this: true,
-        }
-    }
-}
-
 /// Build the [`ClientToolSpec`] registrations for the enabled session-control
 /// tools (voice#61). The descriptions are written to guide the LLM on WHEN to
 /// call each — especially `stop_listening`, which must fire when the user
 /// signals they're finished. Returned in a stable order for deterministic tests.
-pub fn session_control_tools(toggles: ClientToolToggles) -> Vec<ClientToolSpec> {
+pub fn session_control_tools(toggles: ClientToolsConfig) -> Vec<ClientToolSpec> {
     let no_args = || {
         serde_json::json!({
             "type": "object",
@@ -357,7 +369,7 @@ where
     connect_timeout: Duration,
     /// Which session-control client tools to advertise to the orchestrator
     /// (voice#61).
-    client_tools: ClientToolToggles,
+    client_tools: ClientToolsConfig,
     /// Set within a turn when the LLM calls `stop_listening`: after this turn's
     /// reply is spoken the conversation ends and the next wake starts fresh.
     /// Reset at the start of each utterance (voice#61).
@@ -395,19 +407,22 @@ where
         stop_rx: mpsc::Receiver<StopRequest>,
         reload_rx: mpsc::Receiver<()>,
         wake_builder: WakeBuilder<W>,
-        tunables: Tunables,
-        conversation_title: String,
-        silence_duration: Duration,
-        speech_threshold: f32,
-        conversation_mode: bool,
-        conversation_reuse_window: Duration,
-        followup_timeout: Duration,
-        idle_exit_timeout: Option<Duration>,
-        spoken_response_hint: String,
-        listening_cue: ListeningCue,
-        timeouts: TurnTimeouts,
-        client_tools: ClientToolToggles,
+        config: PipelineConfig,
     ) -> Self {
+        let PipelineConfig {
+            tunables,
+            conversation_title,
+            silence_duration,
+            speech_threshold,
+            conversation_mode,
+            conversation_reuse_window,
+            followup_timeout,
+            idle_exit_timeout,
+            spoken_response_hint,
+            listening_cue,
+            timeouts,
+            client_tools,
+        } = config;
         let mut speaker = Speaker::new(Arc::new(tts), Arc::clone(&sink));
         speaker.set_synth_timeout(timeouts.synth);
         Self {
@@ -2190,7 +2205,7 @@ mod tests {
         /// Client tool to inject on the turn's signal stream so the tool handler
         /// runs (voice#61): `(tool_name, arguments)`.
         inject_tool_call: Option<(String, serde_json::Value)>,
-        client_tools: ClientToolToggles,
+        client_tools: ClientToolsConfig,
         /// Hold each turn open so the test drives the signal stream (voice#82).
         hold_turn: bool,
     }
@@ -2214,7 +2229,7 @@ mod tests {
                 // audio onto the recording sink; cue-specific tests opt in.
                 listening_cue: ListeningCue::Off,
                 inject_tool_call: None,
-                client_tools: ClientToolToggles::default(),
+                client_tools: ClientToolsConfig::default(),
                 hold_turn: false,
             }
         }
@@ -2336,18 +2351,20 @@ mod tests {
             stop_rx,
             reload_rx,
             wake_builder,
-            test_tunables(),
-            "test".to_string(),
-            Duration::from_millis(0),
-            0.5,
-            false,
-            reuse_window,
-            Duration::from_millis(50),
-            None,
-            String::new(),
-            ListeningCue::Off,
-            test_timeouts(),
-            ClientToolToggles::default(),
+            PipelineConfig {
+                tunables: test_tunables(),
+                conversation_title: "test".to_string(),
+                silence_duration: Duration::from_millis(0),
+                speech_threshold: 0.5,
+                conversation_mode: false,
+                conversation_reuse_window: reuse_window,
+                followup_timeout: Duration::from_millis(50),
+                idle_exit_timeout: None,
+                spoken_response_hint: String::new(),
+                listening_cue: ListeningCue::Off,
+                timeouts: test_timeouts(),
+                client_tools: ClientToolsConfig::default(),
+            },
         );
         let mut pipeline = pipeline;
         // These tests drive `handle_client_tool_call` directly; in production a
@@ -2416,19 +2433,21 @@ mod tests {
             stop_rx,
             reload_rx,
             wake_builder,
-            test_tunables(),
-            "test".to_string(),
-            Duration::from_millis(0),
-            0.5,
-            false,
-            // Matches test_tunables() so an initial reload is a no-op.
-            Duration::from_millis(600_000),
-            Duration::from_millis(50),
-            None,
-            String::new(),
-            ListeningCue::Off,
-            timeouts,
-            ClientToolToggles::default(),
+            PipelineConfig {
+                tunables: test_tunables(),
+                conversation_title: "test".to_string(),
+                silence_duration: Duration::from_millis(0),
+                speech_threshold: 0.5,
+                conversation_mode: false,
+                // Matches test_tunables() so an initial reload is a no-op.
+                conversation_reuse_window: Duration::from_millis(600_000),
+                followup_timeout: Duration::from_millis(50),
+                idle_exit_timeout: None,
+                spoken_response_hint: String::new(),
+                listening_cue: ListeningCue::Off,
+                timeouts,
+                client_tools: ClientToolsConfig::default(),
+            },
         );
         let mut pipeline = pipeline;
         // These tests drive `stream_response` / `maybe_narrate_status` directly;
@@ -2920,18 +2939,20 @@ mod tests {
             stop_rx,
             reload_rx,
             wake_builder,
-            test_tunables(),
-            "test".to_string(),
-            Duration::from_millis(0),
-            0.5,
-            cfg.conversation_mode,
-            cfg.conversation_reuse_window,
-            cfg.followup_timeout,
-            cfg.idle_exit_timeout,
-            cfg.spoken_response_hint,
-            cfg.listening_cue,
-            test_timeouts(),
-            cfg.client_tools,
+            PipelineConfig {
+                tunables: test_tunables(),
+                conversation_title: "test".to_string(),
+                silence_duration: Duration::from_millis(0),
+                speech_threshold: 0.5,
+                conversation_mode: cfg.conversation_mode,
+                conversation_reuse_window: cfg.conversation_reuse_window,
+                followup_timeout: cfg.followup_timeout,
+                idle_exit_timeout: cfg.idle_exit_timeout,
+                spoken_response_hint: cfg.spoken_response_hint,
+                listening_cue: cfg.listening_cue,
+                timeouts: test_timeouts(),
+                client_tools: cfg.client_tools,
+            },
         );
         let handle = tokio::spawn(async move {
             let _ = pipeline.run().await;
@@ -3685,7 +3706,7 @@ mod tests {
     fn session_control_tools_carry_when_to_call_guidance() {
         // All three tools are advertised by default, in a stable order, each
         // with a description that guides the LLM on WHEN to call it.
-        let tools = session_control_tools(ClientToolToggles::default());
+        let tools = session_control_tools(ClientToolsConfig::default());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
@@ -3705,7 +3726,7 @@ mod tests {
     #[test]
     fn per_tool_toggles_withhold_disabled_tools() {
         // A disabled tool is not advertised; the others still are.
-        let tools = session_control_tools(ClientToolToggles {
+        let tools = session_control_tools(ClientToolsConfig {
             stop_listening: true,
             listen_for_more: false,
             say_this: false,
@@ -4225,18 +4246,20 @@ mod tests {
             stop_rx,
             reload_rx,
             wake_builder,
-            test_tunables(),
-            "test".to_string(),
-            Duration::from_millis(0),
-            0.5,
-            false,
-            Duration::from_secs(600),
-            Duration::from_millis(50),
-            None,
-            String::new(),
-            ListeningCue::Off,
-            test_timeouts(),
-            ClientToolToggles::default(),
+            PipelineConfig {
+                tunables: test_tunables(),
+                conversation_title: "test".to_string(),
+                silence_duration: Duration::from_millis(0),
+                speech_threshold: 0.5,
+                conversation_mode: false,
+                conversation_reuse_window: Duration::from_secs(600),
+                followup_timeout: Duration::from_millis(50),
+                idle_exit_timeout: None,
+                spoken_response_hint: String::new(),
+                listening_cue: ListeningCue::Off,
+                timeouts: test_timeouts(),
+                client_tools: ClientToolsConfig::default(),
+            },
         );
         let handle = tokio::spawn(pipeline.run());
         DegradedHarness {
