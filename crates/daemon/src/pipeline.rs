@@ -502,6 +502,80 @@ where
         }
     }
 
+    /// Wait out any outstanding playback, then drop the echo it queued into the
+    /// mic before the pipeline re-arms Listening (voice#82). Consolidates the
+    /// triplicated wait-for-playback + `try_recv`-drain idiom that previously
+    /// lived inline in the PTT arm and the two relisten paths of `run()`.
+    async fn drain_playback_echo(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) {
+        while self.speaker.is_playing() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        while audio_rx.try_recv().is_ok() {}
+    }
+
+    /// End the voice session (voice#82): clear the daemon's own
+    /// `conversation_id` and its reuse-window clock, drop any
+    /// push-to-talk-into-conversation override, and reset the endpointer.
+    /// Consolidates the cleanup that a stop phrase / `stop_listening` tool and
+    /// the `StopRequest::Conversation` arm each performed inline. Does NOT touch
+    /// `self.state` — the caller transitions through `apply` first.
+    fn end_conversation(&mut self) {
+        self.conversation_id = None;
+        self.last_own_activity = None;
+        self.ptt_conversation_override = None;
+        self.endpointer.reset();
+    }
+
+    /// Enter Listening for a push-to-talk press (voice#82). The body of the
+    /// outer PTT arm, extracted so the run-loop handling of a mid-turn PTT
+    /// interrupt re-arms identically: stop any outstanding playback, drain the
+    /// echo it queued, set the conversation override (honouring the reuse window
+    /// for a plain own-session press), transition to Listening, and arm the
+    /// endpointer with the lead-in. The caller has already decided a PTT press is
+    /// legal here (Idle or Speaking).
+    async fn enter_ptt_listening(
+        &mut self,
+        target: Option<String>,
+        audio_rx: &mut mpsc::Receiver<Vec<f32>>,
+    ) {
+        // Stop any outstanding playback before arming the mic. A single-shot
+        // reply drops to Idle while its TTS is still sounding (playback_end in
+        // the future), so gating stop() on State::Speaking let a PTT press in
+        // Idle skip it — leaving `is_playing` true with no drain and recording
+        // the daemon's own voice (#68). Stop whenever anything is playing,
+        // regardless of state; stop() is the only thing that clears playback_end.
+        if self.speaker.is_playing() {
+            let _ = self.speaker.stop();
+        }
+        // Belt-and-suspenders: wait out any residual tail and drop the echo it
+        // queued into the mic before arming, so no in-flight TTS leaks into the
+        // PTT utterance — matching the relisten path.
+        self.drain_playback_echo(audio_rx).await;
+        // Route this PTT session: `Some(id)` dictates into that conversation;
+        // `None` (plain PushToTalk) falls back to the daemon's own session,
+        // which — like the wake word — persists across presses for continuity.
+        // (A stale override can't leak in: every press overwrites it, and the
+        // wake-word entry resets it to None.)
+        self.ptt_conversation_override = target.clone();
+        // A plain PTT (own session) is a fresh entry like a wake: honour the
+        // reuse window — keep the recent conversation if within it, otherwise
+        // start fresh (voice#53). A targeted PTT uses its own id and is
+        // unaffected.
+        if target.is_none() {
+            self.expire_stale_conversation_on_wake();
+        }
+        self.apply(StateEvent::PttPressed);
+        // Wait (lead-in) for speech to start rather than cutting on the silence
+        // timer from the moment of the press; only cut after speech-then-silence,
+        // or if the lead-in elapses.
+        self.endpointer.arm(Some(self.followup_timeout));
+        self.vad.reset();
+        tracing::info!(
+            target_conversation = target.as_deref().unwrap_or("<own session>"),
+            "push-to-talk activated, waiting for speech"
+        );
+    }
+
     /// Play the audible "Listening" cue (#51) on entering the Listening state.
     ///
     /// - `Ding`: a short generated earcon, queued straight onto the sink — no
@@ -747,49 +821,7 @@ where
                 // conversation (the in-chat mic button).
                 Some(target) = self.ptt_rx.recv() => {
                     if self.state == State::Idle || self.state == State::Speaking {
-                        // Stop any outstanding playback before arming the mic.
-                        // A single-shot reply drops to Idle while its TTS is
-                        // still sounding (playback_end in the future), so gating
-                        // stop() on State::Speaking let a PTT press in Idle skip
-                        // it — leaving `is_playing` true with no drain and
-                        // recording the daemon's own voice (#68). Stop whenever
-                        // anything is playing, regardless of state; stop() is the
-                        // only thing that clears playback_end.
-                        if self.speaker.is_playing() {
-                            self.speaker.stop()?;
-                        }
-                        // Belt-and-suspenders: wait out any residual tail and
-                        // drop the echo it queued into the mic before arming, so
-                        // no in-flight TTS leaks into the PTT utterance — matching
-                        // the relisten path.
-                        while self.speaker.is_playing() {
-                            tokio::time::sleep(Duration::from_millis(50)).await;
-                        }
-                        while audio_rx.try_recv().is_ok() {}
-                        // Route this PTT session: `Some(id)` dictates into that
-                        // conversation; `None` (plain PushToTalk) falls back to
-                        // the daemon's own session, which — like the wake word —
-                        // persists across presses for continuity. (A stale
-                        // override can't leak in: every press overwrites it, and
-                        // the wake-word entry resets it to None.)
-                        self.ptt_conversation_override = target.clone();
-                        // A plain PTT (own session) is a fresh entry like a wake:
-                        // honour the reuse window — keep the recent conversation if
-                        // within it, otherwise start fresh (voice#53). A targeted
-                        // PTT uses its own id and is unaffected.
-                        if target.is_none() {
-                            self.expire_stale_conversation_on_wake();
-                        }
-                        self.apply(StateEvent::PttPressed);
-                        // Wait (lead-in) for speech to start rather than cutting
-                        // on the silence timer from the moment of the press; only
-                        // cut after speech-then-silence, or if the lead-in elapses.
-                        self.endpointer.arm(Some(self.followup_timeout));
-                        self.vad.reset();
-                        tracing::info!(
-                            target_conversation = target.as_deref().unwrap_or("<own session>"),
-                            "push-to-talk activated, waiting for speech"
-                        );
+                        self.enter_ptt_listening(target, &mut audio_rx).await;
                     }
                 }
 
@@ -810,10 +842,7 @@ where
                                 let _ = self.speaker.stop();
                                 self.apply(StateEvent::Stopped);
                             }
-                            self.conversation_id = None;
-                            self.last_own_activity = None;
-                            self.ptt_conversation_override = None;
-                            self.endpointer.reset();
+                            self.end_conversation();
                         }
                     }
                 }
@@ -945,80 +974,8 @@ where
                                 }
                                 Endpoint::Accumulating => {}
                                 Endpoint::Complete(samples) => {
-                                    tracing::info!(
-                                        samples = samples.len(),
-                                        "silence detected, transitioning to processing"
-                                    );
-                                    if self.apply(StateEvent::SilenceDetected) {
-                                        // A failed turn must NOT crash the
-                                        // daemon. The orchestrator may have
-                                        // restarted and dropped the connection;
-                                        // log it, apologize, and end the turn —
-                                        // the gateway reconnects so the next
-                                        // turn works.
-                                        let outcome = match self.process_utterance(samples).await {
-                                            Ok(outcome) => outcome,
-                                            Err(e) => {
-                                                tracing::error!("voice turn failed: {e}");
-                                                self.apply(StateEvent::ResponseStarted);
-                                                let _ = self.speaker.say(ERROR_APOLOGY).await;
-                                                UtteranceOutcome::EndConversation
-                                            }
-                                        };
-
-                                        // Decide whether to re-listen. A
-                                        // `listen_for_more` client tool re-arms
-                                        // even outside conversation mode; a plain
-                                        // turn re-listens only in conversation
-                                        // mode; `stop_listening` / a stop phrase
-                                        // ends regardless (voice#61).
-                                        let relisten = match outcome {
-                                            UtteranceOutcome::EndConversation => false,
-                                            UtteranceOutcome::KeepListening => true,
-                                            UtteranceOutcome::Continue => self.conversation_mode,
-                                        };
-                                        if outcome == UtteranceOutcome::EndConversation {
-                                            // A stop phrase or the `stop_listening`
-                                            // tool ends the conversation regardless
-                                            // of mode AND clears the reuse-window id
-                                            // so the next wake starts fresh
-                                            // (voice#59/#61).
-                                            self.apply(StateEvent::TurnEnded);
-                                            self.conversation_id = None;
-                                            self.last_own_activity = None;
-                                            self.ptt_conversation_override = None;
-                                            self.endpointer.reset();
-                                        } else if relisten {
-                                            // Re-open the mic for a follow-up turn:
-                                            // wait for the reply to finish playing,
-                                            // then drop any audio captured during
-                                            // playback (echo) before listening again.
-                                            while self.speaker.is_playing() {
-                                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                            }
-                                            while audio_rx.try_recv().is_ok() {}
-                                            self.apply(StateEvent::RelistenArmed);
-                                            // Cue the follow-up re-listen too (#51),
-                                            // then wait for the cue to finish and
-                                            // drop the echo it queued into the mic
-                                            // before arming, so it isn't captured as
-                                            // the follow-up.
-                                            self.play_listening_cue().await;
-                                            while self.speaker.is_playing() {
-                                                tokio::time::sleep(Duration::from_millis(50)).await;
-                                            }
-                                            while audio_rx.try_recv().is_ok() {}
-                                            self.endpointer.arm(Some(self.followup_timeout));
-                                            self.vad.reset();
-                                        } else {
-                                            // Single-shot: back to wake-word idle.
-                                            // Drop any PTT-into-conversation target
-                                            // so the next own-session turn doesn't
-                                            // inherit it.
-                                            self.apply(StateEvent::TurnEnded);
-                                            self.ptt_conversation_override = None;
-                                        }
-                                    }
+                                    self.handle_utterance_complete(samples, &mut audio_rx)
+                                        .await;
                                 }
                                 Endpoint::Timeout => {
                                     // No follow-up speech within the timeout:
@@ -1070,6 +1027,72 @@ where
 
         self.source.stop()?;
         Ok(())
+    }
+
+    /// Handle a completed utterance (voice#82): run the turn, then decide
+    /// whether to end the conversation, re-listen for a follow-up, or drop back
+    /// to wake-word idle. Extracted verbatim from the `Endpoint::Complete` arm of
+    /// `run()` so the run loop stays readable and the relisten/echo-drain idiom
+    /// is shared with the other entry points.
+    async fn handle_utterance_complete(
+        &mut self,
+        samples: Vec<f32>,
+        audio_rx: &mut mpsc::Receiver<Vec<f32>>,
+    ) {
+        tracing::info!(
+            samples = samples.len(),
+            "silence detected, transitioning to processing"
+        );
+        if !self.apply(StateEvent::SilenceDetected) {
+            return;
+        }
+        // A failed turn must NOT crash the daemon. The orchestrator may have
+        // restarted and dropped the connection; log it, apologize, and end the
+        // turn — the gateway reconnects so the next turn works.
+        let outcome = match self.process_utterance(samples).await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                tracing::error!("voice turn failed: {e}");
+                self.apply(StateEvent::ResponseStarted);
+                let _ = self.speaker.say(ERROR_APOLOGY).await;
+                UtteranceOutcome::EndConversation
+            }
+        };
+
+        // Decide whether to re-listen. A `listen_for_more` client tool re-arms
+        // even outside conversation mode; a plain turn re-listens only in
+        // conversation mode; `stop_listening` / a stop phrase ends regardless
+        // (voice#61).
+        let relisten = match outcome {
+            UtteranceOutcome::EndConversation => false,
+            UtteranceOutcome::KeepListening => true,
+            UtteranceOutcome::Continue => self.conversation_mode,
+        };
+        if outcome == UtteranceOutcome::EndConversation {
+            // A stop phrase or the `stop_listening` tool ends the conversation
+            // regardless of mode AND clears the reuse-window id so the next wake
+            // starts fresh (voice#59/#61).
+            self.apply(StateEvent::TurnEnded);
+            self.end_conversation();
+        } else if relisten {
+            // Re-open the mic for a follow-up turn: wait for the reply to finish
+            // playing, then drop any audio captured during playback (echo) before
+            // listening again.
+            self.drain_playback_echo(audio_rx).await;
+            self.apply(StateEvent::RelistenArmed);
+            // Cue the follow-up re-listen too (#51), then wait for the cue to
+            // finish and drop the echo it queued into the mic before arming, so
+            // it isn't captured as the follow-up.
+            self.play_listening_cue().await;
+            self.drain_playback_echo(audio_rx).await;
+            self.endpointer.arm(Some(self.followup_timeout));
+            self.vad.reset();
+        } else {
+            // Single-shot: back to wake-word idle. Drop any PTT-into-conversation
+            // target so the next own-session turn doesn't inherit it.
+            self.apply(StateEvent::TurnEnded);
+            self.ptt_conversation_override = None;
+        }
     }
 
     async fn process_utterance(&mut self, samples: Vec<f32>) -> anyhow::Result<UtteranceOutcome> {
