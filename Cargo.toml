@@ -10,6 +10,7 @@ members = [
     "crates/tts-polly",
     "crates/tts-kokoro",
     "crates/assistant-connector",
+    "crates/client-voice",
     "crates/dbus-interface",
     "crates/module",
     "crates/daemon",
@@ -45,6 +46,7 @@ adele-voice-tts-piper = { path = "crates/tts-piper" }
 adele-voice-tts-polly = { path = "crates/tts-polly" }
 adele-voice-tts-kokoro = { path = "crates/tts-kokoro" }
 adele-voice-assistant-connector = { path = "crates/assistant-connector" }
+adele-voice-client-common = { path = "crates/client-voice" }
 adele-voice-dbus-interface = { path = "crates/dbus-interface" }
 adele-voice-module = { path = "crates/module" }
 

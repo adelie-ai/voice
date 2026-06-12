@@ -1,0 +1,9 @@
+[package]
+name = "adele-voice-client-common"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Shared client-side voice-output plumbing (the Adele output level, the narration gate, the speakable-sentence chunker, and the system-refinement constants) reused identically by the GTK and TUI chat clients."
+
+[dependencies]
+adele-voice-core.workspace = true
