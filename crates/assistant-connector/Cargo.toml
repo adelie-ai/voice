@@ -22,9 +22,11 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 serde_json.workspace = true
-# Integration test (voice#83): spin up the real UDS orchestrator server
-# in-process and drive the gateway's subscribe→reconnect→send path, asserting
-# a subscription taken before a reconnect-retry still receives events.
+# Integration tests against the real UDS orchestrator server, in-process:
+#  - voice#83: drive subscribe→reconnect→send and assert a subscription taken
+#    before a reconnect-retry still receives events.
+#  - voice#86: start with an unreachable orchestrator (no crash), then bring the
+#    server up and assert the gateway connects lazily on the next call.
 desktop-assistant-uds = { path = "../../../desktop-assistant/crates/uds-interface" }
 desktop-assistant-application = { path = "../../../desktop-assistant/crates/application" }
 desktop-assistant-auth-jwt = { path = "../../../desktop-assistant/crates/auth-jwt" }

@@ -11,7 +11,7 @@
 //! [`AssistantEvent`]s; only the response-turn signals (chunk / complete /
 //! error) are relevant to the voice pipeline.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use adele_voice_core::VoiceError;
 use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway, ClientToolSpec};
@@ -25,27 +25,67 @@ pub use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 
 /// Voice's assistant gateway, backed by a transport-agnostic [`Connector`].
 ///
-/// We hold a SINGLE [`Connector`] for the gateway's whole life and never swap it
-/// out (voice#83). The Connector already owns a persistent, auto-reconnecting
-/// signal fan-out (#246) plus a supervisor that reconnects its transport *in
-/// place* on a drop and keeps feeding the same stream. Swapping in a fresh
-/// Connector on a failed call (the old behaviour) built a NEW fan-out and
-/// orphaned the pipeline's existing event subscription — so a recovered turn
-/// streamed invisibly and the user heard the stall apology though it succeeded.
-/// Keeping one Connector, letting its supervisor heal the link, and handing out
-/// a [`subscribe`](AssistantGateway::subscribe) receiver that re-registers
-/// across a drop keeps the subscription live through a reconnect.
+/// We hold a SINGLE durable [`Connector`] for the gateway's whole life and never
+/// swap it out once it exists (voice#83). The Connector already owns a
+/// persistent, auto-reconnecting signal fan-out (#246) plus a supervisor that
+/// reconnects its transport *in place* on a drop and keeps feeding the same
+/// stream. Swapping in a fresh Connector on a failed call (the old behaviour)
+/// built a NEW fan-out and orphaned the pipeline's existing event subscription —
+/// so a recovered turn streamed invisibly and the user heard the stall apology
+/// though it succeeded. Keeping one Connector, letting its supervisor heal the
+/// link, and handing out a [`subscribe`](AssistantGateway::subscribe) receiver
+/// that re-registers across a drop keeps the subscription live through a
+/// reconnect.
+///
+/// The connector lives behind a `Mutex<Option<Arc<Connector>>>` only so it can
+/// start ABSENT and be dialed LAZILY (voice#86): the gateway may begin in a
+/// DISCONNECTED state when the orchestrator isn't up yet, so the daemon keeps
+/// serving — wake word, D-Bus, TTS — and connects once the orchestrator appears,
+/// rather than dying at startup and crash-looping under systemd during a
+/// session-start race. The `Option` is filled AT MOST ONCE (the first
+/// successful [`dial`](Self::dial)); after that the single durable Connector is
+/// never replaced, so any subscription taken from it stays valid across the
+/// supervisor's in-place reconnects. A call made while still disconnected dials
+/// on demand; if that fails it returns a recoverable error (the pipeline
+/// apologizes and the next turn retries) — never a crash.
 pub struct ConnectorAssistantGateway {
-    connector: Arc<Connector>,
+    config: ConnectionConfig,
+    connector: Mutex<Option<Arc<Connector>>>,
 }
 
 impl ConnectorAssistantGateway {
-    /// Connect to the orchestrator over the transport named by `config`.
+    /// Connect to the orchestrator over the transport named by `config`,
+    /// failing if it isn't reachable. Prefer [`connect_or_degrade`] in the
+    /// daemon so a missing orchestrator doesn't kill startup (voice#86).
     pub async fn connect(config: &ConnectionConfig) -> Result<Self, VoiceError> {
         let connector = Self::dial(config).await?;
         Ok(Self {
-            connector: Arc::new(connector),
+            config: config.clone(),
+            connector: Mutex::new(Some(Arc::new(connector))),
         })
+    }
+
+    /// Build the gateway WITHOUT requiring the orchestrator to be up (voice#86).
+    /// Tries to connect; on failure logs and returns a gateway in the
+    /// disconnected state that connects lazily on the first call. The daemon
+    /// uses this so an orchestrator that isn't ready at startup degrades the
+    /// voice turn (apology, retried next turn) instead of crash-looping the
+    /// whole service.
+    pub async fn connect_or_degrade(config: &ConnectionConfig) -> Self {
+        let connector = match Self::dial(config).await {
+            Ok(connector) => Some(Arc::new(connector)),
+            Err(e) => {
+                tracing::warn!(
+                    "orchestrator not reachable at startup ({e}); voice will keep running and \
+                     connect when it appears"
+                );
+                None
+            }
+        };
+        Self {
+            config: config.clone(),
+            connector: Mutex::new(connector),
+        }
     }
 
     async fn dial(config: &ConnectionConfig) -> Result<Connector, VoiceError> {
@@ -59,8 +99,21 @@ impl ConnectorAssistantGateway {
         Ok(connector)
     }
 
-    fn current(&self) -> &Connector {
-        &self.connector
+    /// The live connector, dialing lazily if the gateway is still disconnected
+    /// (voice#86). On a successful lazy dial the connection is cached for
+    /// subsequent calls and never replaced thereafter (voice#83 — a stable Arc
+    /// keeps every subscription valid across the supervisor's in-place
+    /// reconnects); if the orchestrator is still down this returns a recoverable
+    /// error rather than panicking.
+    async fn current(&self) -> Result<Arc<Connector>, VoiceError> {
+        if let Some(connector) = self.connector.lock().unwrap().as_ref() {
+            return Ok(Arc::clone(connector));
+        }
+        // Disconnected: dial now (outside the lock — Connector::connect awaits).
+        let connector = Arc::new(Self::dial(&self.config).await?);
+        let mut guard = self.connector.lock().unwrap();
+        // Another task may have connected while we were dialing; keep the first.
+        Ok(Arc::clone(guard.get_or_insert(connector)))
     }
 
     /// Test-only hook to drive the reconnect path directly (voice#83 regression
@@ -86,7 +139,26 @@ impl ConnectorAssistantGateway {
     /// orchestrator is still down the retry simply fails and the next call tries
     /// again — the daemon never crashes over it.
     async fn reconnect(&self) {
-        tokio::time::sleep(RECONNECT_GRACE).await;
+        // Once we hold a live Connector we deliberately do NOT swap it out here
+        // (voice#83): a fresh Connector would build a NEW fan-out and orphan the
+        // pipeline's existing subscription. We just back off and let the
+        // Connector's own supervisor reconnect the SAME transport in place. The
+        // ONLY case we still dial from here is when the gateway started degraded
+        // and never connected (voice#86) — there is no Connector yet, so there is
+        // no subscription to orphan, and a lazy dial is exactly right.
+        if self.connector.lock().unwrap().is_some() {
+            tokio::time::sleep(RECONNECT_GRACE).await;
+            return;
+        }
+        match Self::dial(&self.config).await {
+            Ok(connector) => {
+                let mut guard = self.connector.lock().unwrap();
+                // Another task may have connected while we were dialing; keep
+                // the first so the single durable Connector is never replaced.
+                let _ = guard.get_or_insert_with(|| Arc::new(connector));
+            }
+            Err(e) => tracing::warn!("orchestrator reconnect failed: {e}"),
+        }
     }
 }
 
@@ -146,7 +218,7 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
 
 impl AssistantGateway for ConnectorAssistantGateway {
     async fn create_conversation(&self, title: &str) -> Result<String, VoiceError> {
-        let connector = self.current();
+        let connector = self.current().await?;
         match connector.create_conversation(title).await {
             Ok(id) => Ok(id),
             Err(e) => {
@@ -159,7 +231,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
     }
 
     async fn send_prompt(&self, conversation_id: &str, prompt: &str) -> Result<String, VoiceError> {
-        let connector = self.current();
+        let connector = self.current().await?;
         match connector.send_prompt(conversation_id, prompt).await {
             Ok(id) => Ok(id),
             Err(e) => {
@@ -186,6 +258,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
         let idempotency_key = uuid::Uuid::new_v4().to_string();
         match self
             .current()
+            .await?
             .send_prompt_with_system_refinement_idempotent(
                 conversation_id,
                 prompt,
@@ -201,7 +274,13 @@ impl AssistantGateway for ConnectorAssistantGateway {
                      idempotency key"
                 );
                 self.reconnect().await;
-                self.current()
+                let connector = self.current().await.map_err(|retry_err| {
+                    VoiceError::Assistant(format!(
+                        "send_prompt_with_system_refinement failed; reconnect before retry \
+                         also failed: {first_err}; reconnect error: {retry_err}"
+                    ))
+                })?;
+                connector
                     .send_prompt_with_system_refinement_idempotent(
                         conversation_id,
                         prompt,
@@ -229,6 +308,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
             })
             .collect();
         self.current()
+            .await?
             .register_client_tools(registrations)
             .await
             .map_err(|e| VoiceError::Assistant(format!("register_client_tools failed: {e}")))
@@ -241,6 +321,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
         result: Result<String, String>,
     ) -> Result<(), VoiceError> {
         self.current()
+            .await?
             .submit_client_tool_result(task_id, tool_call_id, result)
             .await
             .map_err(|e| VoiceError::Assistant(format!("submit_client_tool_result failed: {e}")))
@@ -264,7 +345,12 @@ impl AssistantGateway for ConnectorAssistantGateway {
         // fresh slice of the (reconnected-in-place) fan-out and keeps going — so
         // the pipeline holds one receiver for the whole turn and never sees the
         // gap.
-        let connector = Arc::clone(&self.connector);
+        //
+        // `current()` dials lazily if the gateway started degraded (voice#86):
+        // once it returns the single durable Connector, that Arc is never
+        // replaced, so this subscription stays bound to the same fan-out the
+        // supervisor heals in place.
+        let connector = self.current().await?;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut signals = connector.subscribe();
