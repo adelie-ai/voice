@@ -33,6 +33,18 @@ pub enum TtsCommand {
     },
 }
 
+/// A pipeline event that should be broadcast as a D-Bus signal so clients (the
+/// KDE widget) can react without polling (voice#85). State transitions are
+/// carried separately by the existing `State` watch channel; these are the
+/// per-turn text events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceSignal {
+    /// A user utterance was transcribed (the clean transcript text).
+    TranscriptReady(String),
+    /// Adele is about to speak a sentence aloud (the sentence text).
+    SpeakingText(String),
+}
+
 /// A push-to-talk trigger. The payload is the conversation the utterance
 /// should be routed to: `None` uses the daemon's own session ("Voice
 /// Conversation"); `Some(id)` targets the orchestrator conversation with that
@@ -255,4 +267,69 @@ impl DbusVoiceAdapter {
     /// Signal emitted when Adele starts speaking a sentence.
     #[zbus(signal)]
     pub async fn speaking_text(emitter: &SignalEmitter<'_>, text: &str) -> zbus::Result<()>;
+}
+
+/// Drive the `org.desktopAssistant.Voice` signals (voice#85). The signals are
+/// declared on the interface but were never emitted, so a client (the KDE
+/// widget) had to poll `GetState`. This forwarder watches the pipeline's
+/// existing `State` watch channel and a per-turn text-event channel, emitting
+/// `StateChanged` / `TranscriptReady` / `SpeakingText` at the right moments.
+///
+/// Runs until both sources end (the pipeline is gone). `emitter` is bound to the
+/// interface's object path on the daemon's session connection.
+pub async fn run_signal_forwarder(
+    emitter: SignalEmitter<'static>,
+    mut state_rx: watch::Receiver<State>,
+    mut signal_rx: mpsc::Receiver<VoiceSignal>,
+) {
+    // Emit the initial state so a client that connects late learns the current
+    // state without a separate GetState round-trip. Copy the value out and drop
+    // the borrow BEFORE awaiting (the watch guard isn't Send).
+    let initial = *state_rx.borrow();
+    emit_state(&emitter, initial).await;
+
+    loop {
+        tokio::select! {
+            // State transitions: the watch coalesces, so we emit the latest
+            // value after each change (intermediate values may be skipped — a
+            // signal stream of states, not a guaranteed transition log).
+            changed = state_rx.changed() => {
+                if changed.is_err() {
+                    // Sender dropped — the pipeline is gone. Stop once the other
+                    // source is also done.
+                    if signal_rx.is_closed() { break; }
+                    continue;
+                }
+                let state = *state_rx.borrow_and_update();
+                emit_state(&emitter, state).await;
+            }
+            event = signal_rx.recv() => {
+                match event {
+                    Some(VoiceSignal::TranscriptReady(text)) => {
+                        if let Err(e) =
+                            DbusVoiceAdapter::transcript_ready(&emitter, &text).await
+                        {
+                            tracing::debug!(error = %e, "failed to emit TranscriptReady");
+                        }
+                    }
+                    Some(VoiceSignal::SpeakingText(text)) => {
+                        if let Err(e) = DbusVoiceAdapter::speaking_text(&emitter, &text).await {
+                            tracing::debug!(error = %e, "failed to emit SpeakingText");
+                        }
+                    }
+                    None => {
+                        // Pipeline dropped the signal sender. Stop once state is
+                        // also done; otherwise keep mirroring state.
+                        if state_rx.has_changed().is_err() { break; }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn emit_state(emitter: &SignalEmitter<'static>, state: State) {
+    if let Err(e) = DbusVoiceAdapter::state_changed(emitter, &state.to_string()).await {
+        tracing::debug!(error = %e, "failed to emit StateChanged");
+    }
 }

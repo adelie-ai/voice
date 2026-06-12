@@ -34,9 +34,14 @@ name = "adele-voice-assistant-connector"
 version = "0.1.0"
 dependencies = [
  "adele-voice-core",
+ "async-trait",
  "desktop-assistant-api-model",
+ "desktop-assistant-application",
+ "desktop-assistant-auth-jwt",
  "desktop-assistant-client-common",
+ "desktop-assistant-uds",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -71,6 +76,7 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "anyhow",
+ "futures-util",
  "tokio",
  "tracing",
  "zbus",
@@ -1291,6 +1297,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-assistant-application"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "desktop-assistant-api-model",
+ "desktop-assistant-auth-jwt",
+ "desktop-assistant-core",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "desktop-assistant-auth-jwt"
 version = "0.1.0"
 dependencies = [
@@ -1334,6 +1358,41 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "desktop-assistant-transport-dispatch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "desktop-assistant-api-model",
+ "desktop-assistant-application",
+ "desktop-assistant-core",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "desktop-assistant-uds"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "desktop-assistant-api-model",
+ "desktop-assistant-application",
+ "desktop-assistant-core",
+ "desktop-assistant-transport-dispatch",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
