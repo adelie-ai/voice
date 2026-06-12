@@ -61,6 +61,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "adele-voice-client-common"
+version = "0.1.0"
+dependencies = [
+ "adele-voice-core",
+]
+
+[[package]]
 name = "adele-voice-core"
 version = "0.1.0"
 dependencies = [
