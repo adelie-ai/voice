@@ -13,11 +13,10 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::SAMPLE_RATE;
 use adele_voice_core::ports::tts::TextToSpeech;
+use adele_voice_core::resample;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
-use rubato::Resampler;
-use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use tokio::process::Command;
 
 const KOKORO_SAMPLE_RATE: u32 = 24_000;
@@ -265,41 +264,6 @@ impl TextToSpeech for KokoroTts {
         );
         Ok(out)
     }
-}
-
-/// Resample mono f32 audio between integer rates with rubato's FFT resampler.
-fn resample(input: &[f32], src_rate: u32, dst_rate: u32) -> Result<Vec<f32>, VoiceError> {
-    if input.is_empty() {
-        return Ok(Vec::new());
-    }
-    let chunk_size = 1024;
-    let mut resampler = rubato::Fft::<f32>::new(
-        src_rate as usize,
-        dst_rate as usize,
-        chunk_size,
-        1,
-        1,
-        rubato::FixedSync::Input,
-    )
-    .map_err(|e| VoiceError::Tts(format!("resampler init: {e}")))?;
-
-    let input_len = input.len();
-    let output_len = resampler.process_all_needed_output_len(input_len);
-    let input_data = vec![input.to_vec()];
-    let mut output_data = vec![vec![0.0f32; output_len]];
-
-    let in_adapter = SequentialSliceOfVecs::new(&input_data, 1, input_len)
-        .map_err(|e| VoiceError::Tts(format!("resampler input adapter: {e}")))?;
-    let mut out_adapter = SequentialSliceOfVecs::new_mut(&mut output_data, 1, output_len)
-        .map_err(|e| VoiceError::Tts(format!("resampler output adapter: {e}")))?;
-
-    let (_, nbr_out) = resampler
-        .process_all_into_buffer(&in_adapter, &mut out_adapter, input_len, None)
-        .map_err(|e| VoiceError::Tts(format!("resampler process: {e}")))?;
-
-    let mut out = output_data.into_iter().next().unwrap();
-    out.truncate(nbr_out);
-    Ok(out)
 }
 
 #[cfg(test)]

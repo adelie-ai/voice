@@ -65,6 +65,7 @@ name = "adele-voice-core"
 version = "0.1.0"
 dependencies = [
  "pulldown-cmark",
+ "rubato 2.0.0",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -117,7 +118,6 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "ort",
- "rubato 2.0.0",
  "tokio",
  "tracing",
 ]
@@ -128,7 +128,6 @@ version = "0.1.0"
 dependencies = [
  "adele-voice-core",
  "anyhow",
- "rubato 2.0.0",
  "tokio",
  "tracing",
 ]
