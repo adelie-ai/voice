@@ -1902,16 +1902,21 @@ mod tests {
     }
 
     /// STT that signals when it runs (proving audio reached transcription) and
-    /// returns a non-empty transcript so the response cycle proceeds.
+    /// returns a non-empty transcript so the response cycle proceeds. Records the
+    /// length of every buffer it was handed so a test can prove which audio
+    /// landed in the captured utterance (e.g. that a phrase listening-cue's echo
+    /// did NOT — V-7/#87).
     struct FakeStt {
         hit: mpsc::UnboundedSender<()>,
         text: String,
+        captured_lens: Arc<StdMutex<Vec<usize>>>,
     }
     impl SpeechToText for FakeStt {
         async fn transcribe(
             &self,
-            _samples: &[f32],
+            samples: &[f32],
         ) -> Result<Transcript, adele_voice_core::VoiceError> {
+            self.captured_lens.lock().unwrap().push(samples.len());
             let _ = self.hit.send(());
             Ok(Transcript {
                 text: self.text.clone(),
@@ -1923,6 +1928,27 @@ mod tests {
     impl TextToSpeech for FakeTts {
         async fn synthesize(&self, _text: &str) -> Result<Vec<f32>, adele_voice_core::VoiceError> {
             Ok(Vec::new())
+        }
+    }
+
+    /// TTS for the `spawn_pipeline` harness. When `set_playing` is `None` it
+    /// behaves exactly like `FakeTts` (no audio), so every existing test is
+    /// unaffected. When it's `Some`, each synthesis returns one sample (so the
+    /// `Speaker` queues it on the sink) and flips the shared `is_playing` flag —
+    /// modelling a spoken cue/reply that is now sounding, which a test uses to
+    /// prove the listening-cue's echo is drained, not captured (V-7/#87).
+    struct SpawnTts {
+        set_playing: Option<Arc<std::sync::atomic::AtomicBool>>,
+    }
+    impl TextToSpeech for SpawnTts {
+        async fn synthesize(&self, _text: &str) -> Result<Vec<f32>, adele_voice_core::VoiceError> {
+            match &self.set_playing {
+                Some(playing) => {
+                    playing.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(vec![0.0; 1])
+                }
+                None => Ok(Vec::new()),
+            }
         }
     }
 
@@ -2162,6 +2188,10 @@ mod tests {
         /// Lengths of every buffer queued on the sink — the listening cue (the
         /// ding earcon) shows up here.
         sink_played: Arc<StdMutex<Vec<usize>>>,
+        /// Lengths of every buffer handed to STT — i.e. the captured utterances.
+        /// Lets a test prove a phrase listening-cue's echo did NOT land in the
+        /// transcribed audio (V-7/#87).
+        stt_captured_lens: Arc<StdMutex<Vec<usize>>>,
         /// Drives the fake sink's `is_playing`: set true to mimic outstanding
         /// TTS (#68). Cleared by the sink's `stop()`.
         sink_playing: Arc<std::sync::atomic::AtomicBool>,
@@ -2200,6 +2230,12 @@ mod tests {
         client_tools: ClientToolToggles,
         /// Hold each turn open so the test drives the signal stream (voice#82).
         hold_turn: bool,
+        /// When set, the harness TTS reports its synthesized audio as *playing*
+        /// (one sample queued, `is_playing` flipped true) — so a test can model a
+        /// spoken listening-cue actually sounding and assert its echo is drained
+        /// rather than captured (V-7/#87). Off by default: existing tests keep the
+        /// silent `FakeTts` behaviour.
+        cue_plays_audio: bool,
     }
     impl Default for Cfg {
         fn default() -> Self {
@@ -2223,6 +2259,7 @@ mod tests {
                 inject_tool_call: None,
                 client_tools: ClientToolToggles::default(),
                 hold_turn: false,
+                cue_plays_audio: false,
             }
         }
     }
@@ -2318,6 +2355,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: "hello".to_string(),
+                captured_lens: Arc::new(StdMutex::new(Vec::new())),
             },
             FakeRecordingTts {
                 spoken: Arc::clone(&spoken),
@@ -2398,6 +2436,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: "hello".to_string(),
+                captured_lens: Arc::new(StdMutex::new(Vec::new())),
             },
             FakeRecordingTts {
                 spoken: Arc::clone(&spoken),
@@ -2888,7 +2927,13 @@ mod tests {
             })
         });
 
+        let stt_captured_lens = Arc::new(StdMutex::new(Vec::new()));
         let sink = FakeSink::default();
+        let cue_tts = SpawnTts {
+            set_playing: cfg
+                .cue_plays_audio
+                .then(|| Arc::clone(&sink.playing)),
+        };
         let sink_played = Arc::clone(&sink.played);
         let sink_playing = Arc::clone(&sink.playing);
         let sink_in_pad = Arc::clone(&sink.in_pad);
@@ -2904,8 +2949,9 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: cfg.stt_text,
+                captured_lens: Arc::clone(&stt_captured_lens),
             },
-            FakeTts,
+            cue_tts,
             FakeAssistant {
                 tx: StdMutex::new(None),
                 prompt_tx,
@@ -2959,6 +3005,7 @@ mod tests {
             registered_rx,
             tool_result_rx,
             events_rx,
+            stt_captured_lens,
             handle,
         }
     }
@@ -3428,6 +3475,75 @@ mod tests {
         let played = h.sink_played.lock().unwrap().clone();
         h.handle.abort();
         assert!(played.is_empty(), "no cue must be queued when set to off");
+    }
+
+    #[tokio::test]
+    async fn phrase_cue_echo_is_not_captured_as_the_utterance() {
+        // V-7/#87: on the wake path the spoken "Listening" cue ("How can I
+        // help?") plays *into* an already-armed mic. Its echo must be drained,
+        // not endpointed and sent to the assistant as the user's utterance. The
+        // same-breath preroll (#50) — audio captured BEFORE the cue — must still
+        // survive; only post-cue echo is dropped.
+        use std::sync::atomic::Ordering;
+        let mut h = spawn_pipeline(Cfg {
+            wake_detects: true,
+            listening_cue: ListeningCue::Phrase,
+            // The cue actually sounds: synthesizing it flips is_playing true so
+            // the drain has something to wait out (mirrors real playback).
+            cue_plays_audio: true,
+            // turn-1: one speech chunk (0.9) then silence (0.0) closes it.
+            vad: vec![0.9],
+            ..Default::default()
+        });
+
+        // The wake chunk: detected in Idle, seeds the preroll, arms the mic, then
+        // plays the phrase cue (which flips is_playing true).
+        send_chunk(&h).await; // 1000 samples, becomes preroll + first speech
+        // Wait for Listening so the cue has been spoken (is_playing now true).
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("wake -> Listening")
+        .unwrap();
+
+        // While the cue is sounding, its echo arrives on the mic. With the fix the
+        // pipeline is waiting out playback and draining these, so they never reach
+        // the endpointer.
+        for _ in 0..3 {
+            h.audio_tx.send(vec![0.2f32; 1000]).await.unwrap();
+        }
+        // Give the drain a beat, then end the cue's playback.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        h.sink_playing.store(false, Ordering::SeqCst);
+
+        // Now the real user speaks: one speech chunk then silence closes the
+        // utterance and triggers transcription.
+        h.audio_tx.send(vec![0.3f32; 1000]).await.unwrap(); // VAD 0.9 -> speech
+        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap(); // VAD 0.0 -> silence
+
+        // Transcription must run on the user's utterance...
+        tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv())
+            .await
+            .expect("transcription must run")
+            .expect("hit");
+
+        let captured = h.stt_captured_lens.lock().unwrap().clone();
+        h.handle.abort();
+
+        // Exactly one utterance was transcribed.
+        assert_eq!(captured.len(), 1, "one utterance transcribed; got {captured:?}");
+        // It must NOT contain the 3 cue-echo chunks (3000 samples). The captured
+        // buffer is the preroll/same-breath chunk plus the user's speech chunk
+        // (the trailing silence isn't accumulated past the cut), i.e. ~2000
+        // samples. The bug would balloon it past 4000 by swallowing the echo.
+        assert!(
+            captured[0] < 3000,
+            "the phrase-cue echo (3×1000 samples) must be drained, not captured; \
+             captured {} samples",
+            captured[0]
+        );
     }
 
     #[tokio::test]
@@ -4205,6 +4321,7 @@ mod tests {
             FakeStt {
                 hit: hit_tx,
                 text: "hello".to_string(),
+                captured_lens: Arc::new(StdMutex::new(Vec::new())),
             },
             FakeTts,
             FakeAssistant {
