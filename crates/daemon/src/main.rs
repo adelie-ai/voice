@@ -128,9 +128,17 @@ async fn main() -> Result<()> {
         tts_rx,
     ));
 
+    // Per-turn text-signal channel (voice#85): the pipeline reports the
+    // transcript and the lines it speaks; a forwarder task emits them (and state
+    // transitions) as the org.desktopAssistant.Voice D-Bus signals so clients
+    // (the KDE widget) react without polling GetState. A small bound is fine —
+    // emission is best-effort (`try_send`), and the consumer just relays.
+    let (signal_tx, signal_rx) =
+        tokio::sync::mpsc::channel::<adele_voice_dbus_interface::VoiceSignal>(32);
+
     // D-Bus server interface
     let dbus_adapter = DbusVoiceAdapter::new(
-        state_rx,
+        state_rx.clone(),
         enabled_tx,
         enabled_rx.clone(),
         ptt_tx,
@@ -148,6 +156,15 @@ async fn main() -> Result<()> {
         .request_name("org.desktopAssistant.Voice")
         .await?;
     tracing::info!("D-Bus interface registered at {DBUS_VOICE_PATH}");
+
+    // Emit StateChanged / TranscriptReady / SpeakingText from the pipeline's
+    // state watch + the signal channel (voice#85).
+    {
+        let emitter = zbus::object_server::SignalEmitter::new(&connection, DBUS_VOICE_PATH)?;
+        tokio::spawn(adele_voice_dbus_interface::run_signal_forwarder(
+            emitter, state_rx, signal_rx,
+        ));
+    }
 
     // Watch the config file and ping the pipeline (debounced) on edits made
     // outside the KCM, e.g. a hand-edit, so live tuning works either way (#52).
@@ -198,7 +215,8 @@ async fn main() -> Result<()> {
             listen_for_more: config.assistant.client_tools.listen_for_more,
             say_this: config.assistant.client_tools.say_this,
         },
-    );
+    )
+    .with_signal_tx(signal_tx);
 
     tokio::select! {
         result = pipeline.run() => {
