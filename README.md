@@ -48,6 +48,17 @@ The LLM backend is whatever you have configured in the desktop assistant. It **m
 
 ---
 
+## Echo cancellation (full-duplex barge-in)
+
+Speakers + a mic mean Adele can hear her own voice. Two layers handle it:
+
+- **Half-duplex (the floor, every platform, always on):** Adele simply doesn't listen to her own playback — capture is gated while she speaks. This stops her interrupting or answering herself with no dependencies. It's why `audio.mic_barge_in` is **off** by default: interrupting her *by voice mid-reply* needs the mic open while she talks, which is unsafe without cancellation.
+- **Acoustic echo cancellation (the upgrade, per-platform):** removes her playback from the mic signal so the mic is open *and* clean — which is what lets `mic_barge_in` be turned back on safely. On **Linux/PipeWire** this ships as a config install (no extra build): `just install-aec` loads PipeWire's WebRTC echo-cancel module and a WirePlumber hook that routes *only* Adele's streams through it (your other apps and your default devices are untouched; whichever mic you pick in your sound settings is what it cancels against). macOS (CoreAudio Voice-Processing) and Windows (WASAPI) are separate future layers.
+
+After `just install-aec`, confirm with `adele-voice check-setup`, then set `audio.mic_barge_in = true` and restart the daemon to enable voice barge-in. Remove with `just uninstall-aec`.
+
+---
+
 ## Architecture
 
 Ports-and-adapters (hexagonal). `core` defines the domain, the state machine, and the port traits; each capability is an isolated adapter crate, so any engine can be swapped without touching the pipeline.
