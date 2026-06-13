@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
             config.timeouts.status_narration_min_gap_ms,
         ),
         liveness_delay: Duration::from_millis(config.timeouts.narration_liveness_delay_ms),
+        narration_flush: Duration::from_millis(config.timeouts.narration_flush_ms),
     };
 
     // logind session gating (voice#103): release the mic when the session goes

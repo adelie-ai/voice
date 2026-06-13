@@ -151,6 +151,7 @@ Tuning knobs in `~/.config/adele-voice/config.toml` take effect **without a serv
 | `timeouts.response_stall_ms` | hot-applied (next turn) — per-event progress-heartbeat deadline (0 disables) |
 | `timeouts.turn_budget_ms` | hot-applied (next turn) — overall per-turn ceiling (0 disables) |
 | `timeouts.status_narration_min_gap_ms` | hot-applied (next turn) — min gap between spoken progress narrations |
+| `timeouts.narration_flush_ms` | hot-applied (next turn) — mid-sentence quiet window before a settled clause is flushed to TTS (0 disables) |
 | `wake_word.sensitivity` | wake detector **rebuilt** (rustpotter bakes the threshold in at construction) |
 | `audio.input_device` / `audio.output_device` | **restart required** — the capture/playback stream isn't swapped live; the daemon logs a clear "restart required" note and applies every other changed knob |
 
@@ -159,6 +160,8 @@ Everything else (model paths, STT/TTS backend & voice, the orchestrator transpor
 ### Turn timeouts (#58)
 
 The `[timeouts]` section bounds every otherwise-unbounded step of a turn so a wedged orchestrator, STT, or TTS backend never leaves you stuck in `Processing`. On a stall (no progress within `response_stall_ms`, resetting on each streamed chunk **or** progress status) or once the overall `turn_budget_ms` elapses, the daemon speaks a short apology and returns to Idle. Progress statuses from the orchestrator ("checking your calendar…") are narrated **sparingly** — the first immediately, then at most one per `status_narration_min_gap_ms`. Every knob accepts `0` to disable that bound. Defaults are generous (30 s stall, 120 s budget, 20 s STT/TTS, 10 s connect, 15 s narration gap) — they only fire when something is genuinely wedged.
+
+A separate knob, `narration_flush_ms` (default 1.5 s), governs how the *spoken reply itself* is chunked. The daemon streams the reply into a sentence buffer and synthesizes one sentence at a time; when the token stream goes quiet mid-sentence for longer than this window, the buffer flushes what it has so far rather than waiting — but it cuts at a **clause boundary** (a comma, semicolon, colon, or dash), never mid-word, so each synthesized unit stays prosodically whole. The end of a reply always flushes immediately regardless of this timer, so it only ever governs a genuine inter-token stall. Lower it to start speaking sooner on a slow stream (at the cost of more, smaller chunks); set `0` to flush only at sentence ends and end-of-stream.
 
 ### LLM-driven session control (voice#61)
 
