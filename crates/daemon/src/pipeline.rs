@@ -39,10 +39,13 @@ const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that
 /// the user isn't left in silent Processing forever (#58).
 const STALL_APOLOGY: &str = "Sorry, that's taking too long. Let's try again.";
 
-/// Brief liveness line spoken once on a slow turn that has narrated nothing and
+/// Brief liveness lines spoken on a slow turn that has narrated nothing and
 /// streamed nothing yet (e.g. it declared no plan step) — so voice isn't
-/// dead-silent. Rare by design, so it stays natural rather than repetitive.
-const LIVENESS_PHRASE: &str = "One moment.";
+/// dead-silent. Spoken in order, one per `liveness_delay`, escalating so a
+/// genuinely slow turn doesn't just repeat "One moment." robotically; the turn
+/// fires at most `LIVENESS_PHRASES.len()` of them, then stays quiet until the
+/// stall/budget backstop. Rare by design.
+const LIVENESS_PHRASES: &[&str] = &["One moment.", "Still working on it."];
 
 /// A short leading ack ("Got it — checking that now.") is at most this many
 /// words; longer terminal sentences are the real answer and aren't flushed
@@ -264,19 +267,42 @@ pub fn session_control_tools(toggles: ClientToolsConfig) -> Vec<ClientToolSpec> 
     tools
 }
 
-/// Whole-utterance "stop listening" phrases, matched only against the entire
-/// normalized transcript (so "stop" inside a sentence isn't a command). Lets the
-/// user end a conversation hands-free.
-fn is_stop_phrase(text: &str) -> bool {
-    let normalized = text
-        .trim()
+/// Normalize a transcript for whole-utterance matching: trim, lowercase, drop
+/// sentence punctuation, and collapse internal whitespace.
+fn normalize_phrase(text: &str) -> String {
+    text.trim()
         .to_ascii_lowercase()
         .chars()
         .filter(|c| !matches!(c, '.' | ',' | '!' | '?'))
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ");
+        .join(" ")
+}
+
+/// True when the transcript is just one of the short canned lines the daemon
+/// speaks itself (a liveness reassurance or a stall/error apology). Without
+/// acoustic echo cancellation the mic can pick up that playback, Whisper
+/// transcribes it, and it would otherwise start a fresh turn that produces
+/// another canned line — a feedback loop. We discard such an utterance instead
+/// of acting on it. The user's own words never match these exact phrases.
+fn is_self_echo(text: &str) -> bool {
+    let normalized = normalize_phrase(text);
+    if normalized.is_empty() {
+        return false;
+    }
+    LIVENESS_PHRASES
+        .iter()
+        .copied()
+        .chain([STALL_APOLOGY, ERROR_APOLOGY])
+        .any(|canned| normalize_phrase(canned) == normalized)
+}
+
+/// Whole-utterance "stop listening" phrases, matched only against the entire
+/// normalized transcript (so "stop" inside a sentence isn't a command). Lets the
+/// user end a conversation hands-free.
+fn is_stop_phrase(text: &str) -> bool {
+    let normalized = normalize_phrase(text);
     matches!(
         normalized.as_str(),
         "stop"
@@ -1485,6 +1511,15 @@ where
         // (voice#85).
         self.emit_signal(VoiceSignal::TranscriptReady(transcript.text.clone()));
 
+        // The mic can capture the daemon's own playback (no echo cancellation),
+        // so Whisper sometimes transcribes one of our canned reassurance /
+        // apology lines. Acting on it would start a fresh turn that speaks
+        // another canned line and loops. Discard it like a near-silent capture.
+        if is_self_echo(&transcript.text) {
+            tracing::info!(text = %transcript.text, "discarding self-echo of a canned spoken line");
+            return Ok(UtteranceOutcome::Continue);
+        }
+
         // A whole-utterance stop phrase ("stop", "never mind", "that's all", …)
         // ends the conversation hands-free: acknowledge briefly and return to
         // wake-word idle instead of sending it to the assistant.
@@ -1692,12 +1727,13 @@ where
         // sentence-flush tick can't accidentally reset the stall window.
         let mut last_event_at = TokioInstant::now();
         // Delayed-liveness safety net: if the turn narrates nothing and streams
-        // nothing within this window, speak one brief line so a slow turn that
-        // declared no plan step isn't dead-silent. Cancelled by the first status
-        // or chunk; fires at most once. `Duration::ZERO` disables.
-        let liveness_deadline =
+        // nothing within this window, speak a brief line so a slow turn that
+        // declared no plan step isn't dead-silent. Re-arms each `liveness_delay`
+        // while still silent, escalating through `LIVENESS_PHRASES`, then stops.
+        // Cancelled by the first status or chunk. `Duration::ZERO` disables.
+        let mut next_liveness_at =
             (!self.liveness_delay.is_zero()).then(|| TokioInstant::now() + self.liveness_delay);
-        let mut liveness_spoken = false;
+        let mut liveness_idx = 0usize;
         // Guards the mid-turn audio arm (voice#82): cleared when the capture
         // channel closes so the arm disarms instead of hot-looping on a dead
         // receiver (V-1). The run loop's own recv()==None path then recovers.
@@ -1895,18 +1931,24 @@ where
                     }
                 }
                 // Delayed-liveness safety net: a slow turn that has narrated
-                // nothing and streamed nothing yet gets one brief line so voice
-                // isn't dead-silent. The guard disables it once a status/chunk
-                // arrives or it has already fired.
+                // nothing and streamed nothing yet gets a brief, escalating line
+                // so voice isn't dead-silent. Re-arms while still silent until
+                // the phrase list is exhausted; the guard disables it once a
+                // status/chunk arrives.
                 _ = async {
-                    match liveness_deadline {
+                    match next_liveness_at {
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if !liveness_spoken && first_chunk && last_status_spoken_at.is_none() => {
-                    liveness_spoken = true;
+                }, if next_liveness_at.is_some() && first_chunk && last_status_spoken_at.is_none() => {
+                    let phrase = LIVENESS_PHRASES[liveness_idx];
+                    liveness_idx += 1;
+                    // Re-arm for the next escalation step, or stop once the list
+                    // is exhausted (the stall/budget backstop covers the rest).
+                    next_liveness_at = (liveness_idx < LIVENESS_PHRASES.len())
+                        .then(|| TokioInstant::now() + self.liveness_delay);
                     self.apply(StateEvent::ResponseStarted);
-                    self.speaker.say(LIVENESS_PHRASE).await?;
+                    self.speaker.say(phrase).await?;
                 }
             }
 
@@ -2078,6 +2120,27 @@ mod tests {
         assert!(!is_stop_phrase("tell me a story"));
     }
 
+    #[test]
+    fn self_echo_matches_canned_lines_only() {
+        // Whisper transcribing our own playback (no echo cancellation) —
+        // punctuation/case may vary — must be recognized and discarded.
+        assert!(is_self_echo("One moment."));
+        assert!(is_self_echo("one moment"));
+        assert!(is_self_echo("Still working on it"));
+        assert!(is_self_echo(STALL_APOLOGY));
+        assert!(is_self_echo(ERROR_APOLOGY));
+        // Every escalation phrase is covered.
+        for phrase in LIVENESS_PHRASES {
+            assert!(is_self_echo(phrase), "{phrase:?} should be a self-echo");
+        }
+        // A real request that merely contains a word from a canned line is not
+        // an echo, and empty input never is.
+        assert!(!is_self_echo("give me a moment to think"));
+        assert!(!is_self_echo("are you still working on it?"));
+        assert!(!is_self_echo(""));
+        assert!(!is_self_echo("what's the forecast for today?"));
+    }
+
     #[tokio::test]
     async fn stop_phrase_ends_conversation_without_prompting() {
         // A whole-utterance "stop" must end the conversation — even in
@@ -2110,6 +2173,37 @@ mod tests {
         assert!(
             h.prompt_rx.try_recv().is_err(),
             "a stop phrase must not be sent to the assistant"
+        );
+    }
+
+    #[tokio::test]
+    async fn self_echo_utterance_is_not_sent_to_the_assistant() {
+        // Regression guard for the echo loop: when the mic captures our own
+        // playback and Whisper transcribes a canned liveness line, it must be
+        // discarded — never sent to the assistant to start a fresh turn.
+        let mut h = spawn_pipeline(Cfg {
+            stt_text: LIVENESS_PHRASES[0].to_string(),
+            conversation_mode: true,
+            ..Default::default()
+        });
+        h.ptt_tx.send(None).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            h.state_rx.wait_for(|s| *s == State::Listening),
+        )
+        .await
+        .expect("ptt -> Listening")
+        .unwrap();
+        send_chunk(&h).await; // speech
+        send_chunk(&h).await; // silence -> process -> transcribe -> discard
+
+        // A discarded echo re-arms listening (conversation mode) rather than
+        // prompting; give it a moment, then confirm nothing was sent.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        h.handle.abort();
+        assert!(
+            h.prompt_rx.try_recv().is_err(),
+            "a self-echo of a canned line must not be sent to the assistant"
         );
     }
 
@@ -3080,7 +3174,8 @@ mod tests {
     async fn liveness_speaks_once_on_a_slow_stepless_turn() {
         // Safety net: a turn that narrates nothing and streams nothing past the
         // liveness delay (a slow turn that declared no step) gets one brief
-        // liveness line so voice isn't dead-silent — then it completes.
+        // liveness line so voice isn't dead-silent — then it completes before
+        // the next escalation step would fire.
         let liveness = Duration::from_millis(500);
         let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
             liveness_delay: liveness,
@@ -3089,8 +3184,8 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
         let feeder = tokio::spawn(async move {
-            // Nothing for well past the liveness delay, then the reply arrives.
-            tokio::time::sleep(liveness * 2).await;
+            // Past the first liveness delay but before the second, then reply.
+            tokio::time::sleep(liveness + liveness / 2).await;
             let _ = tx.send(AssistantEvent::Complete {
                 request_id: "req".into(),
                 full_response: "the answer".into(),
@@ -3105,10 +3200,59 @@ mod tests {
         .expect("stream_response ok");
         feeder.await.unwrap();
         let said = spoken.lock().unwrap().clone();
+        let liveness_lines: Vec<_> = said
+            .iter()
+            .filter(|s| LIVENESS_PHRASES.contains(&s.as_str()))
+            .collect();
         assert_eq!(
-            said.iter().filter(|s| *s == LIVENESS_PHRASE).count(),
+            liveness_lines.len(),
             1,
-            "a slow stepless turn must speak the liveness line exactly once; said: {said:?}"
+            "a slow stepless turn must speak one liveness line before completing; said: {said:?}"
+        );
+        assert_eq!(
+            liveness_lines[0], LIVENESS_PHRASES[0],
+            "the first liveness line must be the first phrase; said: {said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_escalates_then_stops_on_a_very_slow_turn() {
+        // A turn that stays silent across several liveness windows escalates
+        // through the phrase list in order, then goes quiet (the stall/budget
+        // backstop covers the rest) rather than repeating forever.
+        let liveness = Duration::from_millis(500);
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            liveness_delay: liveness,
+            response_stall: Duration::from_secs(30), // not the limiting factor
+            ..test_timeouts()
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        let feeder = tokio::spawn(async move {
+            // Silent long enough for every phrase plus a couple more windows.
+            tokio::time::sleep(liveness * (LIVENESS_PHRASES.len() as u32 + 3)).await;
+            let _ = tx.send(AssistantEvent::Complete {
+                request_id: "req".into(),
+                full_response: "the answer".into(),
+            });
+        });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            p.stream_response(&mut rx, "req", &mut idle_audio_rx()),
+        )
+        .await
+        .expect("stream_response must return")
+        .expect("stream_response ok");
+        feeder.await.unwrap();
+        let said = spoken.lock().unwrap().clone();
+        let liveness_lines: Vec<&String> = said
+            .iter()
+            .filter(|s| LIVENESS_PHRASES.contains(&s.as_str()))
+            .collect();
+        let expected: Vec<&str> = LIVENESS_PHRASES.to_vec();
+        let got: Vec<&str> = liveness_lines.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            got, expected,
+            "liveness must escalate through each phrase exactly once, in order, then stop; said: {said:?}"
         );
     }
 
@@ -3146,7 +3290,7 @@ mod tests {
         feeder.await.unwrap();
         let said = spoken.lock().unwrap().clone();
         assert!(
-            !said.iter().any(|s| s == LIVENESS_PHRASE),
+            !said.iter().any(|s| LIVENESS_PHRASES.contains(&s.as_str())),
             "progress before the delay must suppress the liveness line; said: {said:?}"
         );
         assert!(
@@ -5514,7 +5658,11 @@ mod tests {
         driver.await.unwrap();
         assert_eq!(end, StreamEnd::Stopped(StopRequest::Speaking));
         assert!(
-            !spoken.lock().unwrap().iter().any(|s| s == LIVENESS_PHRASE),
+            !spoken
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|s| LIVENESS_PHRASES.contains(&s.as_str())),
             "an interrupt before the liveness deadline must suppress the line"
         );
     }
