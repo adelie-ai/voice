@@ -22,6 +22,19 @@ use crate::tts_backend::TtsBackend;
 
 /// Wire a [`Dictation`] from config: the cpal microphone, Silero VAD, and
 /// Whisper STT, with endpointing tuned from the `[vad]` section.
+///
+/// To enable the half-duplex echo guard so the mic doesn't capture
+/// and transcribe Adele's own TTS, chain the speaker's sink onto the result:
+///
+/// ```ignore
+/// let speaker = build_speaker(&cfg.tts, &cfg.audio).await;
+/// let dictation =
+///     build_dictation(&cfg.audio, &cfg.vad, &cfg.stt)?.with_echo_guard(speaker.sink());
+/// ```
+///
+/// Both must play through the same output device for the guard to be accurate;
+/// sharing one [`Speaker`]'s [`sink`](crate::speaker::Speaker::sink) guarantees
+/// that. Without the chained guard, dictation is playback-unaware as before.
 pub fn build_dictation(
     audio: &AudioConfig,
     vad: &VadConfig,

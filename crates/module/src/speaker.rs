@@ -108,6 +108,15 @@ impl<T: TextToSpeech> Speaker<T> {
     pub fn in_tail_pad(&self) -> bool {
         self.sink.in_tail_pad()
     }
+
+    /// Clone the shared output sink. A client that owns both a
+    /// `Speaker` and a [`Dictation`] passes this to
+    /// [`Dictation::with_echo_guard`](crate::dictation::Dictation::with_echo_guard)
+    /// so the mic path can see when this speaker is sounding and avoid capturing
+    /// its own TTS. Cheap: clones an `Arc`, not the audio device.
+    pub fn sink(&self) -> Arc<dyn AudioSink> {
+        Arc::clone(&self.sink)
+    }
 }
 
 #[cfg(test)]
