@@ -132,7 +132,34 @@ fn cleanup(text: &str) -> String {
             }
         }
     }
-    result.trim().to_string()
+    space_jammed_sentences(result.trim())
+}
+
+/// Insert a space after sentence-ending punctuation that is jammed directly
+/// against the start of the next sentence — e.g. `"Holly Springs.Looking"` →
+/// `"Holly Springs. Looking"`. Without the space, TTS (espeak/Kokoro) doesn't
+/// see a sentence boundary and reads the `.` aloud as the word "dot". This can
+/// happen when a status/narration line runs straight into the reply, or the
+/// model omits the space.
+///
+/// Deliberately conservative — it only fires on
+/// `<lowercase letter> <.!?> <uppercase letter>` — so it never breaks decimals
+/// (`3.14`), versions (`v2.0`), acronyms (`U.S.A`, uppercase before the dot), or
+/// lowercase abbreviations (`e.g.`, lowercase after the dot).
+fn space_jammed_sentences(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    for (i, &c) in chars.iter().enumerate() {
+        out.push(c);
+        if matches!(c, '.' | '!' | '?')
+            && i > 0
+            && chars[i - 1].is_lowercase()
+            && chars.get(i + 1).is_some_and(|n| n.is_uppercase())
+        {
+            out.push(' ');
+        }
+    }
+    out
 }
 
 /// Remove residual markdown punctuation that survived parsing — e.g. when a
@@ -369,6 +396,45 @@ mod tests {
             "Got it — checking that now."
         );
         assert_eq!(strip_markdown_for_speech("**Really?**"), "Really?");
+    }
+
+    #[test]
+    fn jammed_sentences_get_a_space_so_tts_does_not_read_dot() {
+        // The reported bug: a sentence run straight into the next with no space
+        // makes espeak read the "." aloud as "dot".
+        assert_eq!(
+            strip_markdown_for_speech(
+                "Checking the weather in Holly Springs.Looking at this evening, it's beautiful."
+            ),
+            "Checking the weather in Holly Springs. Looking at this evening, it's beautiful."
+        );
+        // `!` and `?` too.
+        assert_eq!(
+            strip_markdown_for_speech("It's beautiful!Want the hourly?Yes."),
+            "It's beautiful! Want the hourly? Yes."
+        );
+    }
+
+    #[test]
+    fn sentence_spacing_leaves_decimals_acronyms_and_abbreviations_alone() {
+        // Conservative rule (<lowercase>.<uppercase>) must not touch these.
+        assert_eq!(
+            strip_markdown_for_speech("It costs 3.14 dollars."),
+            "It costs 3.14 dollars."
+        );
+        assert_eq!(
+            strip_markdown_for_speech("Use v2.0 today."),
+            "Use v2.0 today."
+        );
+        assert_eq!(
+            strip_markdown_for_speech("The U.S.A is large."),
+            "The U.S.A is large."
+        );
+        // already-spaced sentences are unchanged (idempotent).
+        assert_eq!(
+            strip_markdown_for_speech("One. Two. Three."),
+            "One. Two. Three."
+        );
     }
 
     #[test]
