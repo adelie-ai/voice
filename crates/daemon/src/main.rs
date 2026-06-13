@@ -7,13 +7,14 @@ use tracing_subscriber::EnvFilter;
 mod config;
 mod cue;
 mod pipeline;
+mod session;
 mod tts_service;
 
 use adele_voice_assistant_connector::ConnectorAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
 use adele_voice_core::domain::State;
 use adele_voice_core::ports::audio::AudioSink;
-use adele_voice_dbus_interface::{DbusVoiceAdapter, StopRequest, TtsCommand};
+use adele_voice_dbus_interface::{CaptureState, DbusVoiceAdapter, StopRequest, TtsCommand};
 use adele_voice_module::{Speaker, TtsBackend};
 use adele_voice_stt_whisper::WhisperStt;
 use adele_voice_vad_silero::SileroVad;
@@ -95,6 +96,10 @@ async fn main() -> Result<()> {
 
     // State channels
     let (state_tx, state_rx) = tokio::sync::watch::channel(State::Idle);
+    // Real capture (mic-open) state, surfaced over D-Bus so the KDE overlay /
+    // health report can show whether the mic is actually open vs paused
+    // (voice#103). The pipeline publishes; the D-Bus adapter reads.
+    let (capture_state_tx, capture_state_rx) = tokio::sync::watch::channel(CaptureState::Capturing);
     let (enabled_tx, enabled_rx) = tokio::sync::watch::channel(true);
     // PTT payload: the target conversation id (None = the daemon's own session).
     let (ptt_tx, ptt_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
@@ -139,6 +144,7 @@ async fn main() -> Result<()> {
     // D-Bus server interface
     let dbus_adapter = DbusVoiceAdapter::new(
         state_rx.clone(),
+        capture_state_rx,
         enabled_tx,
         enabled_rx.clone(),
         ptt_tx,
@@ -183,6 +189,13 @@ async fn main() -> Result<()> {
         liveness_delay: Duration::from_millis(config.timeouts.narration_liveness_delay_ms),
     };
 
+    // logind session gating (voice#103): release the mic when the session goes
+    // inactive (fast user switch) so the daemon doesn't keep recording the
+    // foreground user. Capability-detected: absent logind => inert gate (capture
+    // as before); see `session.rs` for the three-state model.
+    let session_gate =
+        session::spawn_session_gate(config.wake_word.pause_on_session_inactive).await;
+
     // Build and run pipeline
     let pipeline = pipeline::Pipeline::new(
         wake,
@@ -216,7 +229,9 @@ async fn main() -> Result<()> {
             client_tools: config.assistant.client_tools,
         },
     )
-    .with_signal_tx(signal_tx);
+    .with_signal_tx(signal_tx)
+    .with_session_gate(session_gate)
+    .with_capture_state(capture_state_tx);
 
     tokio::select! {
         result = pipeline.run() => {

@@ -19,6 +19,7 @@ dependencies = [
  "adele-voice-wake-rustpotter",
  "anyhow",
  "dirs",
+ "futures-util",
  "notify",
  "serde",
  "serde_json",

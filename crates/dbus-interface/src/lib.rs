@@ -45,6 +45,39 @@ pub enum VoiceSignal {
     SpeakingText(String),
 }
 
+/// The real capture (microphone) state, separate from the pipeline `State`
+/// (voice#103). The KDE mic overlay / health report needs the *truth* about
+/// whether the mic is actually open: pre-#103, `State::Idle` could mean either
+/// "listening for the wake word" (mic open) or "paused" (mic should be closed),
+/// and the device stayed open even when "disabled" or the session was inactive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureState {
+    /// The mic is open and the pipeline is processing audio.
+    #[default]
+    Capturing,
+    /// Capture is released because the logind session is inactive (e.g. fast
+    /// user switch) — privacy/cost gate (voice#103).
+    PausedSessionInactive,
+    /// Capture is released because voice processing was disabled
+    /// (`SetEnabled(false)`) — the mic indicator must not stay lit.
+    PausedDisabled,
+    /// The input device couldn't be opened (degraded) — capture is unavailable
+    /// until the device is fixed / a reload recovers it.
+    Unavailable,
+}
+
+impl std::fmt::Display for CaptureState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Capturing => "Capturing",
+            Self::PausedSessionInactive => "PausedSessionInactive",
+            Self::PausedDisabled => "PausedDisabled",
+            Self::Unavailable => "Unavailable",
+        };
+        f.write_str(s)
+    }
+}
+
 /// A push-to-talk trigger. The payload is the conversation the utterance
 /// should be routed to: `None` uses the daemon's own session ("Voice
 /// Conversation"); `Some(id)` targets the orchestrator conversation with that
@@ -65,6 +98,8 @@ pub enum StopRequest {
 /// D-Bus adapter exposing org.desktopAssistant.Voice.
 pub struct DbusVoiceAdapter {
     state_rx: watch::Receiver<State>,
+    /// The real capture (mic-open) state (voice#103), distinct from `state_rx`.
+    capture_state_rx: watch::Receiver<CaptureState>,
     enabled_tx: Arc<watch::Sender<bool>>,
     enabled_rx: watch::Receiver<bool>,
     ptt_tx: mpsc::Sender<PttRequest>,
@@ -80,6 +115,7 @@ impl DbusVoiceAdapter {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state_rx: watch::Receiver<State>,
+        capture_state_rx: watch::Receiver<CaptureState>,
         enabled_tx: watch::Sender<bool>,
         enabled_rx: watch::Receiver<bool>,
         ptt_tx: mpsc::Sender<PttRequest>,
@@ -89,6 +125,7 @@ impl DbusVoiceAdapter {
     ) -> Self {
         Self {
             state_rx,
+            capture_state_rx,
             enabled_tx: Arc::new(enabled_tx),
             enabled_rx,
             ptt_tx,
@@ -118,6 +155,15 @@ impl DbusVoiceAdapter {
     /// Get whether voice processing is enabled.
     async fn get_enabled(&self) -> fdo::Result<bool> {
         Ok(*self.enabled_rx.borrow())
+    }
+
+    /// Get the real capture (microphone) state (voice#103): "Capturing",
+    /// "PausedSessionInactive", "PausedDisabled", or "Unavailable". Unlike
+    /// `GetState` (the conversation state machine), this reflects whether the mic
+    /// is actually open — so the KDE overlay / health report can show the truth
+    /// (e.g. paused on fast-user-switch) instead of a stale "Idle/listening".
+    async fn get_capture_state(&self) -> fdo::Result<String> {
+        Ok(self.capture_state_rx.borrow().to_string())
     }
 
     /// Trigger push-to-talk (skip wake word, go directly to Listening). The

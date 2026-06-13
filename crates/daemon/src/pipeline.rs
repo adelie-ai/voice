@@ -10,12 +10,22 @@ use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
-use adele_voice_dbus_interface::{StopRequest, VoiceSignal};
+use adele_voice_dbus_interface::{CaptureState, StopRequest, VoiceSignal};
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
 use crate::config::{self, ClientToolsConfig, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
+use crate::session::SessionGate;
+
+/// Sleep for `dur` if `Some`, else never resolve. Used to make a `select!` arm
+/// conditional on an optional deadline without a separate `if` guard pre-check.
+async fn sleep_opt(dur: Option<Duration>) {
+    match dur {
+        Some(d) => tokio::time::sleep(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
 
 /// Builds a fresh wake detector at a given sensitivity. rustpotter bakes the
 /// detection threshold in at construction, so changing it on reload (config#52)
@@ -382,6 +392,18 @@ where
     /// D-Bus layer forwards as `TranscriptReady` / `SpeakingText` signals
     /// (voice#85). `None` when no D-Bus forwarder is attached (e.g. in tests).
     signal_tx: Option<mpsc::Sender<VoiceSignal>>,
+    /// logind session-active gate (voice#103). When the session goes inactive
+    /// (fast user switch) the mic is released; an inert gate (logind absent or
+    /// the feature disabled) never pauses. Defaults to inert.
+    session: SessionGate,
+    /// A push-to-talk that arrived while capture was paused-by-disable and
+    /// triggered a re-acquire (voice#103): the run loop drains it and enters PTT
+    /// listening so PTT keeps working even with wake-word/voice disabled (#3).
+    /// `Some(target)` = pending; `None` = nothing pending.
+    pending_ptt: Option<Option<String>>,
+    /// Publishes the real capture (mic-open) state for the D-Bus
+    /// `GetCaptureState` surface (voice#103). Detached by default in tests.
+    capture_state_tx: watch::Sender<CaptureState>,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -464,6 +486,11 @@ where
             session_end_requested: false,
             listen_for_more_requested: false,
             signal_tx: None,
+            session: SessionGate::inert(),
+            pending_ptt: None,
+            // A detached sender (no receiver) so `capture_state_tx.send` is a
+            // harmless no-op until `with_capture_state` wires the real channel.
+            capture_state_tx: watch::channel(CaptureState::Capturing).0,
         }
     }
 
@@ -506,6 +533,28 @@ where
     pub fn with_signal_tx(mut self, signal_tx: mpsc::Sender<VoiceSignal>) -> Self {
         self.signal_tx = Some(signal_tx);
         self
+    }
+
+    /// Attach the logind session-active gate (voice#103). With an inert gate
+    /// (the default) capture is never paused for session reasons.
+    pub fn with_session_gate(mut self, session: SessionGate) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// Attach the capture-state publisher so the D-Bus `GetCaptureState` surface
+    /// reflects whether the mic is actually open vs paused (voice#103).
+    pub fn with_capture_state(mut self, tx: watch::Sender<CaptureState>) -> Self {
+        self.capture_state_tx = tx;
+        self
+    }
+
+    /// Publish the real capture state for the D-Bus surface (voice#103).
+    fn set_capture_state(&self, state: CaptureState) {
+        if *self.capture_state_tx.borrow() != state {
+            tracing::info!(%state, "capture state changed");
+        }
+        let _ = self.capture_state_tx.send(state);
     }
 
     /// Best-effort emit of a per-turn text signal (voice#85). Uses `try_send` so
@@ -827,15 +876,105 @@ where
         }
     }
 
+    /// Whether capture should currently be running: the logind session is
+    /// active (or the gate is inert) AND voice processing is enabled (voice#103).
+    /// When either is false the mic is released — both for privacy on
+    /// fast-user-switch and so a `SetEnabled(false)` actually closes the device
+    /// rather than only muting wake detection (the mic-indicator trust bug).
+    fn capture_allowed(&self) -> bool {
+        self.session.is_active() && *self.enabled_rx.borrow()
+    }
+
+    /// The capture-state reason for the current not-allowed condition. Session
+    /// takes precedence (it's the privacy/cost gate); else it's the disable gate.
+    fn pause_reason(&self) -> CaptureState {
+        if !self.session.is_active() {
+            CaptureState::PausedSessionInactive
+        } else {
+            CaptureState::PausedDisabled
+        }
+    }
+
+    /// Wait until capture is allowed again, servicing the control channels so the
+    /// daemon stays alive and the mic stays released. A push-to-talk overrides
+    /// the *disable* pause (it re-acquires the mic on demand and the run loop
+    /// then enters Listening — so PTT keeps working with wake-word/voice off, #3)
+    /// but NOT the *session* pause (opening the mic in a switched-away session is
+    /// exactly what the privacy gate prevents). Returns `true` once capture is
+    /// allowed (or a PTT re-acquired it), `false` if every control channel closed
+    /// (clean shutdown). A PTT that triggered the resume is stashed in
+    /// `pending_ptt` for the run loop to drain.
+    ///
+    /// The mic is already stopped by the caller before this is entered.
+    ///
+    /// Returns `true` when capture becomes allowed again, `false` when the
+    /// process should exit cleanly — either every control channel closed, or
+    /// (paused-by-disable only) the idle-exit window elapsed so D-Bus activation
+    /// can restart the daemon on demand (#5). Idle-exit never fires on a
+    /// session-inactive pause: the daemon stays resident to resume when the
+    /// session returns.
+    async fn await_capture_allowed(&mut self) -> bool {
+        self.set_capture_state(self.pause_reason());
+        // Idle-exit countdown starts from when capture was released.
+        let paused_at = Instant::now();
+        loop {
+            if self.capture_allowed() {
+                return true;
+            }
+            // Idle-exit only when paused purely because voice is disabled (#5):
+            // a session-inactive pause must keep the daemon resident.
+            let idle_exit = self
+                .idle_exit_timeout
+                .filter(|_| self.session.is_active() && !self.speaker.is_playing());
+            tokio::select! {
+                _ = self.session.changed() => {}
+                _ = self.enabled_rx.changed() => {}
+                Some(()) = self.reload_rx.recv() => { self.reload(); }
+                Some(target) = self.ptt_rx.recv() => {
+                    // A PTT overrides the disable pause (re-acquire + listen),
+                    // but never the session pause (privacy).
+                    if self.session.is_active() {
+                        tracing::info!("push-to-talk while disabled: re-acquiring the microphone");
+                        self.pending_ptt = Some(target);
+                        return true;
+                    }
+                    tracing::warn!(
+                        "push-to-talk ignored: session inactive (microphone released for privacy)"
+                    );
+                }
+                Some(_req) = self.stop_rx.recv() => { /* nothing capturing to stop */ }
+                _ = sleep_opt(idle_exit.map(|t| t.saturating_sub(paused_at.elapsed()))),
+                    if idle_exit.is_some() =>
+                {
+                    tracing::info!(
+                        "idle-exit: voice disabled and idle, exiting for on-demand activation"
+                    );
+                    return false;
+                }
+                else => return false,
+            }
+        }
+    }
+
     /// Start (or restart) capture, degrading on failure (#79): on `Err`, log an
     /// actionable message and drop into the degraded loop, which keeps the
     /// control channels (and thus the separate TTS/D-Bus tasks) serving until a
     /// reload makes capture available again or everything shuts down. Returns
     /// `None` when every control channel has closed (clean shutdown).
+    ///
+    /// Before opening the device it blocks until capture is allowed (logind
+    /// session active + enabled), so the mic is never opened in a switched-away
+    /// or disabled session (voice#103).
     async fn acquire_capture(&mut self) -> Option<mpsc::Receiver<Vec<f32>>> {
         loop {
+            if !self.capture_allowed() && !self.await_capture_allowed().await {
+                return None; // all control channels closed → clean shutdown
+            }
             match self.source.start() {
-                Ok(rx) => return Some(rx),
+                Ok(rx) => {
+                    self.set_capture_state(CaptureState::Capturing);
+                    return Some(rx);
+                }
                 Err(e) => {
                     tracing::error!(
                         "voice capture unavailable: {e} — speech output (SayText) and D-Bus stay \
@@ -843,6 +982,7 @@ where
                          A config device-name change needs a restart; a transient device return \
                          recovers on reload."
                     );
+                    self.set_capture_state(CaptureState::Unavailable);
                     // Degraded: stay alive, keep serving control channels, retry
                     // capture on reload.
                     if !self.await_capture_retry().await {
@@ -850,6 +990,35 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Release the mic and block until capture is allowed again, then re-acquire
+    /// it (voice#103). Called from the run loop when the session goes inactive or
+    /// voice is disabled. Stops any playback, drops to Idle, ends any in-flight
+    /// conversation, stops the source (so its `running` latch clears and the mic
+    /// is truly closed), then `acquire_capture()` — which waits until allowed.
+    /// Replaces `*audio_rx` with the fresh capture channel. Returns `false` only
+    /// if every control channel closed (clean shutdown).
+    async fn pause_and_reacquire(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) -> bool {
+        tracing::info!(reason = %self.pause_reason(), "releasing microphone (capture paused)");
+        let _ = self.speaker.stop();
+        if self.state != State::Idle {
+            self.apply(StateEvent::Stopped);
+        }
+        self.end_conversation();
+        self.endpointer.reset();
+        if let Err(e) = self.source.stop() {
+            tracing::warn!("source stop on capture pause failed: {e}");
+        }
+        self.set_capture_state(self.pause_reason());
+        match self.acquire_capture().await {
+            Some(rx) => {
+                *audio_rx = rx;
+                tracing::info!("microphone re-acquired (capture resumed)");
+                true
+            }
+            None => false,
         }
     }
 
@@ -875,7 +1044,40 @@ where
         let mut last_activity = Instant::now();
 
         loop {
+            // A PTT that re-acquired the mic from the disable pause (voice#103):
+            // enter Listening now that the device is back, so PTT works even with
+            // wake-word/voice disabled (#3).
+            if let Some(target) = self.pending_ptt.take()
+                && (self.state == State::Idle || self.state == State::Speaking)
+            {
+                last_activity = Instant::now();
+                self.enter_ptt_listening(target, &mut audio_rx).await;
+            }
             tokio::select! {
+                // Session/enable gate (voice#103): when the logind session goes
+                // inactive (fast user switch) or voice processing is disabled,
+                // release the mic at the source and block until capture is
+                // allowed again — cutting the whole pipeline (no audio → no wake
+                // → no STT/LLM/TTS), which fixes privacy and cost together. An
+                // inert gate's `changed()` never fires, so this arm is dormant
+                // when session gating is off. We `recv` the change here; the
+                // `borrow_and_update` inside `enabled_rx.changed()` and the
+                // session watch keep the predicate fresh.
+                _ = self.session.changed(), if self.session.is_enabled() => {
+                    if !self.capture_allowed()
+                        && !self.pause_and_reacquire(&mut audio_rx).await
+                    {
+                        break; // all control channels closed
+                    }
+                }
+                _ = self.enabled_rx.changed() => {
+                    if !self.capture_allowed()
+                        && !self.pause_and_reacquire(&mut audio_rx).await
+                    {
+                        break;
+                    }
+                }
+
                 // Push-to-talk: skip wake word, go to Listening. The payload is
                 // the target conversation: `None` uses the daemon's own
                 // session, `Some(id)` routes the utterance to that orchestrator
@@ -948,10 +1150,21 @@ where
                             None => break, // all control channels closed
                         }
                     };
-                    // `enabled` governs only always-on wake-word listening:
-                    // push-to-talk (and SayText) must work even when "Hey
-                    // Adele" is off, so the gate is scoped to the Idle state
-                    // rather than the whole handler (#3).
+                    // Once the session goes inactive the device is released by
+                    // the gate arm above, but a chunk queued before that arm
+                    // fires could still land here. Drop it outright so a
+                    // switched-away session never gets transcribed even for one
+                    // straggler chunk (voice#103). The gate arm will pause the
+                    // pipeline immediately after.
+                    if !self.session.is_active() {
+                        continue;
+                    }
+                    // Once disabled the device is released by the gate arm above,
+                    // so chunks stop flowing — but a chunk already queued before
+                    // that arm fires would still land here. This per-chunk guard
+                    // skips processing it (and runs the idle-exit fallback for the
+                    // brief window before the pause loop takes over) so a disabled
+                    // daemon never wakes on a straggler chunk (#3/#5/voice#103).
                     if self.state == State::Idle && !*self.enabled_rx.borrow() {
                         // Idle-exit (#5): with wake listening off and nothing
                         // playing, exit after the configured idle window so
@@ -2166,6 +2379,28 @@ mod tests {
         }
     }
 
+    /// A restartable source for the `spawn_pipeline` harness (voice#103): each
+    /// `start()` mints a fresh capture channel and publishes its sender into a
+    /// shared slot, so the test's `send_chunk` always writes to the *current*
+    /// capture channel — even after a pause/resume re-acquired a new one (the
+    /// device-release-on-disable / session-inactive path). `start()` after a
+    /// `stop()` succeeds (the prod cpal source clears its latch on stop too).
+    #[derive(Clone)]
+    struct RestartableSource {
+        current_tx: Arc<StdMutex<Option<mpsc::Sender<Vec<f32>>>>>,
+    }
+    impl AudioSource for RestartableSource {
+        fn start(&self) -> Result<mpsc::Receiver<Vec<f32>>, adele_voice_core::VoiceError> {
+            let (tx, rx) = mpsc::channel::<Vec<f32>>(64);
+            *self.current_tx.lock().unwrap() = Some(tx);
+            Ok(rx)
+        }
+        fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            *self.current_tx.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
     /// Records the length of every buffer it was asked to play, so a test can
     /// assert the listening cue (the ding earcon) was/wasn't queued. Also models
     /// a controllable "is playing" state and a stop counter so the PTT
@@ -2206,7 +2441,10 @@ mod tests {
     }
 
     struct Harness {
-        audio_tx: mpsc::Sender<Vec<f32>>,
+        /// The current capture channel's sender. `RestartableSource` re-publishes
+        /// it on every `start()`, so a test sending audio after a pause/resume
+        /// reaches the live channel (voice#103). `send_audio` reads it.
+        audio_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<f32>>>>>,
         ptt_tx: mpsc::Sender<Option<String>>,
         _enabled_tx: watch::Sender<bool>,
         stop_tx: mpsc::Sender<StopRequest>,
@@ -2242,6 +2480,31 @@ mod tests {
         /// chunks, then fire control events mid-stream.
         events_rx: mpsc::UnboundedReceiver<mpsc::UnboundedSender<AssistantEvent>>,
         handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Harness {
+        /// Send a raw audio buffer to the live capture channel. Awaits the
+        /// channel becoming available (the source may be momentarily re-acquiring
+        /// after a pause), so a test never races a transient gap.
+        async fn send_audio(&self, buf: Vec<f32>) {
+            for _ in 0..200 {
+                let tx = self.audio_slot.lock().unwrap().clone();
+                if let Some(tx) = tx
+                    && tx.send(buf.clone()).await.is_ok()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("no live capture channel to send audio to within 1s");
+        }
+
+        /// Best-effort non-blocking send to the live capture channel.
+        fn try_send_audio(&self, buf: Vec<f32>) {
+            if let Some(tx) = self.audio_slot.lock().unwrap().clone() {
+                let _ = tx.try_send(buf);
+            }
+        }
     }
 
     struct Cfg {
@@ -2943,7 +3206,11 @@ mod tests {
     }
 
     fn spawn_pipeline(cfg: Cfg) -> Harness {
-        let (audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(64);
+        let audio_slot: Arc<StdMutex<Option<mpsc::Sender<Vec<f32>>>>> =
+            Arc::new(StdMutex::new(None));
+        let source = RestartableSource {
+            current_tx: Arc::clone(&audio_slot),
+        };
         let (enabled_tx, enabled_rx) = watch::channel(cfg.enabled);
         let (ptt_tx, ptt_rx) = mpsc::channel(1);
         let (stop_tx, stop_rx) = mpsc::channel(1);
@@ -2997,9 +3264,7 @@ mod tests {
                 hold_turn: cfg.hold_turn,
                 subscribed_tx,
             },
-            Arc::new(FakeSource {
-                rx: StdMutex::new(Some(audio_rx)),
-            }),
+            Arc::new(source),
             Arc::new(sink),
             state_tx,
             enabled_rx,
@@ -3026,7 +3291,7 @@ mod tests {
             let _ = pipeline.run().await;
         });
         Harness {
-            audio_tx,
+            audio_slot,
             ptt_tx,
             _enabled_tx: enabled_tx,
             stop_tx,
@@ -3051,7 +3316,7 @@ mod tests {
     /// `process_utterance` energy gate. With a zero silence-duration, one speech
     /// chunk (VAD 0.9) then one silence chunk (VAD 0.0) closes the utterance.
     async fn send_chunk(h: &Harness) {
-        h.audio_tx.send(vec![0.1f32; 1000]).await.unwrap();
+        h.send_audio(vec![0.1f32; 1000]).await;
     }
 
     #[tokio::test]
@@ -3384,8 +3649,8 @@ mod tests {
         .unwrap();
 
         // VAD scripts this as speech-then-silence, but the samples are ~silent.
-        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
-        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+        h.send_audio(vec![0.0f32; 1000]).await;
+        h.send_audio(vec![0.0f32; 1000]).await;
 
         let got = tokio::time::timeout(Duration::from_millis(500), h.transcribe_rx.recv()).await;
         h.handle.abort();
@@ -3412,7 +3677,7 @@ mod tests {
         h.sink_playing.store(true, Ordering::SeqCst);
         h.sink_in_pad.store(true, Ordering::SeqCst);
 
-        h.audio_tx.send(vec![0.1f32; 1000]).await.unwrap();
+        h.send_audio(vec![0.1f32; 1000]).await;
         // Give the pipeline time to process the chunk.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(
@@ -3425,21 +3690,28 @@ mod tests {
 
     #[tokio::test]
     async fn wake_word_ignored_when_disabled() {
-        // Regression guard: an always-firing detector must not trigger
-        // Listening while wake-word listening is disabled.
+        // Regression guard: an always-firing detector must not trigger Listening
+        // while voice is disabled. Post-#103 "disabled" releases the device
+        // entirely (the mic-indicator-trust fix), so the detector gets no audio
+        // at all — a strictly stronger guarantee. State must stay Idle and the
+        // capture channel must be released (no live sender to send into).
         let h = spawn_pipeline(Cfg {
             enabled: false,
             wake_detects: true,
             ..Default::default()
         });
-        send_chunk(&h).await;
         tokio::time::sleep(Duration::from_millis(150)).await;
         let state = *h.state_rx.borrow();
+        let released = h.audio_slot.lock().unwrap().is_none();
         h.handle.abort();
         assert_eq!(
             state,
             State::Idle,
             "wake word must be ignored while disabled"
+        );
+        assert!(
+            released,
+            "disabling must release the capture device (mic indicator must go dark)"
         );
     }
 
@@ -3554,7 +3826,7 @@ mod tests {
         // they never reach the endpointer.
         const ECHO: f32 = 0.7;
         for _ in 0..3 {
-            h.audio_tx.send(vec![ECHO; 1000]).await.unwrap();
+            h.send_audio(vec![ECHO; 1000]).await;
         }
         // Give the drain a beat, then end the cue's playback.
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -3567,8 +3839,8 @@ mod tests {
 
         // Now the real user speaks (a different amplitude): one speech chunk then
         // silence closes the utterance and triggers transcription.
-        h.audio_tx.send(vec![0.3f32; 1000]).await.unwrap(); // VAD 0.9 -> speech
-        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap(); // VAD 0.0 -> silence
+        h.send_audio(vec![0.3f32; 1000]).await; // VAD 0.9 -> speech
+        h.send_audio(vec![0.0f32; 1000]).await; // VAD 0.0 -> silence
 
         // Transcription must run on the user's utterance...
         tokio::time::timeout(Duration::from_secs(2), h.transcribe_rx.recv())
@@ -3822,20 +4094,20 @@ mod tests {
 
     #[tokio::test]
     async fn idle_exits_when_wake_disabled_and_idle() {
-        // #5: with wake listening off and an idle-exit timeout configured, the
-        // daemon exits after the idle window so D-Bus activation can restart it.
+        // #5: with voice disabled and an idle-exit timeout configured, the daemon
+        // releases the mic (voice#103) and exits after the idle window so D-Bus
+        // activation can restart it on demand. Post-#103 idle-exit fires from the
+        // disable-pause wait once the window elapses — no chunk needed (the
+        // device is already released).
         let h = spawn_pipeline(Cfg {
             enabled: false,
             idle_exit_timeout: Some(Duration::from_millis(80)),
             ..Default::default()
         });
-        // Stay idle past the window, then one chunk trips the idle-exit check.
-        tokio::time::sleep(Duration::from_millis(120)).await;
-        h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
         let exited = tokio::time::timeout(Duration::from_secs(2), h.handle).await;
         assert!(
             exited.is_ok(),
-            "daemon should idle-exit when wake disabled and idle past the timeout"
+            "daemon should idle-exit when voice disabled and idle past the timeout"
         );
     }
 
@@ -3848,7 +4120,7 @@ mod tests {
             ..Default::default()
         });
         for _ in 0..5 {
-            h.audio_tx.send(vec![0.0f32; 1000]).await.unwrap();
+            h.send_audio(vec![0.0f32; 1000]).await;
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let exited = tokio::time::timeout(Duration::from_millis(100), h.handle).await;
@@ -4532,6 +4804,245 @@ mod tests {
         assert!(result.is_ok(), "degraded run() must end with Ok(())");
     }
 
+    // --- voice#103: logind session-active gating ----------------------------
+    //
+    // The privacy/cost fix: capture is gated on the session being active and
+    // voice being enabled. We inject the session-active state at the trait
+    // boundary (a `SessionGate` over a watch channel) and an `enabled` watch, so
+    // these exercise the real `run()` gating without a system D-Bus. A
+    // `CountingSource` counts `start()`/`stop()` so a test can prove the mic is
+    // (not) actually opened — the load-bearing privacy assertion.
+
+    /// A source that hands out a fresh capture channel on each `start()` and
+    /// counts `start`/`stop`, so a test can assert whether the mic was opened.
+    struct CountingSource {
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+        txs: StdMutex<Vec<mpsc::Sender<Vec<f32>>>>,
+    }
+    impl AudioSource for CountingSource {
+        fn start(&self) -> Result<mpsc::Receiver<Vec<f32>>, adele_voice_core::VoiceError> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel::<Vec<f32>>(64);
+            self.txs.lock().unwrap().push(tx);
+            Ok(rx)
+        }
+        fn stop(&self) -> Result<(), adele_voice_core::VoiceError> {
+            self.stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct SessionHarness {
+        session_tx: watch::Sender<bool>,
+        enabled_tx: watch::Sender<bool>,
+        capture_state_rx: watch::Receiver<CaptureState>,
+        starts: Arc<std::sync::atomic::AtomicUsize>,
+        stops: Arc<std::sync::atomic::AtomicUsize>,
+        handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    }
+
+    /// Spawn `run()` with an injected session gate. `gate_enabled = false` makes
+    /// the gate inert (models logind absent / config opt-out); otherwise the gate
+    /// follows `initial_active`. `enabled` seeds the voice-enabled watch.
+    fn spawn_session_harness(
+        gate_enabled: bool,
+        initial_active: bool,
+        enabled: bool,
+    ) -> SessionHarness {
+        let (session_tx, session_rx) = watch::channel(initial_active);
+        let gate = if gate_enabled {
+            SessionGate::watching(session_rx)
+        } else {
+            SessionGate::inert()
+        };
+        let (enabled_tx, enabled_rx) = watch::channel(enabled);
+        let (_ptt_tx, ptt_rx) = mpsc::channel(1);
+        let (_stop_tx, stop_rx) = mpsc::channel(1);
+        let (state_tx, _state_rx) = watch::channel(State::Idle);
+        let (capture_state_tx, capture_state_rx) = watch::channel(CaptureState::Capturing);
+        let (hit_tx, _transcribe_rx) = mpsc::unbounded_channel();
+        let (prompt_tx, _prompt_rx) = mpsc::unbounded_channel();
+        let (created_tx, _created_rx) = mpsc::unbounded_channel();
+        let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
+        let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
+        let (_reload_tx, reload_rx) = mpsc::channel(4);
+        let wake_builder: WakeBuilder<FakeWake> =
+            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pipeline = Pipeline::new(
+            FakeWake { detects: false },
+            FakeVad {
+                probs: StdMutex::new(VecDeque::new()),
+            },
+            FakeStt {
+                hit: hit_tx,
+                text: "hello".to_string(),
+                captured: Arc::new(StdMutex::new(Vec::new())),
+            },
+            FakeTts,
+            FakeAssistant {
+                tx: StdMutex::new(None),
+                prompt_tx,
+                created_tx,
+                registered_tx,
+                tool_result_tx,
+                inject_tool_call: None,
+                fail: false,
+                hold_turn: false,
+                subscribed_tx: mpsc::unbounded_channel().0,
+            },
+            Arc::new(CountingSource {
+                starts: Arc::clone(&starts),
+                stops: Arc::clone(&stops),
+                txs: StdMutex::new(Vec::new()),
+            }),
+            Arc::new(FakeSink::default()),
+            state_tx,
+            enabled_rx,
+            ptt_rx,
+            stop_rx,
+            reload_rx,
+            wake_builder,
+            PipelineConfig {
+                tunables: test_tunables(),
+                conversation_title: "test".to_string(),
+                silence_duration: Duration::from_millis(0),
+                speech_threshold: 0.5,
+                conversation_mode: false,
+                conversation_reuse_window: Duration::from_secs(600),
+                followup_timeout: Duration::from_millis(50),
+                idle_exit_timeout: None,
+                spoken_response_hint: String::new(),
+                listening_cue: ListeningCue::Off,
+                timeouts: test_timeouts(),
+                client_tools: ClientToolsConfig::default(),
+            },
+        )
+        .with_session_gate(gate)
+        .with_capture_state(capture_state_tx);
+        let handle = tokio::spawn(pipeline.run());
+        SessionHarness {
+            session_tx,
+            enabled_tx,
+            capture_state_rx,
+            starts,
+            stops,
+            handle,
+        }
+    }
+
+    /// Poll a `CaptureState` watch until it equals `want` (or fail after 2s).
+    async fn wait_capture_state(rx: &mut watch::Receiver<CaptureState>, want: CaptureState) {
+        if tokio::time::timeout(Duration::from_secs(2), rx.wait_for(|s| *s == want))
+            .await
+            .is_err()
+        {
+            panic!("expected capture state {want}, got {}", *rx.borrow());
+        }
+    }
+
+    #[tokio::test]
+    async fn inactive_session_never_opens_the_mic() {
+        // Session inactive at startup => the device must NOT be opened at all
+        // (no audio => no wake/STT/LLM/TTS). The privacy/cost fix in one assert.
+        let mut h = spawn_session_harness(true, false, true);
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::PausedSessionInactive).await;
+        // Give it a beat to (wrongly) call start() if the gate were broken.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            h.starts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "mic must never be opened while the session is inactive"
+        );
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn active_session_opens_the_mic() {
+        // Session active + enabled => the mic opens and capture state is Capturing.
+        let h = spawn_session_harness(true, true, true);
+        wait_for_count(&h.starts, 1, "mic must open when active+enabled").await;
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn session_going_inactive_releases_the_mic() {
+        // Active → inactive must stop the source (release the mic) and report
+        // PausedSessionInactive; flipping back resumes capture.
+        let mut h = spawn_session_harness(true, true, true);
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::Capturing).await;
+        wait_for_count(&h.starts, 1, "initial start").await;
+
+        h.session_tx.send(false).unwrap();
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::PausedSessionInactive).await;
+        wait_for_count(&h.stops, 1, "stop on session inactive").await;
+
+        h.session_tx.send(true).unwrap();
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::Capturing).await;
+        assert!(
+            h.starts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "capture must resume (re-start) when the session goes active again"
+        );
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_enabled_false_releases_the_device() {
+        // The hygiene fix: SetEnabled(false) must release the device (stop the
+        // source), not merely mute wake detection — the mic indicator must go
+        // dark. Re-enabling re-acquires.
+        let mut h = spawn_session_harness(true, true, true);
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::Capturing).await;
+        wait_for_count(&h.starts, 1, "initial start").await;
+
+        h.enabled_tx.send(false).unwrap();
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::PausedDisabled).await;
+        wait_for_count(&h.stops, 1, "stop on disable").await;
+
+        h.enabled_tx.send(true).unwrap();
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::Capturing).await;
+        assert!(
+            h.starts.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "re-enabling must re-acquire the device"
+        );
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn logind_absent_does_not_gate_capture() {
+        // State 1 (capability absent / config opt-out): the gate is inert, so
+        // capture proceeds normally and is NEVER paused — the explicit
+        // correction to the issue's "unknown => inactive" wording, which would
+        // have left a headless box's mic shut forever.
+        let h = spawn_session_harness(false, false, true);
+        wait_for_count(
+            &h.starts,
+            1,
+            "an inert gate must let capture proceed (do not fail-closed when logind is absent)",
+        )
+        .await;
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn anomalous_state_errs_toward_not_capturing() {
+        // State 3 (present-but-anomalous): the watcher publishes `false` on a
+        // mid-flight read/watch failure (privacy-first). A gate seeded false
+        // models that — the mic stays closed.
+        let mut h = spawn_session_harness(true, false, true);
+        wait_capture_state(&mut h.capture_state_rx, CaptureState::PausedSessionInactive).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            h.starts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an anomalous/indeterminate session (gate value false) must not open the mic"
+        );
+        h.handle.abort();
+    }
+
     // --- V-1: capture-thread death AFTER a successful start ------------------
     //
     // The #79 degraded loop only guarded the *initial* start(). If the capture
@@ -4762,7 +5273,7 @@ mod tests {
         enter_speaking(&h, &events).await;
 
         // A loud chunk while playing = barge-in.
-        h.audio_tx.send(vec![0.2f32; 1000]).await.unwrap();
+        h.send_audio(vec![0.2f32; 1000]).await;
         wait_state(&h, State::Listening, "barge-in mid-stream").await;
         assert!(
             h.sink_stopped.load(std::sync::atomic::Ordering::SeqCst) >= 1,
@@ -4842,7 +5353,7 @@ mod tests {
         let events = start_held_turn(&mut h).await;
         // Stay in Processing (nothing playing). Flood low-VAD chunks.
         for _ in 0..20 {
-            let _ = h.audio_tx.try_send(vec![0.0f32; 1000]);
+            h.try_send_audio(vec![0.0f32; 1000]);
         }
         // No barge-in: still Processing.
         let mut listen_rx = h.state_rx.clone();

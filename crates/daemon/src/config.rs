@@ -99,6 +99,14 @@ pub struct WakeWordConfig {
     /// value falls back to the default instead of failing the whole parse.
     #[serde(deserialize_with = "deserialize_listening_cue")]
     pub listening_cue: ListeningCue,
+    /// Pause capture (release the mic) when the logind session goes inactive —
+    /// e.g. on fast-user-switch — so the daemon doesn't keep recording the
+    /// foreground user (privacy + cloud-pipeline cost + device contention)
+    /// (voice#103). Default `true`. Set `false` for multi-seat / system-service
+    /// deployments where session-active tracking isn't meaningful. When logind
+    /// isn't present at all (headless/container/non-systemd) the gate is inert
+    /// regardless and capture proceeds as before.
+    pub pause_on_session_inactive: bool,
 }
 
 /// How the daemon announces that it has started Listening (#51).
@@ -213,6 +221,7 @@ impl Default for WakeWordConfig {
             sensitivity: 0.5,
             eager: true,
             listening_cue: ListeningCue::Ding,
+            pause_on_session_inactive: true,
         }
     }
 }
@@ -474,6 +483,27 @@ mod tests {
             config.listening_cue,
             ListeningCue::Ding,
             "the ding earcon is the default Listening cue (#51)"
+        );
+        assert!(
+            config.pause_on_session_inactive,
+            "session gating is on by default (voice#103)"
+        );
+    }
+
+    #[test]
+    fn parses_pause_on_session_inactive_opt_out() {
+        // voice#103: the privacy gate can be turned off for multi-seat / system
+        // deployments; the knob round-trips from TOML.
+        let config: Config = toml::from_str(
+            r#"
+[wake_word]
+pause_on_session_inactive = false
+"#,
+        )
+        .expect("config with the opt-out parses");
+        assert!(
+            !config.wake_word.pause_on_session_inactive,
+            "pause_on_session_inactive=false must be honoured"
         );
     }
 
