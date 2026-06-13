@@ -20,13 +20,22 @@
 lutils = require ("linking-utils")
 log = Log.open_topic ("s-linking")
 
--- True when this stream belongs to Adele (the daemon or an embedding client).
--- Matches on any identity prop carrying the "adele" binary stem, so it covers
--- adele-voice / adele-gtk / adele-tui without enumerating each.
+-- True when this stream is an Adele *client* (the daemon or an embedding app:
+-- adele-voice / adele-gtk / adele-tui), matched by its "adele-" binary stem.
+--
+-- CRITICAL: must NOT match the echo-canceller's own internal nodes
+-- (adele.ec.capture / adele.ec.playback / adele_ec_source / adele_ec_sink) —
+-- routing those back through the EC source starves it of the real-mic feed and
+-- Adele captures silence. We exclude them explicitly, then match the hyphenated
+-- client stem (the EC nodes use a dot/underscore, never "adele-").
 local function is_adele (props)
+  local node = props ["node.name"] or ""
+  if string.find (node, "adele.ec", 1, true) or string.find (node, "adele_ec", 1, true) then
+    return false
+  end
   for _, key in ipairs ({ "application.process.binary", "node.name", "application.name" }) do
     local v = props [key]
-    if v and string.find (string.lower (v), "adele", 1, true) then
+    if v and string.find (string.lower (v), "adele-", 1, true) then
       return true
     end
   end
