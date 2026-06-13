@@ -484,6 +484,34 @@ fn check_setup(config: &config::Config) {
         "Fallback policy: if the configured backend can't initialize it falls back to a LOCAL"
     );
     println!("backend (Piper) — never to a billable cloud backend automatically.");
+
+    // Acoustic echo cancellation (Linux/PipeWire). Best-effort capability probe:
+    // ask the PipeWire pulse layer whether the echo-cancel virtual source exists.
+    // Absent isn't an error — Adele just runs half-duplex (mic barge-in off).
+    println!("\nEcho cancellation (PipeWire, Linux):");
+    let ec_present = std::process::Command::new("pactl")
+        .args(["list", "sources", "short"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("adele_ec_source"));
+    match ec_present {
+        Some(true) => println!(
+            "  [ok  ] echo-cancel node present (adele_ec_source) — run `just install-aec` already done"
+        ),
+        Some(false) => println!(
+            "  [--  ] no echo-cancel node — run `just install-aec` to enable full-duplex barge-in"
+        ),
+        None => println!("  [--  ] couldn't probe (pactl unavailable) — PipeWire/Linux only"),
+    }
+    println!(
+        "  mic barge-in: {}  (needs echo cancellation; otherwise Adele hears herself)",
+        if config.audio.mic_barge_in {
+            "ON"
+        } else {
+            "off"
+        }
+    );
 }
 
 #[cfg(test)]
