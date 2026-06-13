@@ -70,6 +70,10 @@ pub struct TurnTimeouts {
     /// most once and never once any status/chunk has arrived. `Duration::ZERO`
     /// disables.
     pub liveness_delay: Duration,
+    /// Mid-sentence quiet window before the narration buffer flushes a clause to
+    /// TTS. `Duration::ZERO` disables timeout flushing (speak only at sentence
+    /// ends and end-of-stream).
+    pub narration_flush: Duration,
 }
 
 /// The non-wiring configuration for a [`Pipeline`], grouped so `Pipeline::new`
@@ -374,6 +378,9 @@ where
     /// narration and no reply yet (a slow turn that declared no step). Fires at
     /// most once; `Duration::ZERO` disables.
     liveness_delay: Duration,
+    /// Mid-sentence quiet window before the narration buffer flushes a clause to
+    /// TTS. `Duration::ZERO` disables timeout flushing.
+    narration_flush: Duration,
     /// Bound on each conversation create / subscribe / send round-trip (#58).
     /// `Duration::ZERO` disables.
     connect_timeout: Duration,
@@ -481,6 +488,7 @@ where
             turn_budget: timeouts.turn_budget,
             status_narration_min_gap: timeouts.status_narration_min_gap,
             liveness_delay: timeouts.liveness_delay,
+            narration_flush: timeouts.narration_flush,
             connect_timeout: timeouts.connect,
             client_tools,
             session_end_requested: false,
@@ -804,6 +812,13 @@ where
             tracing::info!(
                 status_narration_min_gap_ms = ms,
                 "config reload: applied timeouts.status_narration_min_gap_ms"
+            );
+        }
+        if let Some(ms) = plan.set_narration_flush_ms {
+            self.narration_flush = Duration::from_millis(ms);
+            tracing::info!(
+                narration_flush_ms = ms,
+                "config reload: applied timeouts.narration_flush_ms"
             );
         }
         if let Some(sensitivity) = plan.rebuild_wake_sensitivity {
@@ -1656,7 +1671,13 @@ where
         // loop awaits — and so the paused-time test clock advances them too.
         use tokio::time::Instant as TokioInstant;
 
-        let mut sentence_buf = SentenceBuffer::new(Duration::from_millis(500));
+        // Mid-sentence quiet window before the buffer flushes a settled clause
+        // (config; 0 disables timeout flushing). End-of-stream still flushes the
+        // tail immediately via the Complete/Error/closed arms below, so this
+        // only governs a genuine inter-token stall — keeping it generous avoids
+        // chopping a normally-paced sentence into separate synth units.
+        let mut sentence_buf = SentenceBuffer::new(self.narration_flush);
+        let flush_ticks = !self.narration_flush.is_zero();
         let mut first_chunk = true;
         // Status narration rate-limit (#58): the first status always speaks;
         // later ones speak only after `status_narration_min_gap` has elapsed.
@@ -1866,8 +1887,9 @@ where
                     self.reload();
                 }
 
-                // Check for timeout flush while waiting for chunks
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                // Check for timeout flush while waiting for chunks. The tick
+                // only needs to run when timeout flushing is enabled.
+                _ = tokio::time::sleep(Duration::from_millis(100)), if flush_ticks => {
                     if let Some(sentence) = sentence_buf.flush_if_timeout() {
                         self.speak_reply(&sentence).await?;
                     }
@@ -2577,6 +2599,7 @@ mod tests {
             response_stall_ms: 0,
             turn_budget_ms: 0,
             status_narration_min_gap_ms: 0,
+            narration_flush_ms: 0,
             input_device: "default".into(),
             output_device: "default".into(),
         }
@@ -2593,6 +2616,9 @@ mod tests {
             connect: Duration::ZERO,
             status_narration_min_gap: Duration::ZERO,
             liveness_delay: Duration::ZERO,
+            // The narration timeout flush was previously hardcoded to 500 ms;
+            // keep that here so the streaming tests exercise it as before.
+            narration_flush: Duration::from_millis(500),
         }
     }
 

@@ -56,6 +56,15 @@ pub struct TimeoutConfig {
     /// always-on filler. Never fires once any status or chunk has arrived, and
     /// fires at most once per turn. 0 disables. (Takes effect on restart.)
     pub narration_liveness_delay_ms: u64,
+    /// How long the streamed reply may go quiet mid-sentence before the
+    /// sentence buffer flushes what it has to TTS. The flush cuts at a clause
+    /// boundary (comma/dash/…), so this only governs a genuine inter-token
+    /// stall — not the end of the reply, which is flushed immediately. Too low
+    /// and a normal pause between tokens chops a sentence into separately
+    /// synthesized fragments (stilted prosody); too high and a truly slow turn
+    /// holds spoken-ready text longer. 0 disables timeout flushing entirely
+    /// (the buffer then speaks only at sentence ends and at end-of-stream).
+    pub narration_flush_ms: u64,
 }
 
 impl Default for TimeoutConfig {
@@ -78,6 +87,11 @@ impl Default for TimeoutConfig {
             // declared step) never trips it, short enough to reassure on a
             // genuinely slow turn that declared no step.
             narration_liveness_delay_ms: 4_000,
+            // ~1.5 s: comfortably longer than the gap between tokens on a
+            // healthy stream (so a normal sentence assembles and is spoken
+            // whole), short enough that a real stall doesn't leave
+            // already-settled clauses unspoken for long.
+            narration_flush_ms: 1_500,
         }
     }
 }
@@ -330,6 +344,9 @@ pub struct Tunables {
     /// Minimum gap between spoken status narrations (#58). Hot-swapped on the
     /// pipeline (affects the next turn).
     pub status_narration_min_gap_ms: u64,
+    /// Mid-sentence quiet window before the narration buffer flushes a clause to
+    /// TTS. Hot-swapped on the pipeline (affects the next turn). 0 disables.
+    pub narration_flush_ms: u64,
     /// Changing either device requires restarting the capture/playback stream,
     /// which we do not do live — the daemon logs "restart required" instead.
     pub input_device: String,
@@ -350,6 +367,7 @@ impl Config {
             response_stall_ms: self.timeouts.response_stall_ms,
             turn_budget_ms: self.timeouts.turn_budget_ms,
             status_narration_min_gap_ms: self.timeouts.status_narration_min_gap_ms,
+            narration_flush_ms: self.timeouts.narration_flush_ms,
             input_device: self.audio.input_device.clone(),
             output_device: self.audio.output_device.clone(),
         }
@@ -380,6 +398,8 @@ pub struct ReloadPlan {
     pub set_turn_budget_ms: Option<u64>,
     /// Update the pipeline's status-narration min gap (#58).
     pub set_status_narration_min_gap_ms: Option<u64>,
+    /// Update the pipeline's mid-sentence narration-flush window (0 disables).
+    pub set_narration_flush_ms: Option<u64>,
     /// Rebuild the wake detector at this sensitivity.
     pub rebuild_wake_sensitivity: Option<f32>,
     /// A device changed; the capture/playback stream would need a restart, which
@@ -431,6 +451,9 @@ pub fn plan_reload(old: &Tunables, new: &Tunables) -> ReloadPlan {
     }
     if old.status_narration_min_gap_ms != new.status_narration_min_gap_ms {
         plan.set_status_narration_min_gap_ms = Some(new.status_narration_min_gap_ms);
+    }
+    if old.narration_flush_ms != new.narration_flush_ms {
+        plan.set_narration_flush_ms = Some(new.narration_flush_ms);
     }
     if old.wake_sensitivity != new.wake_sensitivity {
         plan.rebuild_wake_sensitivity = Some(new.wake_sensitivity);
@@ -650,6 +673,10 @@ speech_threshold = 0.7
         let d = TimeoutConfig::default();
         assert!(d.response_stall_ms > 0 && d.turn_budget_ms > d.response_stall_ms);
         assert!(d.stt_ms > 0 && d.tts_ms > 0 && d.connect_ms > 0);
+        // The narration flush window defaults to something comfortably longer
+        // than the gap between tokens on a healthy stream, so a normal sentence
+        // assembles whole rather than being chopped into separate synth units.
+        assert!(d.narration_flush_ms >= 1_000);
 
         let cfg: Config = toml::from_str(
             r#"
@@ -678,6 +705,7 @@ stt_ms = 0
             response_stall_ms: old.response_stall_ms + 1000,
             turn_budget_ms: old.turn_budget_ms + 10_000,
             status_narration_min_gap_ms: old.status_narration_min_gap_ms + 5000,
+            narration_flush_ms: old.narration_flush_ms + 500,
             ..old.clone()
         };
         let plan = plan_reload(&old, &new);
@@ -687,6 +715,7 @@ stt_ms = 0
             plan.set_status_narration_min_gap_ms,
             Some(new.status_narration_min_gap_ms)
         );
+        assert_eq!(plan.set_narration_flush_ms, Some(new.narration_flush_ms));
         assert_eq!(plan.rebuild_wake_sensitivity, None);
     }
 
