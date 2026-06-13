@@ -18,3 +18,6 @@ zbus.workspace = true
 zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
 futures-util = "0.3"
+
+[lints]
+workspace = true

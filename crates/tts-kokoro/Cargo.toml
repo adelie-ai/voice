@@ -9,3 +9,6 @@ adele-voice-core = { workspace = true }
 ort = "2.0.0-rc.12"
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[lints]
+workspace = true

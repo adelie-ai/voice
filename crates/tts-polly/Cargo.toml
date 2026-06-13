@@ -14,3 +14,6 @@ tracing = { workspace = true }
 # are off, so credentials come from env vars, a static/STS profile, or IMDS.
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 aws-sdk-polly = { version = "1", default-features = false, features = ["behavior-version-latest", "http-1x", "default-https-client", "rt-tokio"] }
+
+[lints]
+workspace = true

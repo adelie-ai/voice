@@ -7,3 +7,6 @@ description = "Shared client-side voice-output plumbing (the Adele output level,
 
 [dependencies]
 adele-voice-core.workspace = true
+
+[lints]
+workspace = true

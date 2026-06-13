@@ -13,3 +13,6 @@ tracing.workspace = true
 # Pin half to avoid rand 0.8/0.9 conflict in candle-core
 [dependencies.half]
 version = ">=2.1, <2.5"
+
+[lints]
+workspace = true

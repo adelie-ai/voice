@@ -9,3 +9,6 @@ adele-voice-core.workspace = true
 anyhow.workspace = true
 tokio = { workspace = true, features = ["process", "io-util"] }
 tracing.workspace = true
+
+[lints]
+workspace = true

@@ -11,3 +11,6 @@ whisper-rs = "0.16"
 tracing.workspace = true
 # `rt` for spawn_blocking and `time` for the per-decode timeout (#58).
 tokio = { workspace = true }
+
+[lints]
+workspace = true

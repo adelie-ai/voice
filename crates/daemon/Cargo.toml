@@ -35,3 +35,6 @@ zbus.workspace = true
 # `test-util` enables the paused-time test clock (#58) so the heartbeat / stall
 # / budget tests run instantly instead of waiting out real timeouts.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

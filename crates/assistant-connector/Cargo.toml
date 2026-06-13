@@ -33,3 +33,6 @@ desktop-assistant-auth-jwt = { path = "../../../desktop-assistant/crates/auth-jw
 async-trait = "0.1"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
