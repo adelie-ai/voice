@@ -217,6 +217,7 @@ async fn main() -> Result<()> {
             conversation_title: config.assistant.conversation_title,
             silence_duration: Duration::from_millis(config.vad.silence_duration_ms),
             speech_threshold: config.vad.speech_threshold,
+            mic_barge_in: config.audio.mic_barge_in,
             conversation_mode: config.assistant.conversation_mode,
             conversation_reuse_window: Duration::from_millis(
                 config.assistant.conversation_reuse_window_ms,

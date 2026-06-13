@@ -93,6 +93,9 @@ pub struct PipelineConfig {
     pub silence_duration: Duration,
     /// VAD speech-probability threshold.
     pub speech_threshold: f32,
+    /// Allow mic speech to interrupt Adele's playback (barge-in, voice#82).
+    /// OFF unless echo cancellation is in place — see [`AudioConfig`].
+    pub mic_barge_in: bool,
     /// Keep the mic open for follow-up turns after a reply.
     pub conversation_mode: bool,
     /// Window within which a fresh wake reuses the recent conversation (voice#53).
@@ -377,6 +380,9 @@ where
     ptt_conversation_override: Option<String>,
     conversation_title: String,
     speech_threshold: f32,
+    /// Allow mic speech to interrupt playback (barge-in). False unless AEC is in
+    /// place — otherwise Adele barges in on her own echo (see [`AudioConfig`]).
+    mic_barge_in: bool,
     conversation_mode: bool,
     /// Cross-wake conversation reuse window (voice#53): on a fresh wake within
     /// this window of the last turn's activity, the daemon's own session is
@@ -469,6 +475,7 @@ where
             conversation_title,
             silence_duration,
             speech_threshold,
+            mic_barge_in,
             conversation_mode,
             conversation_reuse_window,
             followup_timeout,
@@ -504,6 +511,7 @@ where
             ptt_conversation_override: None,
             conversation_title,
             speech_threshold,
+            mic_barge_in,
             conversation_mode,
             conversation_reuse_window,
             last_own_activity: None,
@@ -1897,7 +1905,14 @@ where
                 chunk = audio_rx.recv(), if audio_alive => {
                     match chunk {
                         Some(chunk) => {
-                            if self.speaker.is_playing() {
+                            // Barge-in is OFF by default: without echo cancellation
+                            // the mic hears Adele's own playback, the VAD scores it
+                            // as speech, and she "interrupts" herself — clipping the
+                            // reply mid-word and looping on the echo. Only run the
+                            // detector when mic barge-in is explicitly enabled (i.e.
+                            // AEC is in place). Otherwise discard the chunk so the
+                            // channel doesn't back up; stop/PTT/D-Bus still interrupt.
+                            if self.mic_barge_in && self.speaker.is_playing() {
                                 let prob = self.vad.speech_probability(&chunk)?;
                                 if prob >= self.speech_threshold {
                                     tracing::info!(prob, "barge-in during streamed playback (voice#82)");
@@ -1905,8 +1920,8 @@ where
                                     break StreamEnd::BargedIn(chunk);
                                 }
                             }
-                            // Not playing, or below threshold: ignore — don't let
-                            // the channel back up.
+                            // Barge-in disabled, not playing, or below threshold:
+                            // ignore — don't let the channel back up.
                         }
                         None => {
                             tracing::warn!(
@@ -2641,6 +2656,10 @@ mod tests {
         client_tools: ClientToolsConfig,
         /// Hold each turn open so the test drives the signal stream (voice#82).
         hold_turn: bool,
+        /// Allow mic speech to interrupt playback (barge-in). Defaults true here
+        /// so the existing barge-in tests keep exercising it; production defaults
+        /// false (no AEC). A dedicated test opts out to assert the gate.
+        mic_barge_in: bool,
         /// When set, the harness TTS reports its synthesized audio as *playing*
         /// (one sample queued, `is_playing` flipped true) — so a test can model a
         /// spoken listening-cue actually sounding and assert its echo is drained
@@ -2671,6 +2690,7 @@ mod tests {
                 client_tools: ClientToolsConfig::default(),
                 hold_turn: false,
                 cue_plays_audio: false,
+                mic_barge_in: true,
             }
         }
     }
@@ -2801,6 +2821,7 @@ mod tests {
                 conversation_title: "test".to_string(),
                 silence_duration: Duration::from_millis(0),
                 speech_threshold: 0.5,
+                mic_barge_in: true,
                 conversation_mode: false,
                 conversation_reuse_window: reuse_window,
                 followup_timeout: Duration::from_millis(50),
@@ -2884,6 +2905,7 @@ mod tests {
                 conversation_title: "test".to_string(),
                 silence_duration: Duration::from_millis(0),
                 speech_threshold: 0.5,
+                mic_barge_in: true,
                 conversation_mode: false,
                 // Matches test_tunables() so an initial reload is a no-op.
                 conversation_reuse_window: Duration::from_millis(600_000),
@@ -3447,6 +3469,7 @@ mod tests {
                 conversation_title: "test".to_string(),
                 silence_duration: Duration::from_millis(0),
                 speech_threshold: 0.5,
+                mic_barge_in: cfg.mic_barge_in,
                 conversation_mode: cfg.conversation_mode,
                 conversation_reuse_window: cfg.conversation_reuse_window,
                 followup_timeout: cfg.followup_timeout,
@@ -4852,6 +4875,7 @@ mod tests {
                 conversation_title: "test".to_string(),
                 silence_duration: Duration::from_millis(0),
                 speech_threshold: 0.5,
+                mic_barge_in: true,
                 conversation_mode: false,
                 conversation_reuse_window: Duration::from_secs(600),
                 followup_timeout: Duration::from_millis(50),
@@ -5081,6 +5105,7 @@ mod tests {
                 conversation_title: "test".to_string(),
                 silence_duration: Duration::from_millis(0),
                 speech_threshold: 0.5,
+                mic_barge_in: true,
                 conversation_mode: false,
                 conversation_reuse_window: Duration::from_secs(600),
                 followup_timeout: Duration::from_millis(50),
@@ -5448,6 +5473,38 @@ mod tests {
         assert!(
             h.sink_stopped.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "barge-in must stop the sink"
+        );
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn mic_barge_in_disabled_does_not_interrupt_playback() {
+        // Regression guard for the echo-clip loop: with mic barge-in OFF (the
+        // default, no AEC), a loud chunk while Adele is speaking must NOT stop
+        // the sink or leave Speaking — otherwise she clips her own "One moment."
+        // on her own echo and loops. Mirrors the barge-in test but gated off.
+        let mut h = spawn_pipeline(Cfg {
+            hold_turn: true,
+            mic_barge_in: false,
+            vad: vec![0.9, 0.0, 0.95],
+            ..Default::default()
+        });
+        let events = start_held_turn(&mut h).await;
+        enter_speaking(&h, &events).await;
+
+        // A loud chunk while playing would be a barge-in if enabled.
+        h.send_audio(vec![0.2f32; 1000]).await;
+        // Give the audio arm time to process (and prove it does nothing).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            h.sink_stopped.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "with mic barge-in disabled, playback must not be stopped by speech"
+        );
+        assert_eq!(
+            *h.state_rx.borrow(),
+            State::Speaking,
+            "with mic barge-in disabled, the turn must stay in Speaking"
         );
         h.handle.abort();
     }
