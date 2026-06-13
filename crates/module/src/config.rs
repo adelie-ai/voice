@@ -11,6 +11,13 @@ use std::path::PathBuf;
 pub struct AudioConfig {
     pub input_device: String,
     pub output_device: String,
+    /// Let speech detected *while Adele is speaking* interrupt her playback
+    /// ("barge-in", voice#82). Requires acoustic echo cancellation to be safe:
+    /// without it the mic hears Adele's own voice through the speakers, which
+    /// the VAD can't distinguish from yours, so she interrupts (and re-records)
+    /// herself — clipping her replies and looping. Defaults OFF until AEC is in
+    /// place; you still interrupt via the stop button / push-to-talk / D-Bus.
+    pub mic_barge_in: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -64,6 +71,7 @@ impl Default for AudioConfig {
         Self {
             input_device: "default".into(),
             output_device: "default".into(),
+            mic_barge_in: false,
         }
     }
 }

@@ -21,7 +21,7 @@ The pipeline is a small state machine, and the microphone is treated very differ
 | **Idle** | Local wake-word scanning only — each frame is fed to the on-device "Hey Adele" detector and immediately discarded | nowhere; never leaves RAM |
 | **Listening** | Capturing your utterance (entered via the wake word **or** push-to-talk) | buffered locally for transcription |
 | **Processing** | Mic input ignored | — |
-| **Speaking** | Monitored only for *barge-in* so you can interrupt the reply | nowhere |
+| **Speaking** | Mic ignored by default; monitored for *barge-in* only when `audio.mic_barge_in` is on (needs echo cancellation) | nowhere |
 
 **Captured audio never leaves your machine, in any state.** Speech *recognition* is always local. Speech *synthesis* is local by default (Kokoro or Piper); the only way any voice data leaves the machine is if you **opt into the AWS Polly TTS backend**, which sends the assistant's *reply text* (never your microphone audio) to AWS for synthesis — see [Text-to-speech backends](#text-to-speech-backends).
 
@@ -154,6 +154,7 @@ Tuning knobs in `~/.config/adele-voice/config.toml` take effect **without a serv
 | `timeouts.narration_flush_ms` | hot-applied (next turn) — mid-sentence quiet window before a settled clause is flushed to TTS (0 disables) |
 | `wake_word.sensitivity` | wake detector **rebuilt** (rustpotter bakes the threshold in at construction) |
 | `audio.input_device` / `audio.output_device` | **restart required** — the capture/playback stream isn't swapped live; the daemon logs a clear "restart required" note and applies every other changed knob |
+| `audio.mic_barge_in` | **restart required** — interrupt the reply by speaking. **Off by default**: without acoustic echo cancellation the mic hears Adele's own voice and she barges in on herself (clipping replies, looping). Turn on only with AEC in place; you can always interrupt via the stop control / push-to-talk / D-Bus |
 
 Everything else (model paths, STT/TTS backend & voice, the orchestrator transport, and the `timeouts.stt_ms` / `timeouts.tts_ms` / `timeouts.connect_ms` bounds — baked into the STT/TTS/connector at startup) still needs a restart; those rebuild expensive sessions or reconnect a socket. The TTS voice is the exception: switch it live via `SetVoice` (above).
 
