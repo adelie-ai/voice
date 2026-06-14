@@ -23,8 +23,10 @@
 //! would instead force the orchestrator daemon (which also links `client-common`)
 //! to take a dependency on the whole voice stack.
 
+#[cfg(feature = "chunker")]
 use std::time::Duration;
 
+#[cfg(feature = "chunker")]
 use adele_voice_core::sentence_buffer::SentenceBuffer;
 
 /// The three-way voice-**output** level for a conversation, exposed by the
@@ -151,6 +153,10 @@ pub const ALWAYS_SYSTEM_REFINEMENT: &str = "This reply will be read aloud in ful
 ///
 /// The timeout passed to the buffer is irrelevant here: this is a synchronous,
 /// one-shot push/flush with no streaming, so the time-based flush never fires.
+///
+/// Behind the default `chunker` feature — it pulls in `adele-voice-core`. wasm
+/// consumers that only need [`AdeleOutput`] build with `default-features = false`.
+#[cfg(feature = "chunker")]
 pub fn into_speakable_sentences(text: &str) -> Vec<String> {
     // Timeout is unused on this synchronous push→flush path; any value works.
     let mut buf = SentenceBuffer::new(Duration::from_millis(500));
@@ -238,32 +244,37 @@ mod tests {
         }
     }
 
-    // --- Sentence chunking ---
+    // --- Sentence chunking (behind the `chunker` feature) ---
 
+    #[cfg(feature = "chunker")]
     #[test]
     fn chunks_multi_sentence_into_sentences() {
         let chunks = into_speakable_sentences("Hello there. How are you? I am fine.");
         assert_eq!(chunks, vec!["Hello there.", "How are you?", "I am fine."]);
     }
 
+    #[cfg(feature = "chunker")]
     #[test]
     fn chunks_single_sentence_into_one() {
         let chunks = into_speakable_sentences("Just one sentence here.");
         assert_eq!(chunks, vec!["Just one sentence here."]);
     }
 
+    #[cfg(feature = "chunker")]
     #[test]
     fn chunks_text_without_terminal_punctuation_into_one() {
         let chunks = into_speakable_sentences("no trailing punctuation here");
         assert_eq!(chunks, vec!["no trailing punctuation here"]);
     }
 
+    #[cfg(feature = "chunker")]
     #[test]
     fn chunks_empty_or_whitespace_into_nothing() {
         assert!(into_speakable_sentences("").is_empty());
         assert!(into_speakable_sentences("   \n\t  ").is_empty());
     }
 
+    #[cfg(feature = "chunker")]
     #[test]
     fn chunks_long_paragraph_into_multiple() {
         let paragraph = "The quick brown fox jumps over the lazy dog. \
