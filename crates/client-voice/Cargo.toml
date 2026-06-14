@@ -6,7 +6,17 @@ license = "AGPL-3.0-or-later"
 description = "Shared client-side voice-output plumbing (the Adele output level, the narration gate, the speakable-sentence chunker, and the system-refinement constants) reused identically by the GTK and TUI chat clients."
 
 [dependencies]
-adele-voice-core.workspace = true
+# Optional: only `into_speakable_sentences` (the SentenceBuffer chunker) needs
+# it. Gated so `AdeleOutput` + the refinement constants stay dependency-free and
+# compile to wasm32 (consumed by client-ui-common / adele-web-ui), #115.
+adele-voice-core = { workspace = true, optional = true }
+
+[features]
+default = ["chunker"]
+# The speakable-sentence chunker (`into_speakable_sentences`), which pulls in
+# `adele-voice-core`. On by default for the native chat clients; turned off
+# (`default-features = false`) by wasm consumers that only need `AdeleOutput`.
+chunker = ["dep:adele-voice-core"]
 
 [lints]
 workspace = true
