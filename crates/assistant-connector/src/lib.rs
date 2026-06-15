@@ -172,7 +172,9 @@ const RECONNECT_GRACE: std::time::Duration = std::time::Duration::from_millis(25
 /// ignored.
 fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
     match event {
-        SignalEvent::Chunk { request_id, chunk } => Some(AssistantEvent::Chunk {
+        SignalEvent::Chunk {
+            request_id, chunk, ..
+        } => Some(AssistantEvent::Chunk {
             request_id,
             text: chunk,
         }),
@@ -181,6 +183,7 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
         SignalEvent::Status {
             request_id,
             message,
+            ..
         } => Some(AssistantEvent::Status {
             request_id,
             message,
@@ -188,13 +191,14 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
         SignalEvent::Complete {
             request_id,
             full_response,
+            ..
         } => Some(AssistantEvent::Complete {
             request_id,
             full_response,
         }),
-        SignalEvent::Error { request_id, error } => {
-            Some(AssistantEvent::Error { request_id, error })
-        }
+        SignalEvent::Error {
+            request_id, error, ..
+        } => Some(AssistantEvent::Error { request_id, error }),
         // The turn suspended on a client-local tool call (voice#61): the LLM is
         // driving the voice session. Map it through so the pipeline can run the
         // tool and post the result back, resuming the parked turn. The
@@ -386,15 +390,15 @@ mod tests {
     #[test]
     fn maps_response_turn_signals_into_voice_events() {
         assert!(matches!(
-            map_signal(SignalEvent::Chunk { request_id: "r".into(), chunk: "hi".into() }),
+            map_signal(SignalEvent::Chunk { conversation_id: "c".into(), request_id: "r".into(), chunk: "hi".into() }),
             Some(AssistantEvent::Chunk { text, .. }) if text == "hi"
         ));
         assert!(matches!(
-            map_signal(SignalEvent::Complete { request_id: "r".into(), full_response: "done".into() }),
+            map_signal(SignalEvent::Complete { conversation_id: "c".into(), request_id: "r".into(), full_response: "done".into() }),
             Some(AssistantEvent::Complete { full_response, .. }) if full_response == "done"
         ));
         assert!(matches!(
-            map_signal(SignalEvent::Error { request_id: "r".into(), error: "boom".into() }),
+            map_signal(SignalEvent::Error { conversation_id: "c".into(), request_id: "r".into(), error: "boom".into() }),
             Some(AssistantEvent::Error { error, .. }) if error == "boom"
         ));
     }
@@ -405,6 +409,7 @@ mod tests {
         // stall heartbeat), not be dropped.
         assert!(matches!(
             map_signal(SignalEvent::Status {
+                conversation_id: "c".into(),
                 request_id: "r".into(),
                 message: "checking your calendar".into()
             }),
