@@ -73,11 +73,24 @@ pub trait AssistantGateway: Send + Sync {
         result: Result<String, String>,
     ) -> impl std::future::Future<Output = Result<(), VoiceError>> + Send;
 
-    /// Create a new conversation, returning its ID.
+    /// Create a new conversation with optional tags, returning its ID.
     fn create_conversation(
         &self,
         title: &str,
+        tags: Vec<String>,
     ) -> impl std::future::Future<Output = Result<String, VoiceError>> + Send;
+
+    /// Archive a conversation (move to archived without deleting).
+    fn archive_conversation(
+        &self,
+        id: &str,
+    ) -> impl std::future::Future<Output = Result<(), VoiceError>> + Send;
+
+    /// Permanently delete a conversation and all its messages.
+    fn delete_conversation(
+        &self,
+        id: &str,
+    ) -> impl std::future::Future<Output = Result<(), VoiceError>> + Send;
 
     /// Send a prompt with a per-request `system_refinement` — a one-turn
     /// addition to the assistant's system prompt (empty = none).

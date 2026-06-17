@@ -221,9 +221,9 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
 }
 
 impl AssistantGateway for ConnectorAssistantGateway {
-    async fn create_conversation(&self, title: &str) -> Result<String, VoiceError> {
+    async fn create_conversation(&self, title: &str, tags: Vec<String>) -> Result<String, VoiceError> {
         let connector = self.current().await?;
-        match connector.create_conversation(title).await {
+        match connector.create_conversation_with_tags(title, tags).await {
             Ok(id) => Ok(id),
             Err(e) => {
                 self.reconnect().await;
@@ -232,6 +232,22 @@ impl AssistantGateway for ConnectorAssistantGateway {
                 )))
             }
         }
+    }
+
+    async fn archive_conversation(&self, id: &str) -> Result<(), VoiceError> {
+        self.current()
+            .await?
+            .archive_conversation(id)
+            .await
+            .map_err(|e| VoiceError::Assistant(format!("archive_conversation failed: {e}")))
+    }
+
+    async fn delete_conversation(&self, id: &str) -> Result<(), VoiceError> {
+        self.current()
+            .await?
+            .delete_conversation(id)
+            .await
+            .map_err(|e| VoiceError::Assistant(format!("delete_conversation failed: {e}")))
     }
 
     async fn send_prompt_with_system_refinement(
