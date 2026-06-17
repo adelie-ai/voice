@@ -443,6 +443,10 @@ where
     /// Publishes the real capture (mic-open) state for the D-Bus
     /// `GetCaptureState` surface (voice#103). Detached by default in tests.
     capture_state_tx: watch::Sender<CaptureState>,
+    /// User-speech transcripts from the current own-session conversation,
+    /// accumulated across turns in the reuse window and used by the post-session
+    /// LLM triage task to judge whether the conversation is worth keeping.
+    session_transcripts: Vec<String>,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -533,6 +537,7 @@ where
             // A detached sender (no receiver) so `capture_state_tx.send` is a
             // harmless no-op until `with_capture_state` wires the real channel.
             capture_state_tx: watch::channel(CaptureState::Capturing).0,
+            session_transcripts: Vec::new(),
         }
     }
 
@@ -641,8 +646,12 @@ where
             }
             (Some(_), _) => {
                 tracing::info!("last conversation is outside the reuse window; starting fresh");
-                self.conversation_id = None;
+                let transcripts = std::mem::take(&mut self.session_transcripts);
+                let stale_id = self.conversation_id.take();
                 self.last_own_activity = None;
+                if let Some(id) = stale_id.filter(|_| !transcripts.is_empty()) {
+                    self.spawn_triage_task(id, transcripts);
+                }
             }
             (None, _) => {}
         }
@@ -670,6 +679,22 @@ where
         self.last_own_activity = None;
         self.ptt_conversation_override = None;
         self.endpointer.reset();
+    }
+
+    /// Spawn a background task that asks the LLM to judge the just-ended voice
+    /// session and automatically archives or deletes trivial / mistaken-activation
+    /// conversations. Fire-and-forget: the pipeline returns to Idle immediately;
+    /// the triage runs asynchronously.
+    fn spawn_triage_task(&self, voice_conv_id: String, transcripts: Vec<String>) {
+        let assistant = Arc::clone(&self.assistant);
+        let timeout = self.connect_timeout.max(Duration::from_secs(30));
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_triage(assistant, voice_conv_id.clone(), transcripts, timeout).await
+            {
+                tracing::warn!(%voice_conv_id, "post-session triage failed: {e}");
+            }
+        });
     }
 
     /// Enter Listening for a push-to-talk press (voice#82). The body of the
@@ -1423,7 +1448,21 @@ where
             // regardless of mode AND clears the reuse-window id so the next wake
             // starts fresh (voice#59/#61).
             self.apply(StateEvent::TurnEnded);
+            // For own-session conversations with real turns, snapshot before
+            // clearing so the triage task can judge and archive/delete if trivial.
+            let triage_target = if self.ptt_conversation_override.is_none() {
+                let transcripts = std::mem::take(&mut self.session_transcripts);
+                self.conversation_id
+                    .clone()
+                    .filter(|_| !transcripts.is_empty())
+                    .map(|id| (id, transcripts))
+            } else {
+                None
+            };
             self.end_conversation();
+            if let Some((conv_id, transcripts)) = triage_target {
+                self.spawn_triage_task(conv_id, transcripts);
+            }
         } else if relisten {
             // Re-open the mic for a follow-up turn: wait for the reply to finish
             // playing, then drop any audio captured during playback (echo) before
@@ -1557,7 +1596,8 @@ where
                 let id = bounded(
                     self.connect_timeout,
                     "create_conversation",
-                    self.assistant.create_conversation(&self.conversation_title),
+                    self.assistant
+                        .create_conversation(&self.conversation_title, vec!["voice".to_string()]),
                 )
                 .await?;
                 tracing::info!(conversation_id = %id, "created voice conversation");
@@ -1580,16 +1620,58 @@ where
         // polluting the visible chat transcript. The gateway falls back to
         // prepending the hint (the pre-#200 behaviour) when the orchestrator
         // lacks the refinement-aware method.
-        let request_id = bounded(
-            self.connect_timeout,
-            "send_prompt",
-            self.assistant.send_prompt_with_system_refinement(
-                &conversation_id,
-                &transcript.text,
-                &self.spoken_response_hint,
-            ),
-        )
-        .await?;
+        //
+        // If the send fails for the own session (stale conversation ID, e.g. the
+        // orchestrator lost the conversation), create a fresh conversation and
+        // retry once rather than apologizing immediately.
+        let request_id = {
+            let first = bounded(
+                self.connect_timeout,
+                "send_prompt",
+                self.assistant.send_prompt_with_system_refinement(
+                    &conversation_id,
+                    &transcript.text,
+                    &self.spoken_response_hint,
+                ),
+            )
+            .await;
+            match first {
+                Ok(id) => id,
+                Err(e) if own_session => {
+                    tracing::warn!(
+                        "send to own-session conversation failed ({e}); \
+                         clearing stale id and retrying with a fresh conversation"
+                    );
+                    self.conversation_id = None;
+                    let fresh_id = bounded(
+                        self.connect_timeout,
+                        "create_conversation_retry",
+                        self.assistant.create_conversation(
+                            &self.conversation_title,
+                            vec!["voice".to_string()],
+                        ),
+                    )
+                    .await?;
+                    tracing::info!(conversation_id = %fresh_id, "created replacement conversation");
+                    self.conversation_id = Some(fresh_id.clone());
+                    bounded(
+                        self.connect_timeout,
+                        "send_prompt_retry",
+                        self.assistant.send_prompt_with_system_refinement(
+                            &fresh_id,
+                            &transcript.text,
+                            &self.spoken_response_hint,
+                        ),
+                    )
+                    .await?
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        // Record own-session turns for post-session LLM triage.
+        if own_session {
+            self.session_transcripts.push(transcript.text.clone());
+        }
 
         let stream_end = self
             .stream_response(&mut signal_rx, &request_id, audio_rx)
@@ -2094,6 +2176,88 @@ where
     }
 }
 
+/// Post-session LLM triage: create a temporary conversation, send the session
+/// transcripts as context, collect a one-word verdict (keep / archive / delete),
+/// act on the original voice conversation accordingly, then delete the temporary
+/// triage conversation. Called from a background [`tokio::spawn`] so the pipeline
+/// returns to Idle immediately — never blocks the wake-word loop.
+async fn run_triage<A: AssistantGateway + 'static>(
+    assistant: Arc<A>,
+    voice_conv_id: String,
+    transcripts: Vec<String>,
+    timeout: Duration,
+) -> Result<(), VoiceError> {
+    let triage_id = bounded(
+        timeout,
+        "triage_create",
+        assistant.create_conversation("_voice_triage_", vec![]),
+    )
+    .await?;
+
+    let transcript_lines: String = transcripts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| format!("Turn {}: {t}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!("Voice session transcript (user speech only):\n{transcript_lines}");
+    let refinement = "Judge this voice assistant session. Reply with EXACTLY ONE WORD:\n\
+        delete — mistaken wake-word activation (gibberish, accidental, no real interaction)\n\
+        archive — trivial (brief factual queries, simple commands, throwaway small talk)\n\
+        keep — substantive (complex questions, tasks, anything worth reviewing later)";
+
+    let mut signal_rx =
+        bounded(timeout, "triage_subscribe", assistant.subscribe()).await?;
+
+    let request_id = bounded(
+        timeout,
+        "triage_send",
+        assistant.send_prompt_with_system_refinement(&triage_id, &prompt, refinement),
+    )
+    .await?;
+
+    let verdict = {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let event = tokio::select! {
+                e = signal_rx.recv() => e,
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(VoiceError::Assistant("triage verdict timed out".to_string()));
+                }
+            };
+            match event {
+                Some(AssistantEvent::Complete {
+                    request_id: rid,
+                    full_response,
+                }) if rid == request_id => break full_response,
+                Some(AssistantEvent::Error {
+                    request_id: rid,
+                    error,
+                }) if rid == request_id => {
+                    return Err(VoiceError::Assistant(format!("triage LLM error: {error}")));
+                }
+                None => return Err(VoiceError::Assistant("triage stream closed".to_string())),
+                _ => {}
+            }
+        }
+    };
+
+    let word = verdict.split_whitespace().next().unwrap_or("").to_lowercase();
+    tracing::info!(%voice_conv_id, verdict = %word, "post-session triage");
+    match word.as_str() {
+        "archive" => {
+            let _ = assistant.archive_conversation(&voice_conv_id).await;
+        }
+        "delete" => {
+            let _ = assistant.delete_conversation(&voice_conv_id).await;
+        }
+        _ => {}
+    }
+    let _ = assistant.delete_conversation(&triage_id).await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Pipeline tests with fake adapters. Focus: #3 — the `enabled` flag must
@@ -2465,14 +2629,33 @@ mod tests {
         async fn create_conversation(
             &self,
             title: &str,
+            _tags: Vec<String>,
         ) -> Result<String, adele_voice_core::VoiceError> {
             if self.fail {
                 return Err(adele_voice_core::VoiceError::Assistant(
                     "uds connection closed".to_string(),
                 ));
             }
-            let _ = self.created_tx.send(title.to_string());
+            // Internal triage conversations (title starts with '_') are not
+            // recorded in the test channel — tests should not need to drain them.
+            if !title.starts_with('_') {
+                let _ = self.created_tx.send(title.to_string());
+            }
             Ok("own-session".to_string())
+        }
+
+        async fn archive_conversation(
+            &self,
+            _id: &str,
+        ) -> Result<(), adele_voice_core::VoiceError> {
+            Ok(())
+        }
+
+        async fn delete_conversation(
+            &self,
+            _id: &str,
+        ) -> Result<(), adele_voice_core::VoiceError> {
+            Ok(())
         }
         async fn send_prompt_with_system_refinement(
             &self,
@@ -4924,6 +5107,10 @@ mod tests {
 
         // Nudge the degraded loop with a reload so it re-tries start().
         h.reload_tx.send(()).await.unwrap();
+        // Wait until the pipeline has actually processed the reload and called
+        // start() again; otherwise PTT may arrive while the degraded select! is
+        // still running and be silently discarded.
+        wait_for_count(&h.starts, 2, "start() retry after reload").await;
 
         // The normal loop is now running: PTT must drive Idle -> Listening.
         h.ptt_tx.send(None).await.unwrap();

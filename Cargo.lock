@@ -1298,7 +1298,7 @@ dependencies = [
 name = "desktop-assistant-api-model"
 version = "0.1.0"
 dependencies = [
- "desktop-assistant-core",
+ "desktop-assistant-protocol",
  "serde",
  "serde_json",
 ]
@@ -1359,6 +1359,7 @@ dependencies = [
  "backon",
  "chrono",
  "desktop-assistant-auth-jwt",
+ "desktop-assistant-protocol",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1373,6 +1374,22 @@ name = "desktop-assistant-frame-codec"
 version = "0.1.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "desktop-assistant-peer-cred"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "tokio",
+]
+
+[[package]]
+name = "desktop-assistant-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -1402,6 +1419,7 @@ dependencies = [
  "desktop-assistant-application",
  "desktop-assistant-core",
  "desktop-assistant-frame-codec",
+ "desktop-assistant-peer-cred",
  "desktop-assistant-transport-dispatch",
  "futures",
  "serde",
