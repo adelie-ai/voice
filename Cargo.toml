@@ -64,3 +64,23 @@ warnings = "deny"
 
 [workspace.lints.clippy]
 all = "deny"
+
+# Release profiles. Default favors small, fast binaries (strip + thin LTO).
+# Build variants: `cargo build --profile release-fast` / `--profile release-small`.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+
+[profile.release-fast]
+inherits = "release"
+lto = "fat"
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+panic = "abort"
+strip = true
