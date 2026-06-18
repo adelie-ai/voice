@@ -96,6 +96,34 @@ install-service:
     systemctl --user daemon-reload
     echo "Installed. Enable with: just enable"
 
+# Install PipeWire acoustic echo cancellation (Linux/PipeWire only). Adds the
+# echo-cancel module + the WirePlumber routing hook, then reloads the audio
+# stack. Lets you turn on `audio.mic_barge_in` without Adele hearing herself.
+# Uninstall with `just uninstall-aec`.
+install-aec:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p ~/.config/pipewire/pipewire.conf.d \
+             ~/.config/wireplumber/wireplumber.conf.d \
+             ~/.local/share/wireplumber/scripts
+    install -m644 aec/pipewire/99-adele-echo-cancel.conf ~/.config/pipewire/pipewire.conf.d/
+    install -m644 aec/wireplumber/51-adele-aec.conf       ~/.config/wireplumber/wireplumber.conf.d/
+    # WirePlumber resolves script names against its DATA dirs, not config.
+    install -m644 aec/wireplumber/adele-aec-target.lua    ~/.local/share/wireplumber/scripts/
+    systemctl --user restart pipewire pipewire-pulse wireplumber
+    echo "AEC installed. Verify with: adele-voice check-setup"
+    echo "Then enable barge-in by setting audio.mic_barge_in = true and restarting adele-voice."
+
+# Remove the PipeWire echo cancellation files and reload the audio stack.
+uninstall-aec:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -f ~/.config/pipewire/pipewire.conf.d/99-adele-echo-cancel.conf \
+          ~/.config/wireplumber/wireplumber.conf.d/51-adele-aec.conf \
+          ~/.local/share/wireplumber/scripts/adele-aec-target.lua
+    systemctl --user restart pipewire pipewire-pulse wireplumber
+    echo "AEC removed."
+
 # Enable + start the daemon as a user service
 enable:
     systemctl --user enable --now adele-voice
