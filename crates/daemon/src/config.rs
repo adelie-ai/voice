@@ -118,8 +118,8 @@ pub struct WakeWordConfig {
     /// is the dominant idle cost). The gate is fail-open and accuracy-neutral
     /// when there is speech-level audio; set `false` to restore the original
     /// always-run behaviour. Captured at startup like `eager` — a change needs a
-    /// restart (the detector is rebuilt only on a `sensitivity` reload). Default
-    /// `true`.
+    /// restart (only `sensitivity` is applied live, via the detector's runtime
+    /// threshold). Default `true`.
     pub energy_gate: bool,
     /// Pause capture (release the mic) when the logind session goes inactive —
     /// e.g. on fast-user-switch — so the daemon doesn't keep recording the
@@ -409,8 +409,9 @@ pub struct ReloadPlan {
     pub set_status_narration_min_gap_ms: Option<u64>,
     /// Update the pipeline's mid-sentence narration-flush window (0 disables).
     pub set_narration_flush_ms: Option<u64>,
-    /// Rebuild the wake detector at this sensitivity.
-    pub rebuild_wake_sensitivity: Option<f32>,
+    /// Apply this wake-word sensitivity to the running detector (live, no
+    /// rebuild — see `WakeWordDetector::set_sensitivity`).
+    pub apply_wake_sensitivity: Option<f32>,
     /// A device changed; the capture/playback stream would need a restart, which
     /// is not done live. Carries the human-readable change for the log.
     pub restart_required_for_device: Option<String>,
@@ -427,8 +428,8 @@ impl ReloadPlan {
 ///
 /// - `speech_threshold`, `silence_duration_ms`, `followup_timeout_ms`,
 ///   `conversation_mode`, `idle_exit_timeout_ms` hot-apply in place.
-/// - `wake_sensitivity` requires rebuilding the wake detector (rustpotter bakes
-///   the threshold in at construction).
+/// - `wake_sensitivity` applies live to the running detector (no rebuild — the
+///   rustpotter adapter pokes its score threshold via `update_detector_config`).
 /// - an `input_device`/`output_device` change can't be applied live (it would
 ///   need restarting the cpal stream); the plan flags a restart-required note
 ///   instead, and every other changed knob still applies.
@@ -465,7 +466,7 @@ pub fn plan_reload(old: &Tunables, new: &Tunables) -> ReloadPlan {
         plan.set_narration_flush_ms = Some(new.narration_flush_ms);
     }
     if old.wake_sensitivity != new.wake_sensitivity {
-        plan.rebuild_wake_sensitivity = Some(new.wake_sensitivity);
+        plan.apply_wake_sensitivity = Some(new.wake_sensitivity);
     }
     if old.input_device != new.input_device || old.output_device != new.output_device {
         plan.restart_required_for_device = Some(format!(
@@ -650,20 +651,20 @@ speech_threshold = 0.7
             Some(new.idle_exit_timeout_ms)
         );
         // No rebuild / restart implied by the hot knobs alone.
-        assert_eq!(plan.rebuild_wake_sensitivity, None);
+        assert_eq!(plan.apply_wake_sensitivity, None);
         assert_eq!(plan.restart_required_for_device, None);
         assert!(!plan.is_empty());
     }
 
     #[test]
-    fn wake_sensitivity_change_requires_rebuilding_the_detector() {
+    fn wake_sensitivity_change_is_applied_live() {
         let old = Config::default().tunables();
         let new = Tunables {
             wake_sensitivity: old.wake_sensitivity + 0.2,
             ..old.clone()
         };
         let plan = plan_reload(&old, &new);
-        assert_eq!(plan.rebuild_wake_sensitivity, Some(new.wake_sensitivity));
+        assert_eq!(plan.apply_wake_sensitivity, Some(new.wake_sensitivity));
         // Only the wake detector — nothing else changed.
         assert_eq!(plan.set_speech_threshold, None);
         assert_eq!(plan.restart_required_for_device, None);
@@ -746,7 +747,7 @@ stt_ms = 0
             Some(new.status_narration_min_gap_ms)
         );
         assert_eq!(plan.set_narration_flush_ms, Some(new.narration_flush_ms));
-        assert_eq!(plan.rebuild_wake_sensitivity, None);
+        assert_eq!(plan.apply_wake_sensitivity, None);
     }
 
     #[test]

@@ -27,11 +27,6 @@ async fn sleep_opt(dur: Option<Duration>) {
     }
 }
 
-/// Builds a fresh wake detector at a given sensitivity. rustpotter bakes the
-/// detection threshold in at construction, so changing it on reload (config#52)
-/// means rebuilding the detector rather than poking a setter.
-pub type WakeBuilder<W> = Box<dyn Fn(f32) -> Result<W, VoiceError> + Send>;
-
 /// Spoken when the assistant turn fails — short and human, never the raw error.
 const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
 
@@ -81,9 +76,9 @@ pub struct TurnTimeouts {
 
 /// The non-wiring configuration for a [`Pipeline`], grouped so `Pipeline::new`
 /// takes one options struct instead of a dozen positional scalars (voice#89).
-/// The audio backends, channels, and `wake_builder` stay positional arguments —
-/// they're wiring, not tunables — while everything here is plain config the
-/// constructor stores or forwards.
+/// The audio backends and channels stay positional arguments — they're wiring,
+/// not tunables — while everything here is plain config the constructor stores
+/// or forwards.
 pub struct PipelineConfig {
     /// Reloadable tunables snapshot (the on-disk truth we diff against).
     pub tunables: Tunables,
@@ -366,8 +361,6 @@ where
     /// the pipeline to re-read the config and apply any changed tunables live
     /// (config#52).
     reload_rx: mpsc::Receiver<()>,
-    /// Rebuilds the wake detector when `wake_word.sensitivity` changes.
-    wake_builder: WakeBuilder<W>,
     /// Snapshot of the live-applicable knobs, diffed against a freshly loaded
     /// config on each reload to decide what to apply.
     tunables: Tunables,
@@ -471,7 +464,6 @@ where
         ptt_rx: mpsc::Receiver<Option<String>>,
         stop_rx: mpsc::Receiver<StopRequest>,
         reload_rx: mpsc::Receiver<()>,
-        wake_builder: WakeBuilder<W>,
         config: PipelineConfig,
     ) -> Self {
         let PipelineConfig {
@@ -509,7 +501,6 @@ where
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             tunables,
             conversation_id: None,
             ptt_conversation_override: None,
@@ -689,8 +680,7 @@ where
         let assistant = Arc::clone(&self.assistant);
         let timeout = self.connect_timeout.max(Duration::from_secs(30));
         tokio::spawn(async move {
-            if let Err(e) =
-                run_triage(assistant, voice_conv_id.clone(), transcripts, timeout).await
+            if let Err(e) = run_triage(assistant, voice_conv_id.clone(), transcripts, timeout).await
             {
                 tracing::warn!(%voice_conv_id, "post-session triage failed: {e}");
             }
@@ -880,19 +870,22 @@ where
                 "config reload: applied timeouts.narration_flush_ms"
             );
         }
-        if let Some(sensitivity) = plan.rebuild_wake_sensitivity {
-            match (self.wake_builder)(sensitivity) {
-                Ok(wake) => {
-                    self.wake = wake;
+        if let Some(sensitivity) = plan.apply_wake_sensitivity {
+            match self.wake.set_sensitivity(sensitivity) {
+                Ok(()) => {
+                    // Keep the tunables snapshot in step so a later reload (e.g.
+                    // the file-watcher ping after calibration persists the same
+                    // value) sees no change and doesn't re-apply needlessly.
+                    self.tunables.wake_sensitivity = sensitivity;
                     tracing::info!(
                         sensitivity,
-                        "config reload: rebuilt wake detector for wake_word.sensitivity"
+                        "config reload: applied wake_word.sensitivity live"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         sensitivity,
-                        "config reload: failed to rebuild wake detector, keeping current: {e}"
+                        "config reload: failed to apply wake sensitivity, keeping current: {e}"
                     );
                 }
             }
@@ -2207,8 +2200,7 @@ async fn run_triage<A: AssistantGateway + 'static>(
         archive — trivial (brief factual queries, simple commands, throwaway small talk)\n\
         keep — substantive (complex questions, tasks, anything worth reviewing later)";
 
-    let mut signal_rx =
-        bounded(timeout, "triage_subscribe", assistant.subscribe()).await?;
+    let mut signal_rx = bounded(timeout, "triage_subscribe", assistant.subscribe()).await?;
 
     let request_id = bounded(
         timeout,
@@ -2243,7 +2235,11 @@ async fn run_triage<A: AssistantGateway + 'static>(
         }
     };
 
-    let word = verdict.split_whitespace().next().unwrap_or("").to_lowercase();
+    let word = verdict
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     tracing::info!(%voice_conv_id, verdict = %word, "post-session triage");
     match word.as_str() {
         "archive" => {
@@ -2423,12 +2419,20 @@ mod tests {
         h.handle.abort();
     }
 
+    #[derive(Default)]
     struct FakeWake {
         detects: bool,
+        /// Last sensitivity handed to `set_sensitivity` — lets a reload test
+        /// observe that the value was applied live (no rebuild).
+        applied_sensitivity: Option<f32>,
     }
     impl WakeWordDetector for FakeWake {
         fn detect(&mut self, _samples: &[f32]) -> Result<bool, adele_voice_core::VoiceError> {
             Ok(self.detects)
+        }
+        fn set_sensitivity(&mut self, s: f32) -> Result<(), adele_voice_core::VoiceError> {
+            self.applied_sensitivity = Some(s);
+            Ok(())
         }
     }
 
@@ -2651,10 +2655,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_conversation(
-            &self,
-            _id: &str,
-        ) -> Result<(), adele_voice_core::VoiceError> {
+        async fn delete_conversation(&self, _id: &str) -> Result<(), adele_voice_core::VoiceError> {
             Ok(())
         }
         async fn send_prompt_with_system_refinement(
@@ -2962,11 +2963,12 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let spoken = Arc::new(StdMutex::new(Vec::new()));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -2998,7 +3000,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -3046,11 +3047,12 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let spoken = Arc::new(StdMutex::new(Vec::new()));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -3082,7 +3084,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -3143,21 +3144,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_plan_rebuilds_wake_detector_on_sensitivity_change() {
-        // The wake-sensitivity branch must invoke the builder; the builder here
-        // flips `detects` to true so we can observe the swap took effect.
+    fn apply_plan_applies_wake_sensitivity_live() {
+        // The wake-sensitivity branch must poke the running detector's
+        // `set_sensitivity` (no rebuild) and keep the tunables snapshot in step.
         let mut p = build_pipeline();
-        // Replace the builder with one that yields a detector that always fires.
-        p.wake_builder = Box::new(|_s| Ok(FakeWake { detects: true }));
-        assert!(!p.wake.detect(&[0.0; 10]).unwrap());
+        assert_eq!(p.wake.applied_sensitivity, None);
         let plan = config::ReloadPlan {
-            rebuild_wake_sensitivity: Some(0.9),
+            apply_wake_sensitivity: Some(0.9),
             ..config::ReloadPlan::default()
         };
         p.apply_plan(&plan);
-        assert!(
-            p.wake.detect(&[0.0; 10]).unwrap(),
-            "the wake detector must be rebuilt by the builder on a sensitivity change"
+        assert_eq!(
+            p.wake.applied_sensitivity,
+            Some(0.9),
+            "the sensitivity must be applied to the live detector"
+        );
+        assert_eq!(
+            p.tunables.wake_sensitivity, 0.9,
+            "the tunables snapshot must track the applied sensitivity"
         );
     }
 
@@ -3598,13 +3602,6 @@ mod tests {
         let (subscribed_tx, events_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
 
-        let wake_detects = cfg.wake_detects;
-        let wake_builder: WakeBuilder<FakeWake> = Box::new(move |_sensitivity| {
-            Ok(FakeWake {
-                detects: wake_detects,
-            })
-        });
-
         let stt_captured = Arc::new(StdMutex::new(Vec::new()));
         let sink = FakeSink::default();
         let cue_tts = SpawnTts {
@@ -3618,6 +3615,7 @@ mod tests {
         let pipeline = Pipeline::new(
             FakeWake {
                 detects: cfg.wake_detects,
+                ..Default::default()
             },
             FakeVad {
                 probs: StdMutex::new(VecDeque::from(cfg.vad)),
@@ -3646,7 +3644,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -5013,12 +5010,13 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
         let (reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -5052,7 +5050,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -5249,12 +5246,13 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -5286,7 +5284,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),

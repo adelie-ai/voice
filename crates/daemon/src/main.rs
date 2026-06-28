@@ -54,20 +54,16 @@ async fn main() -> Result<()> {
     // values (config#52).
     let tunables = config.tunables();
 
-    // Initialize components. The wake builder rebuilds the detector at a new
-    // sensitivity on reload (rustpotter bakes the threshold in at construction).
-    // `eager` (#50) and `energy_gate` are captured at startup — changing either
-    // needs a restart (the detector is rebuilt only on a `sensitivity` reload).
-    let wake_model_path = config.wake_word.model_path.clone();
-    let wake_eager = config.wake_word.eager;
-    let wake_energy_gate = config.wake_word.energy_gate;
-    let wake_builder: pipeline::WakeBuilder<RustpotterWakeWordDetector> = {
-        let model_path = wake_model_path.clone();
-        Box::new(move |sensitivity| {
-            RustpotterWakeWordDetector::new(&model_path, sensitivity, wake_eager, wake_energy_gate)
-        })
-    };
-    let wake = wake_builder(config.wake_word.sensitivity)?;
+    // Initialize components. The wake detector's sensitivity is applied live on
+    // reload via `WakeWordDetector::set_sensitivity` (no rebuild); `eager` (#50)
+    // and `energy_gate` are captured at startup — changing either needs a
+    // restart.
+    let wake = RustpotterWakeWordDetector::new(
+        &config.wake_word.model_path,
+        config.wake_word.sensitivity,
+        config.wake_word.eager,
+        config.wake_word.energy_gate,
+    )?;
     let vad = SileroVad::new(&config.vad.model_path)?;
     // STT decode is bounded (#58): a wedged inference apologizes instead of
     // hanging the turn. 0 disables the bound.
@@ -213,7 +209,6 @@ async fn main() -> Result<()> {
         ptt_rx,
         stop_rx,
         reload_rx,
-        wake_builder,
         pipeline::PipelineConfig {
             tunables,
             conversation_title: config.assistant.conversation_title,
