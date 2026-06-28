@@ -1,19 +1,269 @@
+//! Rustpotter wake-word detector, with an optional energy gate in front of it.
+//!
+//! # Why the gate exists
+//!
+//! Wake-word detection is always-on: every captured frame is fed to rustpotter,
+//! which runs a full MFCC / FFT feature extraction plus a template comparison
+//! per frame — even in a silent room, which is most of the idle time. Profiling
+//! the live daemon showed this single path accounts for ~22% of a CPU core at
+//! idle (it is the dominant cost; the ONNX models and the resampler are
+//! near-zero while idle).
+//!
+//! The [`EnergyGate`] is the classic two-stage keyword-spotting design: a cheap
+//! short-term-energy (RMS) test decides whether a frame is even *plausibly*
+//! speech before paying for rustpotter. During silence the expensive path is
+//! skipped, so idle CPU drops roughly in proportion to the fraction of time the
+//! room is quiet. When there is speech-level energy the gate is fully open and
+//! rustpotter sees an unbroken stream, so detection accuracy is unchanged.
+//!
+//! # Requirements the gate must satisfy
+//!
+//! 1. **Never miss a wake word.** A quiet onset must still reach rustpotter, and
+//!    rustpotter must see a *contiguous* window over the whole utterance. This
+//!    is met by (a) a pre-roll: the gate keeps the last [`PREROLL_SECS`] of
+//!    frames while closed and flushes them into rustpotter the instant it opens,
+//!    so the leading phoneme is never clipped; and (b) a hangover: once energy
+//!    drops the gate keeps feeding for [`HANGOVER_SECS`] before closing, which
+//!    covers the trailing silence a non-eager rustpotter needs to confirm a
+//!    score peak (it fires *after* the word, on the fall-back).
+//! 2. **Self-tuning across rooms.** A fixed threshold is wrong for every mic. An
+//!    adaptive noise floor (see [`EnergyGate::update_floor`]) tracks the ambient
+//!    level so the open/close decision is relative to the room, not absolute.
+//! 3. **Fail open, never closed.** Every uncertain case errs toward feeding
+//!    rustpotter: the floor starts at its minimum (so the gate is wide open at
+//!    startup until it has learned the room), and the whole gate is opt-out via
+//!    config (`wake_word.energy_gate = false`) if it ever misbehaves.
+//! 4. **Negligible cost.** The gate is one pass of multiply-accumulate plus a
+//!    sqrt per frame — trivial next to rustpotter's FFT — so a *closed* frame is
+//!    effectively free.
+//!
+//! # The math
+//!
+//! For a frame of `N` samples `x[0..N]` (f32, roughly in `[-1, 1]`), the
+//! short-term energy is the root-mean-square amplitude:
+//!
+//! ```text
+//!     rms = sqrt( (1/N) * Σ x[i]² )
+//! ```
+//!
+//! Thresholds are expressed as multiples of the adaptive floor, which is the
+//! natural way to talk about a signal-to-noise margin (a ratio in linear
+//! amplitude is a fixed dB offset: `dB = 20·log10(ratio)`):
+//!
+//! - open when `rms ≥ floor · OPEN_RATIO`   (`OPEN_RATIO = 4` ⇒ +12 dB over floor)
+//! - close when `rms < floor · CLOSE_RATIO` (`CLOSE_RATIO = 2` ⇒ +6 dB over floor)
+//!
+//! The gap between the two (12 dB open vs 6 dB close) is hysteresis: it stops the
+//! gate chattering on energy that hovers right at the threshold.
+//!
+//! The floor is an exponential moving average with asymmetric time constants:
+//!
+//! ```text
+//!     floor ← floor + α·(rms − floor),   α = 1 − exp(−Δt / τ)
+//! ```
+//!
+//! where `Δt` is the frame duration (`samples_per_frame / SAMPLE_RATE`). A slow
+//! attack (`τ = FLOOR_UP_TAU_SECS`, ~10 s) means a few seconds of speech barely
+//! moves the floor, so the floor learns *ambient*, not speech; a fast release
+//! (`τ = FLOOR_DOWN_TAU_SECS`, ~0.5 s) means any inflation from a long utterance
+//! is undone in the inter-utterance gap. The floor is clamped to
+//! `[FLOOR_MIN, FLOOR_MAX]` so it can neither collapse to zero in perfect
+//! digital silence (which would make any sample "loud") nor run away so high in
+//! sustained noise that genuine speech can't clear it.
+
+use std::collections::VecDeque;
+
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::SAMPLE_RATE;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use rustpotter::{Rustpotter, RustpotterConfig, SampleFormat};
 use std::path::Path;
 
+/// Open the gate at +12 dB over the noise floor (`20·log10(4) ≈ 12.0 dB`).
+const OPEN_RATIO: f32 = 4.0;
+/// Close the gate below +6 dB over the noise floor (`20·log10(2) ≈ 6.0 dB`); the
+/// 6 dB gap to [`OPEN_RATIO`] is the hysteresis that prevents chatter.
+const CLOSE_RATIO: f32 = 2.0;
+/// Floor attack time constant: how slowly the floor rises toward a louder level.
+/// Long, so a multi-second utterance barely lifts it (the floor tracks ambient,
+/// not speech) and so startup converges to the room over a few seconds.
+const FLOOR_UP_TAU_SECS: f32 = 10.0;
+/// Floor release time constant: how quickly the floor falls toward a quieter
+/// level. Short, so any inflation a long utterance caused is recovered within
+/// the gap before the next utterance.
+const FLOOR_DOWN_TAU_SECS: f32 = 0.5;
+/// Floor lower clamp ≈ −60 dBFS (`20·log10(1e-3)`). Stops the floor collapsing
+/// to zero in pure digital silence, which would make the gate open on a single
+/// stray sample. With this floor the gate opens no lower than ~−48 dBFS.
+const FLOOR_MIN: f32 = 1e-3;
+/// Floor upper clamp ≈ −30 dBFS (`20·log10(3e-2)`). Stops a runaway floor in
+/// sustained loud noise from rising so high that real speech can't clear the
+/// open ratio. In an environment loud enough to hit this, disable the gate.
+const FLOOR_MAX: f32 = 3e-2;
+/// Pre-roll kept while the gate is closed and flushed to rustpotter on open, so
+/// a quiet word onset just before the energy crosses the open threshold is not
+/// clipped. ~300 ms mirrors the pipeline's same-breath wake pre-buffer.
+const PREROLL_SECS: f32 = 0.30;
+/// Hangover: keep feeding rustpotter this long after energy drops below the
+/// close threshold before actually closing. Must comfortably exceed the trailing
+/// silence a non-eager rustpotter needs to confirm a score peak (it fires on the
+/// fall-back *after* the word), and bridge brief intra-phrase dips.
+const HANGOVER_SECS: f32 = 0.60;
+
+/// Root-mean-square amplitude of one frame — the cheap short-term-energy measure
+/// the gate decides on. Returns 0 for an empty frame. See the module math note.
+fn frame_rms(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
+    (sum_sq / frame.len() as f32).sqrt()
+}
+
+/// Energy gate that sits in front of rustpotter and decides, per frame, whether
+/// to run the expensive detector. Holds the adaptive noise floor, the open/hangover
+/// state, and the pre-roll ring. Pure and rustpotter-free so the decision logic
+/// is unit-tested directly (the risky part of the change).
+struct EnergyGate {
+    /// True while the gate is open and frames flow straight to rustpotter.
+    open: bool,
+    /// Adaptive ambient-noise estimate in RMS amplitude (see [`Self::update_floor`]).
+    floor: f32,
+    /// Frames left to keep feeding after energy dropped, before closing.
+    hangover_left: usize,
+    /// Recent frames retained while closed, flushed on open as the onset pre-roll.
+    preroll: VecDeque<Vec<f32>>,
+    /// Per-frame EMA coefficient for a rising floor (derived from [`FLOOR_UP_TAU_SECS`]).
+    up_alpha: f32,
+    /// Per-frame EMA coefficient for a falling floor (derived from [`FLOOR_DOWN_TAU_SECS`]).
+    down_alpha: f32,
+    /// Hangover length in frames (derived from [`HANGOVER_SECS`]).
+    hangover_frames: usize,
+    /// Pre-roll capacity in frames (derived from [`PREROLL_SECS`]).
+    preroll_frames: usize,
+}
+
+impl EnergyGate {
+    /// Build a gate for rustpotter's frame size. The duration-based constants are
+    /// converted to per-frame quantities here, where the frame duration
+    /// (`samples_per_frame / SAMPLE_RATE`) is known, so the tuning stays
+    /// expressed in seconds/dB regardless of rustpotter's internal frame length.
+    fn new(samples_per_frame: usize) -> Self {
+        let frame_secs = samples_per_frame as f32 / SAMPLE_RATE as f32;
+        // α = 1 − exp(−Δt/τ): the standard one-pole EMA coefficient for a given
+        // time constant at this frame rate.
+        let up_alpha = 1.0 - (-frame_secs / FLOOR_UP_TAU_SECS).exp();
+        let down_alpha = 1.0 - (-frame_secs / FLOOR_DOWN_TAU_SECS).exp();
+        // Convert the duration windows to a frame count via integer ceil-division
+        // in the sample domain, so the windows are never shorter than the spec'd
+        // duration and an exact ratio (e.g. 300 ms / 30 ms) isn't bumped to the
+        // next frame by float-`ceil` rounding error.
+        let hangover_frames =
+            ((HANGOVER_SECS * SAMPLE_RATE as f32) as usize).div_ceil(samples_per_frame);
+        let preroll_frames =
+            ((PREROLL_SECS * SAMPLE_RATE as f32) as usize).div_ceil(samples_per_frame);
+        Self {
+            open: false,
+            // Start at the minimum so the gate is wide open until it has learned
+            // the room — fail-open, never clipping a wake word at startup.
+            floor: FLOOR_MIN,
+            hangover_left: 0,
+            preroll: VecDeque::with_capacity(preroll_frames + 1),
+            up_alpha,
+            down_alpha,
+            hangover_frames,
+            preroll_frames,
+        }
+    }
+
+    /// Update the adaptive noise floor toward this frame's RMS with an asymmetric
+    /// one-pole EMA — slow when rising (so speech doesn't inflate it), fast when
+    /// falling (so it recovers quickly) — then clamp to `[FLOOR_MIN, FLOOR_MAX]`.
+    fn update_floor(&mut self, rms: f32) {
+        let alpha = if rms > self.floor {
+            self.up_alpha
+        } else {
+            self.down_alpha
+        };
+        self.floor += alpha * (rms - self.floor);
+        self.floor = self.floor.clamp(FLOOR_MIN, FLOOR_MAX);
+    }
+
+    /// Drop the oldest pre-roll frames until the ring is within capacity.
+    fn trim_preroll(&mut self) {
+        while self.preroll.len() > self.preroll_frames {
+            self.preroll.pop_front();
+        }
+    }
+
+    /// Admit one rustpotter-sized frame. Returns `(reset, frames)` where `frames`
+    /// are the frames to run rustpotter on, oldest-first (empty = skip this
+    /// frame, the CPU saving), and `reset` asks the caller to clear rustpotter's
+    /// window because the gate just closed (so the next utterance starts from a
+    /// clean window seeded only by its own pre-roll).
+    ///
+    /// Four cases:
+    /// - **closed, quiet** → buffer the frame as pre-roll, skip rustpotter.
+    /// - **closed, loud**  → open; flush the pre-roll (onset context) plus this
+    ///   frame to rustpotter.
+    /// - **open**          → feed this frame; re-arm the hangover while energy
+    ///   stays up, count it down once energy drops.
+    /// - **open, hangover elapsed** → close; ask for a rustpotter reset.
+    fn admit(&mut self, frame: Vec<f32>) -> (bool, Vec<Vec<f32>>) {
+        let rms = frame_rms(&frame);
+        self.update_floor(rms);
+
+        if self.open {
+            if rms >= self.floor * CLOSE_RATIO {
+                // Still speech-level: keep open and re-arm the hangover.
+                self.hangover_left = self.hangover_frames;
+                (false, vec![frame])
+            } else if self.hangover_left > 0 {
+                // Quiet, but inside the hangover — keep feeding the tail so a
+                // non-eager detector can still confirm its peak.
+                self.hangover_left -= 1;
+                (false, vec![frame])
+            } else {
+                // Hangover elapsed: close, reset rustpotter, and start a fresh
+                // pre-roll with this frame as its most recent context.
+                self.open = false;
+                self.preroll.clear();
+                self.preroll.push_back(frame);
+                self.trim_preroll();
+                (true, Vec::new())
+            }
+        } else if rms >= self.floor * OPEN_RATIO {
+            // Onset: open and flush the buffered pre-roll plus this frame so the
+            // leading phonemes reach rustpotter as a contiguous block. The history
+            // was already capped to `preroll_frames` while closed; the onset frame
+            // is flushed in addition to it (so up to `preroll_frames + 1` frames),
+            // hence no trim here.
+            self.open = true;
+            self.hangover_left = self.hangover_frames;
+            self.preroll.push_back(frame);
+            (false, self.preroll.drain(..).collect())
+        } else {
+            // Quiet: retain as pre-roll and skip the expensive detector.
+            self.preroll.push_back(frame);
+            self.trim_preroll();
+            (false, Vec::new())
+        }
+    }
+}
+
 pub struct RustpotterWakeWordDetector {
     rustpotter: Rustpotter,
-    /// Exact number of samples rustpotter consumes per `process_bytes` call.
-    /// `process_bytes` returns `None` (a silent no-op) for ANY other length and
+    /// Exact number of samples rustpotter consumes per `process_samples` call.
+    /// `process_samples` returns `None` (a silent no-op) for ANY other length and
     /// does not buffer across calls, so we must hand it exactly one frame.
     samples_per_frame: usize,
     /// Carries leftover samples between `detect()` calls so arbitrary capture
     /// chunk sizes (the daemon sends 20 ms / 320-sample chunks) are re-framed
     /// into rustpotter's frame size instead of being dropped on the floor (#44).
     buf: Vec<f32>,
+    /// Optional energy gate (`wake_word.energy_gate`). `None` restores the
+    /// original always-run behaviour; `Some` skips rustpotter on silent frames.
+    gate: Option<EnergyGate>,
 }
 
 /// Pop one complete `frame`-sized chunk from the front of `buf`, retaining the
@@ -35,7 +285,17 @@ impl RustpotterWakeWordDetector {
     /// threshold instead of waiting for the score to peak and fall back below it.
     /// This trims the ~2 s tail latency of the default (non-eager) detector at
     /// the cost of a higher false-trigger risk — tune with `sensitivity` (#50).
-    pub fn new(model_path: &Path, sensitivity: f32, eager: bool) -> Result<Self, VoiceError> {
+    ///
+    /// `energy_gate`: when true, run frames through an [`EnergyGate`] so the
+    /// expensive rustpotter path is skipped during silence (lower idle CPU). The
+    /// gate is fail-open and accuracy-neutral when there is speech; set false to
+    /// restore the original always-run behaviour.
+    pub fn new(
+        model_path: &Path,
+        sensitivity: f32,
+        eager: bool,
+        energy_gate: bool,
+    ) -> Result<Self, VoiceError> {
         let mut config = RustpotterConfig::default();
         config.fmt.sample_rate = SAMPLE_RATE as usize;
         config.fmt.sample_format = SampleFormat::F32;
@@ -71,6 +331,7 @@ impl RustpotterWakeWordDetector {
             model = %model_path.display(),
             sensitivity,
             eager,
+            energy_gate,
             samples_per_frame,
             "wake word detector initialized"
         );
@@ -79,7 +340,28 @@ impl RustpotterWakeWordDetector {
             rustpotter,
             samples_per_frame,
             buf: Vec::new(),
+            gate: energy_gate.then(|| EnergyGate::new(samples_per_frame)),
         })
+    }
+
+    /// Run rustpotter on exactly one frame, logging and reporting a detection.
+    /// Takes the frame by value and hands it straight to `process_samples`, which
+    /// accepts `&[f32]`-equivalent owned samples directly — no LE-byte round-trip
+    /// (the old `process_bytes` path serialized each f32 to bytes only for
+    /// rustpotter to decode them straight back).
+    fn run_frame(&mut self, frame: Vec<f32>) -> bool {
+        if let Some(detection) = self.rustpotter.process_samples::<f32>(frame) {
+            // Log the score so the threshold can be tuned from real fires.
+            tracing::info!(
+                score = detection.score,
+                avg_score = detection.avg_score,
+                gain = detection.gain,
+                "wake word detected"
+            );
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -91,17 +373,22 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         self.buf.extend_from_slice(samples);
 
         let mut detected = false;
-        while let Some(frame) = take_frame(&mut self.buf, self.samples_per_frame) {
-            // f32 little-endian bytes, as rustpotter's F32 format expects.
-            let bytes: Vec<u8> = frame.iter().flat_map(|s| s.to_le_bytes()).collect();
-            if let Some(detection) = self.rustpotter.process_bytes(&bytes) {
-                // Log the score so the threshold can be tuned from real fires.
-                tracing::info!(
-                    score = detection.score,
-                    avg_score = detection.avg_score,
-                    gain = detection.gain,
-                    "wake word detected"
-                );
+        let spf = self.samples_per_frame;
+        while let Some(frame) = take_frame(&mut self.buf, spf) {
+            if self.gate.is_some() {
+                // The gate decides which frames are worth rustpotter's cost. Its
+                // borrow ends with `admit` (it returns owned data), freeing the
+                // subsequent `self.rustpotter` / `self.run_frame` borrows.
+                let (reset, frames) = self.gate.as_mut().unwrap().admit(frame);
+                if reset {
+                    self.rustpotter.reset();
+                }
+                for f in frames {
+                    if self.run_frame(f) {
+                        detected = true;
+                    }
+                }
+            } else if self.run_frame(frame) {
                 detected = true;
             }
         }
@@ -111,7 +398,9 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
 
 #[cfg(test)]
 mod tests {
-    use super::take_frame;
+    use super::*;
+
+    // --- #44: re-framing arbitrary capture chunks into rustpotter frames ---
 
     #[test]
     fn sub_frame_chunk_yields_no_frame_but_is_retained() {
@@ -157,5 +446,161 @@ mod tests {
         let mut buf = vec![0.0f32; 10];
         assert!(take_frame(&mut buf, 0).is_none());
         assert_eq!(buf.len(), 10);
+    }
+
+    // --- energy gate ---
+
+    /// rustpotter's real frame size at 16 kHz, so the derived per-frame windows
+    /// (pre-roll/hangover) in these tests match production.
+    const SPF: usize = 480; // 30 ms at 16 kHz
+    /// A frame whose every sample equals `amp`, so its RMS is exactly `amp`.
+    fn frame_at(amp: f32) -> Vec<f32> {
+        vec![amp; SPF]
+    }
+
+    #[test]
+    fn rms_of_constant_frame_is_its_amplitude() {
+        // sqrt(mean(a²)) == |a| for a constant frame — the property the gate tests rely on.
+        assert!((frame_rms(&frame_at(0.1)) - 0.1).abs() < 1e-6);
+        assert!((frame_rms(&frame_at(0.0)) - 0.0).abs() < 1e-6);
+        assert_eq!(frame_rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn gate_derives_sane_windows_from_frame_size() {
+        let g = EnergyGate::new(SPF); // 30 ms frames
+        // 0.30 s / 0.03 s = 10 frames; 0.60 s / 0.03 s = 20 frames.
+        assert_eq!(g.preroll_frames, 10, "~300 ms pre-roll");
+        assert_eq!(g.hangover_frames, 20, "~600 ms hangover");
+        // EMA coefficients are in (0,1) and attack is far slower than release.
+        assert!(g.up_alpha > 0.0 && g.up_alpha < g.down_alpha && g.down_alpha < 1.0);
+    }
+
+    #[test]
+    fn silence_keeps_gate_closed_and_skips_rustpotter() {
+        // Frames at the floor minimum never clear the open ratio, so every frame
+        // is skipped — this is the idle-CPU saving.
+        let mut g = EnergyGate::new(SPF);
+        for _ in 0..200 {
+            let (reset, frames) = g.admit(frame_at(FLOOR_MIN));
+            assert!(!reset);
+            assert!(frames.is_empty(), "silent frames must skip rustpotter");
+        }
+        assert!(!g.open);
+    }
+
+    #[test]
+    fn loud_onset_opens_and_flushes_preroll_oldest_first() {
+        let mut g = EnergyGate::new(SPF);
+        // Five quiet frames buffer as pre-roll without running rustpotter.
+        for _ in 0..5 {
+            let (_, frames) = g.admit(frame_at(FLOOR_MIN));
+            assert!(frames.is_empty());
+        }
+        // A clearly loud frame (well over +12 dB) opens the gate.
+        let (reset, frames) = g.admit(frame_at(0.2));
+        assert!(!reset);
+        assert!(g.open, "loud onset must open the gate");
+        // The 5 buffered quiet frames PLUS the loud onset frame are flushed, so
+        // rustpotter sees the full onset as a contiguous block.
+        assert_eq!(frames.len(), 6, "pre-roll + onset flushed together");
+        assert!(
+            (frame_rms(frames.last().unwrap()) - 0.2).abs() < 1e-6,
+            "the onset frame is flushed last (most recent)"
+        );
+        assert!(
+            frames[..5].iter().all(|f| frame_rms(f) <= FLOOR_MIN + 1e-6),
+            "the quiet pre-roll precedes the onset"
+        );
+    }
+
+    #[test]
+    fn preroll_is_capped_to_its_window() {
+        // Far more quiet frames than the pre-roll holds: only the most recent
+        // `preroll_frames` (+ the onset) survive to the flush.
+        let mut g = EnergyGate::new(SPF);
+        for _ in 0..100 {
+            g.admit(frame_at(FLOOR_MIN));
+        }
+        let (_, frames) = g.admit(frame_at(0.2));
+        assert_eq!(
+            frames.len(),
+            g.preroll_frames + 1,
+            "pre-roll is bounded; only recent context plus the onset is flushed"
+        );
+    }
+
+    #[test]
+    fn open_gate_feeds_then_closes_after_hangover_and_requests_reset() {
+        let mut g = EnergyGate::new(SPF);
+        g.admit(frame_at(0.2)); // open
+        assert!(g.open);
+        // While quiet but within the hangover, each frame is still fed (so a
+        // non-eager detector can confirm its peak on the trailing silence).
+        for i in 0..g.hangover_frames {
+            let (reset, frames) = g.admit(frame_at(FLOOR_MIN));
+            assert!(!reset, "still feeding during hangover (frame {i})");
+            assert_eq!(frames.len(), 1, "the tail frame is fed (frame {i})");
+        }
+        // The frame after the hangover elapses closes the gate and asks for a reset.
+        let (reset, frames) = g.admit(frame_at(FLOOR_MIN));
+        assert!(reset, "gate close must reset rustpotter's window");
+        assert!(frames.is_empty(), "nothing is run on the closing frame");
+        assert!(!g.open);
+    }
+
+    #[test]
+    fn ongoing_speech_re_arms_the_hangover_so_it_never_closes_mid_word() {
+        let mut g = EnergyGate::new(SPF);
+        g.admit(frame_at(0.2)); // open
+        // Alternate quiet/loud well within the hangover: the loud frames keep
+        // re-arming it, so the gate must stay open throughout (no reset).
+        for _ in 0..(g.hangover_frames * 3) {
+            let (reset_q, _) = g.admit(frame_at(FLOOR_MIN));
+            assert!(!reset_q);
+            let (reset_l, frames_l) = g.admit(frame_at(0.2));
+            assert!(!reset_l);
+            assert_eq!(frames_l.len(), 1);
+        }
+        assert!(
+            g.open,
+            "speech that keeps returning must hold the gate open"
+        );
+    }
+
+    #[test]
+    fn floor_adapts_so_steady_ambient_noise_eventually_gates() {
+        // Steady moderate noise opens the gate at first (floor starts at the
+        // minimum) but, as the floor climbs to the ambient level, the same noise
+        // no longer clears the open ratio and the gate closes — the self-tuning
+        // requirement.
+        let mut g = EnergyGate::new(SPF);
+        let ambient = 8e-3; // ~−42 dBFS, between FLOOR_MIN and FLOOR_MAX
+        let (_, first) = g.admit(frame_at(ambient));
+        assert!(
+            !first.is_empty(),
+            "before the floor has learned the room, ambient must fail OPEN (fed)"
+        );
+        // Let the floor converge (well past the ~10 s attack constant).
+        for _ in 0..600 {
+            g.admit(frame_at(ambient));
+        }
+        let (_, settled) = g.admit(frame_at(ambient));
+        assert!(
+            settled.is_empty() && !g.open,
+            "once the floor tracks ambient, steady noise is gated out (CPU saved)"
+        );
+        assert!(g.floor > ambient / OPEN_RATIO, "floor rose toward ambient");
+    }
+
+    #[test]
+    fn floor_never_collapses_below_the_minimum() {
+        // Pure digital silence must not drive the floor to zero (which would make
+        // the gate open on any nonzero sample).
+        let mut g = EnergyGate::new(SPF);
+        for _ in 0..1000 {
+            g.admit(frame_at(0.0));
+        }
+        assert!(g.floor >= FLOOR_MIN, "floor is clamped at its minimum");
     }
 }

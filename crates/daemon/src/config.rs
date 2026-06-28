@@ -113,6 +113,14 @@ pub struct WakeWordConfig {
     /// value falls back to the default instead of failing the whole parse.
     #[serde(deserialize_with = "deserialize_listening_cue")]
     pub listening_cue: ListeningCue,
+    /// Run an energy (RMS) gate in front of rustpotter so the expensive
+    /// wake-word path is skipped during silence, cutting idle CPU (the detector
+    /// is the dominant idle cost). The gate is fail-open and accuracy-neutral
+    /// when there is speech-level audio; set `false` to restore the original
+    /// always-run behaviour. Captured at startup like `eager` — a change needs a
+    /// restart (the detector is rebuilt only on a `sensitivity` reload). Default
+    /// `true`.
+    pub energy_gate: bool,
     /// Pause capture (release the mic) when the logind session goes inactive —
     /// e.g. on fast-user-switch — so the daemon doesn't keep recording the
     /// foreground user (privacy + cloud-pipeline cost + device contention)
@@ -235,6 +243,7 @@ impl Default for WakeWordConfig {
             sensitivity: 0.5,
             eager: true,
             listening_cue: ListeningCue::Ding,
+            energy_gate: true,
             pause_on_session_inactive: true,
         }
     }
@@ -510,6 +519,27 @@ mod tests {
         assert!(
             config.pause_on_session_inactive,
             "session gating is on by default (voice#103)"
+        );
+        assert!(
+            config.energy_gate,
+            "the wake-word energy gate is on by default (idle-CPU saving)"
+        );
+    }
+
+    #[test]
+    fn parses_energy_gate_opt_out() {
+        // The energy gate can be turned off to restore the original always-run
+        // wake-word path; the knob round-trips from TOML and unspecified fields
+        // keep their defaults.
+        let config: Config = toml::from_str("[wake_word]\nenergy_gate = false\n")
+            .expect("config with the opt-out parses");
+        assert!(
+            !config.wake_word.energy_gate,
+            "energy_gate=false must be honoured"
+        );
+        assert!(
+            config.wake_word.eager,
+            "unspecified eager stays the default alongside the opt-out"
         );
     }
 
