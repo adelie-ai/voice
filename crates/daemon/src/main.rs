@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing_subscriber::EnvFilter;
 
+mod calibration;
 mod config;
 mod cue;
 mod pipeline;
@@ -45,6 +46,16 @@ async fn main() -> Result<()> {
     if std::env::args().skip(1).any(|a| a == "list-devices") {
         list_devices();
         return Ok(());
+    }
+
+    // `adele-voice calibrate [N]`: drive wake-word calibration on the running
+    // daemon over D-Bus (#121). A thin client — the daemon owns the mic and does
+    // the measuring; this just prompts and prints. The optional N is the number
+    // of utterances (0/absent uses the daemon default).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("calibrate") {
+        let utterances = args.get(1).and_then(|a| a.parse::<u32>().ok()).unwrap_or(0);
+        return run_calibrate_cli(utterances).await;
     }
 
     tracing::info!("adele-voice starting");
@@ -105,6 +116,11 @@ async fn main() -> Result<()> {
     // Reload ping: the config-file watcher and the D-Bus `Reload` method both
     // ask the pipeline to re-read config.toml and apply changed tunables (#52).
     let (reload_tx, reload_rx) = tokio::sync::mpsc::channel::<()>(4);
+    // Wake-word calibration (#121): the D-Bus `CalibrateWake` method hands a
+    // request to the pipeline and awaits the outcome. Depth 1 — calibration is
+    // modal, one at a time.
+    let (calibrate_tx, calibrate_rx) =
+        tokio::sync::mpsc::channel::<adele_voice_dbus_interface::CalibrationRequest>(1);
 
     // Text-to-speech service backing SayText/SynthesizeText and voice
     // selection. Shares the backend instance (TTS clones share the active-voice
@@ -149,6 +165,7 @@ async fn main() -> Result<()> {
         stop_tx,
         tts_tx,
         reload_tx.clone(),
+        calibrate_tx,
     );
 
     let connection = zbus::Connection::session().await?;
@@ -230,7 +247,8 @@ async fn main() -> Result<()> {
     )
     .with_signal_tx(signal_tx)
     .with_session_gate(session_gate)
-    .with_capture_state(capture_state_tx);
+    .with_capture_state(capture_state_tx)
+    .with_calibrate(calibrate_rx);
 
     tokio::select! {
         result = pipeline.run() => {
@@ -481,6 +499,70 @@ fn check_setup(config: &config::Config) {
         "Fallback policy: if the configured backend can't initialize it falls back to a LOCAL"
     );
     println!("backend (Piper) — never to a billable cloud backend automatically.");
+}
+
+/// `adele-voice calibrate [N]`: client for the daemon's wake-word calibration
+/// (#121). The daemon owns the mic and does the measuring; this subscribes to
+/// progress, calls `CalibrateWake`, prompts the user, and prints the result.
+async fn run_calibrate_cli(utterances: u32) -> Result<()> {
+    use futures_util::StreamExt;
+
+    let conn = zbus::Connection::session()
+        .await
+        .context("failed to connect to the session bus")?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.desktopAssistant.Voice",
+        DBUS_VOICE_PATH,
+        "org.desktopAssistant.Voice",
+    )
+    .await
+    .context("failed to reach the adele-voice daemon — is it running?")?;
+
+    // Subscribe BEFORE invoking so no progress is missed.
+    let mut progress = proxy
+        .receive_signal("CalibrationProgress")
+        .await
+        .context("failed to subscribe to calibration progress")?;
+
+    println!(
+        "Wake-word calibration. I'll ask you to say \"Hey Adele\" a few times — \
+         speak normally, the way you would in everyday use.\n"
+    );
+
+    // Print prompts/measurements as they stream in. Aborted once the call
+    // returns (the daemon stops emitting then anyway).
+    let printer = tokio::spawn(async move {
+        while let Some(msg) = progress.next().await {
+            let Ok((captured, total, score)) = msg.body().deserialize::<(u32, u32, f64)>() else {
+                continue;
+            };
+            if score < -1.5 {
+                println!("   …didn't catch that — try again.");
+            } else if score < 0.0 {
+                println!("-> Say \"Hey Adele\" now ({}/{})", captured + 1, total);
+            } else {
+                println!("   got it ({captured}/{total}), match score {score:.2}");
+            }
+        }
+    });
+
+    let reply = proxy.call_method("CalibrateWake", &(utterances,)).await;
+    printer.abort();
+    let reply = reply.map_err(|e| anyhow::anyhow!("calibration failed: {e}"))?;
+
+    let (sensitivity, samples, min, max, mean): (f64, u32, f64, f64, f64) = reply
+        .body()
+        .deserialize()
+        .context("unexpected calibration reply from the daemon")?;
+
+    println!("\nCalibration complete.");
+    println!("   Heard {samples} clear wake words (scores {min:.2}-{max:.2}, average {mean:.2}).");
+    println!(
+        "   Wake sensitivity set to {sensitivity:.2} (a margin below your weakest), \
+         applied live and saved."
+    );
+    Ok(())
 }
 
 #[cfg(test)]

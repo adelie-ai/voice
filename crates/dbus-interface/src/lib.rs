@@ -37,12 +37,46 @@ pub enum TtsCommand {
 /// KDE widget) can react without polling (voice#85). State transitions are
 /// carried separately by the existing `State` watch channel; these are the
 /// per-turn text events.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VoiceSignal {
     /// A user utterance was transcribed (the clean transcript text).
     TranscriptReady(String),
     /// Adele is about to speak a sentence aloud (the sentence text).
     SpeakingText(String),
+    /// Wake-word calibration progress (#121): `captured` utterances of `total`
+    /// recorded so far, and the peak `score` of the most recent one. A negative
+    /// `score` is a prompt rather than a measurement: `-1.0` means "speak the
+    /// next utterance now", `-2.0` means "no clear wake word heard — try again".
+    CalibrationProgress {
+        captured: u32,
+        total: u32,
+        score: f64,
+    },
+}
+
+/// A request to run wake-word calibration on the pipeline (#121). The pipeline
+/// takes over its mic capture briefly, measures `utterances` spoken wake-word
+/// peaks (emitting [`VoiceSignal::CalibrationProgress`] as it goes), sets the
+/// new cutoff live, persists it, and replies with the outcome.
+pub struct CalibrationRequest {
+    pub utterances: u32,
+    pub reply: oneshot::Sender<Result<CalibrationOutcome, String>>,
+}
+
+/// The result of a calibration run: the cutoff that was applied (and persisted)
+/// plus the score statistics it was derived from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalibrationOutcome {
+    /// The wake sensitivity that was applied and persisted.
+    pub sensitivity: f32,
+    /// How many utterance peaks the recommendation was based on.
+    pub samples: u32,
+    /// The lowest observed peak (the recommendation sits a margin below this).
+    pub min_peak: f32,
+    /// The highest observed peak.
+    pub max_peak: f32,
+    /// The mean observed peak.
+    pub mean_peak: f32,
 }
 
 /// The real capture (microphone) state, separate from the pipeline `State`
@@ -109,6 +143,9 @@ pub struct DbusVoiceAdapter {
     /// (config#52). The KCM calls `Reload` after writing config.toml so live
     /// tuning takes effect without waiting for the file watcher.
     reload_tx: mpsc::Sender<()>,
+    /// Hands a wake-word calibration request to the pipeline (#121) and awaits
+    /// the outcome. The CLI and the KCM both drive calibration through this.
+    calibrate_tx: mpsc::Sender<CalibrationRequest>,
 }
 
 impl DbusVoiceAdapter {
@@ -122,6 +159,7 @@ impl DbusVoiceAdapter {
         stop_tx: mpsc::Sender<StopRequest>,
         tts_tx: mpsc::Sender<TtsCommand>,
         reload_tx: mpsc::Sender<()>,
+        calibrate_tx: mpsc::Sender<CalibrationRequest>,
     ) -> Self {
         Self {
             state_rx,
@@ -132,6 +170,7 @@ impl DbusVoiceAdapter {
             stop_tx,
             tts_tx,
             reload_tx,
+            calibrate_tx,
         }
     }
 }
@@ -217,9 +256,9 @@ impl DbusVoiceAdapter {
     /// Re-read `~/.config/adele-voice/config.toml` and apply any changed
     /// tunables to the running pipeline without a service restart (config#52).
     /// Hot-applies vad.speech_threshold, vad.silence_duration_ms,
-    /// assistant.followup_timeout_ms, assistant.conversation_mode, and
-    /// idle_exit_timeout_ms; rebuilds the wake detector on a
-    /// wake_word.sensitivity change. An audio-device change is logged as
+    /// assistant.followup_timeout_ms, assistant.conversation_mode,
+    /// idle_exit_timeout_ms, and wake_word.sensitivity (the last applied live to
+    /// the running detector, no rebuild). An audio-device change is logged as
     /// needing a restart (it can't be hot-swapped). The KCM calls this after
     /// writing the config so live tuning is instant; a file watcher also picks
     /// up edits made any other way.
@@ -302,9 +341,54 @@ impl DbusVoiceAdapter {
             .map_err(fdo::Error::Failed)
     }
 
+    /// Calibrate the wake-word sensitivity to this user/mic (#121). The daemon
+    /// briefly takes over the microphone and asks the user to say "Hey Adele"
+    /// `utterances` times (0 selects a sensible default; the count is clamped to
+    /// a reasonable range), measuring each one's peak match score. It then sets
+    /// the sensitivity a margin below the worst score, applies it live, and
+    /// persists it to the config file. Progress is reported via
+    /// `CalibrationProgress` signals while this call is in flight.
+    ///
+    /// Returns `(sensitivity, samples, min_peak, max_peak, mean_peak)`: the
+    /// applied cutoff and the score statistics it came from. Fails if voice is
+    /// busy (not idle) or no clear wake word could be heard.
+    async fn calibrate_wake(&self, utterances: u32) -> fdo::Result<(f64, u32, f64, f64, f64)> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.calibrate_tx
+            .send(CalibrationRequest {
+                utterances,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("failed to start calibration: {e}")))?;
+        let outcome = reply_rx
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("calibration was dropped: {e}")))?
+            .map_err(fdo::Error::Failed)?;
+        Ok((
+            outcome.sensitivity as f64,
+            outcome.samples,
+            outcome.min_peak as f64,
+            outcome.max_peak as f64,
+            outcome.mean_peak as f64,
+        ))
+    }
+
     /// Signal emitted when the pipeline state changes.
     #[zbus(signal)]
     pub async fn state_changed(emitter: &SignalEmitter<'_>, state: &str) -> zbus::Result<()>;
+
+    /// Wake-word calibration progress (#121): `captured` of `total` utterances
+    /// recorded, and the peak `score` of the most recent. A negative `score` is
+    /// a prompt, not a measurement (`-1.0` = "say the next one now", `-2.0` =
+    /// "didn't hear it, try again").
+    #[zbus(signal)]
+    pub async fn calibration_progress(
+        emitter: &SignalEmitter<'_>,
+        captured: u32,
+        total: u32,
+        score: f64,
+    ) -> zbus::Result<()>;
 
     /// Signal emitted when a transcript is ready.
     #[zbus(signal)]
@@ -361,6 +445,19 @@ pub async fn run_signal_forwarder(
                     Some(VoiceSignal::SpeakingText(text)) => {
                         if let Err(e) = DbusVoiceAdapter::speaking_text(&emitter, &text).await {
                             tracing::debug!(error = %e, "failed to emit SpeakingText");
+                        }
+                    }
+                    Some(VoiceSignal::CalibrationProgress {
+                        captured,
+                        total,
+                        score,
+                    }) => {
+                        if let Err(e) = DbusVoiceAdapter::calibration_progress(
+                            &emitter, captured, total, score,
+                        )
+                        .await
+                        {
+                            tracing::debug!(error = %e, "failed to emit CalibrationProgress");
                         }
                     }
                     None => {

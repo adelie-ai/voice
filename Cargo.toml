@@ -26,6 +26,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+# Format-preserving TOML editor: lets the daemon write back a single key (the
+# calibrated wake sensitivity, #121) without reflowing the user's config or
+# dropping its comments, unlike a full serde round-trip.
+toml_edit = "0.22"
 dirs = "6"
 notify = "8"
 # FFT-based audio resampler. Shared by the core batch `resample` helper (used by

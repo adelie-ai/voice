@@ -493,6 +493,36 @@ pub fn load() -> Result<Config> {
     Ok(config)
 }
 
+/// Persist a (calibrated) wake sensitivity to `wake_word.sensitivity` in the
+/// config file, preserving everything else — comments, formatting, key order —
+/// by editing the document in place instead of re-serializing the whole Config
+/// (#121). Creates the file and the `[wake_word]` table if they don't exist.
+pub fn persist_wake_sensitivity(sensitivity: f32) -> Result<()> {
+    let path = config_path();
+    let mut doc = if path.exists() {
+        std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read config from {}", path.display()))?
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("failed to parse config at {}", path.display()))?
+    } else {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create config dir {}", dir.display()))?;
+        }
+        toml_edit::DocumentMut::new()
+    };
+    // Mutable indexing auto-creates the `[wake_word]` table if absent.
+    doc["wake_word"]["sensitivity"] = toml_edit::value(sensitivity as f64);
+    std::fs::write(&path, doc.to_string())
+        .with_context(|| format!("failed to write config to {}", path.display()))?;
+    tracing::info!(
+        sensitivity,
+        path = %path.display(),
+        "persisted calibrated wake sensitivity"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

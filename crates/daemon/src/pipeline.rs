@@ -10,10 +10,11 @@ use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
-use adele_voice_dbus_interface::{CaptureState, StopRequest, VoiceSignal};
+use adele_voice_dbus_interface::{CalibrationRequest, CaptureState, StopRequest, VoiceSignal};
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
+use crate::calibration;
 use crate::config::{self, ClientToolsConfig, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
 use crate::session::SessionGate;
@@ -24,6 +25,18 @@ async fn sleep_opt(dur: Option<Duration>) {
     match dur {
         Some(d) => tokio::time::sleep(d).await,
         None => std::future::pending::<()>().await,
+    }
+}
+
+/// Await the next calibration request if a channel is attached, else never
+/// resolve — so the `select!` arm is dormant when calibration isn't wired
+/// (mirrors [`sleep_opt`]). Returns `None` when the channel has closed.
+async fn recv_calibration(
+    rx: &mut Option<mpsc::Receiver<CalibrationRequest>>,
+) -> Option<CalibrationRequest> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -424,6 +437,10 @@ where
     /// D-Bus layer forwards as `TranscriptReady` / `SpeakingText` signals
     /// (voice#85). `None` when no D-Bus forwarder is attached (e.g. in tests).
     signal_tx: Option<mpsc::Sender<VoiceSignal>>,
+    /// Inbound wake-word calibration requests (#121). `None` when no calibration
+    /// channel is attached (e.g. in tests); when present, an idle pipeline can
+    /// take over the mic to measure the user's wake scores.
+    calibrate_rx: Option<mpsc::Receiver<CalibrationRequest>>,
     /// logind session-active gate (voice#103). When the session goes inactive
     /// (fast user switch) the mic is released; an inert gate (logind absent or
     /// the feature disabled) never pauses. Defaults to inert.
@@ -523,6 +540,7 @@ where
             session_end_requested: false,
             listen_for_more_requested: false,
             signal_tx: None,
+            calibrate_rx: None,
             session: SessionGate::inert(),
             pending_ptt: None,
             // A detached sender (no receiver) so `capture_state_tx.send` is a
@@ -577,6 +595,14 @@ where
     /// (the default) capture is never paused for session reasons.
     pub fn with_session_gate(mut self, session: SessionGate) -> Self {
         self.session = session;
+        self
+    }
+
+    /// Attach the wake-word calibration channel (#121) so the D-Bus
+    /// `CalibrateWake` method can drive a calibration run on the idle pipeline.
+    /// Without it, calibration requests have nowhere to go.
+    pub fn with_calibrate(mut self, rx: mpsc::Receiver<CalibrationRequest>) -> Self {
+        self.calibrate_rx = Some(rx);
         self
     }
 
@@ -898,6 +924,137 @@ where
         }
     }
 
+    /// Run a wake-word calibration session (#121): take over the mic, ask the
+    /// user to say the wake word `req.utterances` times (clamped), measure each
+    /// peak match score, set the sensitivity a margin below the worst, apply it
+    /// live, and persist it. Progress is reported via `CalibrationProgress`
+    /// signals and the outcome is sent back on `req.reply`.
+    ///
+    /// Calibration owns the mic and reconfigures the detector, so it only runs
+    /// from a clean Idle state (and is rejected otherwise). The main loop is
+    /// suspended for the duration — this is a deliberate, user-driven modal step.
+    async fn run_calibration(
+        &mut self,
+        req: CalibrationRequest,
+        audio_rx: &mut mpsc::Receiver<Vec<f32>>,
+    ) {
+        if self.state != State::Idle || self.speaker.is_playing() {
+            let _ = req.reply.send(Err(
+                "voice is busy — finish the current conversation before calibrating".to_string(),
+            ));
+            return;
+        }
+
+        let total = calibration::clamp_utterances(req.utterances);
+        tracing::info!(utterances = total, "wake calibration: starting");
+        self.wake.begin_calibration();
+
+        let mut peaks: Vec<f32> = Vec::with_capacity(total as usize);
+        let max_attempts = calibration::max_attempts(total);
+        let mut attempts = 0u32;
+        while (peaks.len() as u32) < total && attempts < max_attempts {
+            attempts += 1;
+            // A negative score is a prompt, not a measurement: tell the client
+            // "say the next one now".
+            self.emit_signal(VoiceSignal::CalibrationProgress {
+                captured: peaks.len() as u32,
+                total,
+                score: -1.0,
+            });
+            match self.capture_one_wake(audio_rx).await {
+                Some(score) => {
+                    peaks.push(score);
+                    self.emit_signal(VoiceSignal::CalibrationProgress {
+                        captured: peaks.len() as u32,
+                        total,
+                        score: score as f64,
+                    });
+                    tracing::info!(
+                        score,
+                        captured = peaks.len(),
+                        total,
+                        "wake calibration: captured utterance"
+                    );
+                }
+                None => {
+                    // Timed out with nothing clear — prompt a retry (-2.0).
+                    self.emit_signal(VoiceSignal::CalibrationProgress {
+                        captured: peaks.len() as u32,
+                        total,
+                        score: -2.0,
+                    });
+                    tracing::warn!("wake calibration: no clear wake word heard, retrying");
+                }
+            }
+        }
+
+        // Decide the outcome, then ALWAYS leave calibration mode — restoring the
+        // user's eager setting and applying either the new cutoff (success) or
+        // the prior sensitivity unchanged (failure).
+        let result = match calibration::recommend(&peaks) {
+            Some(outcome) => {
+                if let Err(e) = self.wake.end_calibration(outcome.sensitivity) {
+                    tracing::warn!("wake calibration: failed to apply new cutoff: {e}");
+                }
+                // Keep the tunables snapshot in step so the file-watcher reload
+                // triggered by the persist below is a no-op for sensitivity.
+                self.tunables.wake_sensitivity = outcome.sensitivity;
+                match config::persist_wake_sensitivity(outcome.sensitivity) {
+                    Ok(()) => Ok(outcome),
+                    Err(e) => Err(format!(
+                        "calibrated to {:.2} and applied it, but couldn't save it: {e}",
+                        outcome.sensitivity
+                    )),
+                }
+            }
+            None => {
+                let _ = self.wake.end_calibration(self.tunables.wake_sensitivity);
+                Err(format!(
+                    "couldn't hear enough clear wake words (got {} of {}) — check the \
+                     microphone and try again",
+                    peaks.len(),
+                    total
+                ))
+            }
+        };
+
+        match &result {
+            Ok(o) => tracing::info!(
+                sensitivity = o.sensitivity,
+                samples = o.samples,
+                "wake calibration: complete"
+            ),
+            Err(e) => tracing::warn!("wake calibration: {e}"),
+        }
+        let _ = req.reply.send(result);
+    }
+
+    /// Listen for one spoken wake word during a calibration session, returning
+    /// its peak score, or `None` if nothing clear is heard before the
+    /// per-utterance timeout (or capture ends). The detector is in calibration
+    /// mode, so `detect` fires once per utterance at the true peak.
+    async fn capture_one_wake(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) -> Option<f32> {
+        let deadline = tokio::time::sleep(calibration::UTTERANCE_TIMEOUT);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => return None,
+                chunk = audio_rx.recv() => {
+                    let chunk = chunk?;
+                    match self.wake.detect(&chunk) {
+                        Ok(true) => {
+                            if let Some(score) = self.wake.take_last_score() {
+                                return Some(score);
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!("wake calibration: detect error: {e}"),
+                    }
+                }
+            }
+        }
+    }
+
     /// Advertise the enabled session-control client tools to the orchestrator
     /// (voice#61) so the LLM can stop/continue listening or speak a line. A
     /// failure here must never stop the daemon — voice still works without the
@@ -1182,6 +1339,18 @@ where
                 // file watcher (debounced) or the D-Bus `Reload` method.
                 Some(()) = self.reload_rx.recv() => {
                     self.reload();
+                }
+
+                // Wake-word calibration (#121): the D-Bus `CalibrateWake` method
+                // routes a request here. It takes over the mic to measure the
+                // user's wake-word scores, so it only runs from a clean Idle
+                // state (run_calibration rejects otherwise).
+                req = recv_calibration(&mut self.calibrate_rx) => {
+                    match req {
+                        Some(req) => self.run_calibration(req, &mut audio_rx).await,
+                        // Channel closed: disarm the arm so it stops resolving.
+                        None => self.calibrate_rx = None,
+                    }
                 }
 
                 // Process audio chunks
