@@ -22,8 +22,10 @@ pub const MIN_SAMPLES: usize = 3;
 pub const UTTERANCE_TIMEOUT: Duration = Duration::from_secs(12);
 /// A measured peak below this is treated as "no clear wake word heard" (only
 /// ambient/noise weakly matched the template) rather than a real utterance, so
-/// it's retried instead of recorded. Comfortably below a genuine match (~0.4+).
-pub const MIN_PEAK: f32 = 0.15;
+/// it's retried instead of recorded. Set above typical ambient template-match
+/// noise and well below a genuine "Hey Adele" (~0.4+), so noise can't latch the
+/// settle timer before the user actually speaks.
+pub const MIN_PEAK: f32 = 0.20;
 /// Once the running peak has reached [`MIN_PEAK`] and then stopped rising for
 /// this long, the utterance is considered finished and its peak is recorded —
 /// no dependence on the detector "firing".
