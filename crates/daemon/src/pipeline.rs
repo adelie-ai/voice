@@ -1030,28 +1030,50 @@ where
     }
 
     /// Listen for one spoken wake word during a calibration session, returning
-    /// its peak score, or `None` if nothing clear is heard before the
-    /// per-utterance timeout (or capture ends). The detector is in calibration
-    /// mode, so `detect` fires once per utterance at the true peak.
+    /// its peak match score — or `None` if nothing clear is heard before the
+    /// per-utterance timeout (or capture ends).
+    ///
+    /// We don't wait for the detector to "fire": at the low calibration threshold
+    /// a non-eager detector never falls back, so instead we track rustpotter's
+    /// running peak ([`WakeWordDetector::peak_score`]) and end the utterance once
+    /// that peak has reached [`calibration::MIN_PEAK`] and then stopped rising for
+    /// [`calibration::PEAK_SETTLE`] (the word has finished). A peak that never
+    /// clears `MIN_PEAK` within the window is treated as "didn't hear it".
     async fn capture_one_wake(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) -> Option<f32> {
+        self.wake.clear_peak();
         let deadline = tokio::time::sleep(calibration::UTTERANCE_TIMEOUT);
         tokio::pin!(deadline);
+        let mut best = 0.0f32;
+        let mut last_gain = Instant::now();
         loop {
             tokio::select! {
-                _ = &mut deadline => return None,
+                _ = &mut deadline => break,
                 chunk = audio_rx.recv() => {
                     let chunk = chunk?;
-                    match self.wake.detect(&chunk) {
-                        Ok(true) => {
-                            if let Some(score) = self.wake.take_last_score() {
-                                return Some(score);
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(e) => tracing::warn!("wake calibration: detect error: {e}"),
+                    if let Some(peak) = self.wake.peak_score(&chunk)
+                        && peak > best + 0.005
+                    {
+                        best = peak;
+                        last_gain = Instant::now();
+                    }
+                    // Once a real match has formed and the score has settled, the
+                    // utterance is done — record it without waiting out the timeout.
+                    if best >= calibration::MIN_PEAK && last_gain.elapsed() >= calibration::PEAK_SETTLE
+                    {
+                        break;
                     }
                 }
             }
+        }
+        if best >= calibration::MIN_PEAK {
+            tracing::info!(peak = best, "wake calibration: utterance peak measured");
+            Some(best)
+        } else {
+            tracing::info!(
+                peak = best,
+                "wake calibration: no clear match this utterance"
+            );
+            None
         }
     }
 

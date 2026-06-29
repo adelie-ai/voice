@@ -17,17 +17,24 @@ pub trait WakeWordDetector: Send {
         Ok(())
     }
 
-    /// Enter a calibration session: the detector should report the *true peak
-    /// score* of each spoken wake word (e.g. by running at a low threshold,
-    /// non-eager) so a caller can measure the user's real scores. Default no-op.
+    /// Enter a calibration session: the detector should run so that the *running
+    /// peak match score* of an utterance can be read out via [`Self::peak_score`]
+    /// (e.g. at a very low threshold so a partial always forms). Default no-op.
     fn begin_calibration(&mut self) {}
 
-    /// During calibration, return the peak score of the most recent detection
-    /// (one utterance → one peak), consuming it so the next call reflects the
-    /// next utterance. Default: nothing to report.
-    fn take_last_score(&mut self) -> Option<f32> {
+    /// During calibration, feed audio and return the running peak match score for
+    /// the CURRENT utterance so far (the maximum score seen since the last
+    /// [`Self::clear_peak`]), or `None` if nothing has scored yet. Unlike
+    /// `detect`, this never depends on the detector "firing" — the caller decides
+    /// when the utterance ends — so it works regardless of the score noise floor.
+    /// Default: nothing to report.
+    fn peak_score(&mut self, _samples: &[f32]) -> Option<f32> {
         None
     }
+
+    /// Reset the running peak (and the detector's window) before the next
+    /// calibration utterance. Default no-op.
+    fn clear_peak(&mut self) {}
 
     /// Leave calibration mode and apply `sensitivity` as the new live cutoff.
     /// The default just applies the sensitivity (calibration was a no-op).

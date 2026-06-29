@@ -20,6 +20,14 @@ pub const MAX_UTTERANCES: u32 = 10;
 pub const MIN_SAMPLES: usize = 3;
 /// How long to wait for each spoken wake word before prompting a retry.
 pub const UTTERANCE_TIMEOUT: Duration = Duration::from_secs(12);
+/// A measured peak below this is treated as "no clear wake word heard" (only
+/// ambient/noise weakly matched the template) rather than a real utterance, so
+/// it's retried instead of recorded. Comfortably below a genuine match (~0.4+).
+pub const MIN_PEAK: f32 = 0.15;
+/// Once the running peak has reached [`MIN_PEAK`] and then stopped rising for
+/// this long, the utterance is considered finished and its peak is recorded —
+/// no dependence on the detector "firing".
+pub const PEAK_SETTLE: Duration = Duration::from_millis(800);
 
 /// Smallest margin below the worst observed peak (in score units), so the cutoff
 /// never sits exactly on a score the user actually produced.

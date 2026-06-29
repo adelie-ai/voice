@@ -86,10 +86,12 @@ pub const MIN_SENSITIVITY: f32 = 0.10;
 /// Hard upper bound for the live wake sensitivity. At/above this essentially no
 /// real utterance scores high enough to fire, so the cutoff is clamped here.
 pub const MAX_SENSITIVITY: f32 = 0.95;
-/// Threshold used *only while calibrating*: low enough (below [`MIN_SENSITIVITY`])
-/// that the user's real wake-word scores — the thing we're trying to measure —
-/// are never gated out before we can observe them.
-const CALIBRATION_THRESHOLD: f32 = 0.05;
+/// Threshold used *only while calibrating*. Very low, so rustpotter forms a
+/// scoring partial for any speech (even a weak match) and its running peak can
+/// be read via `get_partial_detection` — calibration measures that peak directly
+/// rather than waiting for a non-eager "fire", which never happens when the
+/// threshold is below the score's noise floor.
+const CALIBRATION_THRESHOLD: f32 = 0.01;
 
 /// Open the gate at +12 dB over the noise floor (`20·log10(4) ≈ 12.0 dB`).
 const OPEN_RATIO: f32 = 4.0;
@@ -283,15 +285,14 @@ pub struct RustpotterWakeWordDetector {
     /// Optional energy gate (`wake_word.energy_gate`). `None` restores the
     /// original always-run behaviour; `Some` skips rustpotter on silent frames.
     gate: Option<EnergyGate>,
-    /// True while a calibration session is in progress: the energy gate is
-    /// bypassed (so a non-eager measurement run gets rustpotter's full
-    /// fall-back window rather than being truncated by a gate close) and each
-    /// detection's score is stashed in `last_peak` for the caller to read.
+    /// True while a calibration session is in progress. Used to guard
+    /// `set_sensitivity` so a config reload can't clobber the calibration
+    /// threshold mid-session.
     calibrating: bool,
-    /// Peak score of the most recent detection, for calibration to read out
-    /// (one utterance → one peak). Set on every fire; consumed by
-    /// [`Self::take_last_score`].
-    last_peak: Option<f32>,
+    /// Running peak match score for the current calibration utterance — the max
+    /// of every fire / partial score seen since the last [`Self::clear_peak`].
+    /// Read by [`Self::peak_score`].
+    calib_peak: f32,
     /// The user's `eager` setting, saved across a calibration session so it can
     /// be restored afterwards (calibration forces non-eager to measure true
     /// peaks, and `DetectorConfig` isn't `Clone`, so we mutate-and-restore).
@@ -375,7 +376,7 @@ impl RustpotterWakeWordDetector {
             buf: Vec::new(),
             gate: energy_gate.then(|| EnergyGate::new(samples_per_frame)),
             calibrating: false,
-            last_peak: None,
+            calib_peak: 0.0,
             saved_eager: eager,
         })
     }
@@ -394,10 +395,6 @@ impl RustpotterWakeWordDetector {
                 gain = detection.gain,
                 "wake word detected"
             );
-            // Stash the peak so a calibration run can read the user's actual
-            // score for this utterance (harmless in normal operation — nothing
-            // reads it unless calibrating).
-            self.last_peak = Some(detection.score);
             true
         } else {
             false
@@ -421,11 +418,7 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         let mut detected = false;
         let spf = self.samples_per_frame;
         while let Some(frame) = take_frame(&mut self.buf, spf) {
-            // Bypass the gate while calibrating: a non-eager measurement run needs
-            // rustpotter's full trailing fall-back window to confirm each peak, and
-            // a gate close (which resets rustpotter) could truncate it. The user is
-            // speaking deliberately during calibration, so the CPU saving is moot.
-            if self.gate.is_some() && !self.calibrating {
+            if self.gate.is_some() {
                 // The gate decides which frames are worth rustpotter's cost. Its
                 // borrow ends with `admit` (it returns owned data), freeing the
                 // subsequent `self.rustpotter` / `self.run_frame` borrows.
@@ -469,13 +462,13 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         Ok(())
     }
 
-    /// Enter calibration: drive rustpotter at a very low threshold and
-    /// **non-eager** so each spoken wake word yields its TRUE peak score (the
-    /// peak reported on fall-back), regardless of the user's eager preference.
-    /// The energy gate is bypassed for the duration (see [`Self::detect`]).
+    /// Enter calibration: drive rustpotter at a very low threshold so a scoring
+    /// partial forms for any speech and its running peak can be read via
+    /// [`Self::peak_score`]. (We don't rely on the detector "firing": at a
+    /// threshold below the score noise floor a non-eager detector never falls
+    /// back, so we read the partial's peak directly instead.)
     fn begin_calibration(&mut self) {
         self.calibrating = true;
-        self.last_peak = None;
         self.saved_eager = self.config.detector.eager;
         // Drive rustpotter at the low, non-eager calibration settings. We mutate
         // the stored detector config in place (it isn't `Clone`) — `eager` is
@@ -486,12 +479,36 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         self.config.detector.threshold = CALIBRATION_THRESHOLD;
         self.rustpotter
             .update_detector_config(&self.config.detector);
+        self.clear_peak();
     }
 
-    /// Take the peak score of the most recent detection (one utterance → one
-    /// peak), clearing it so the next call reflects the next utterance.
-    fn take_last_score(&mut self) -> Option<f32> {
-        self.last_peak.take()
+    /// Feed audio and return the running peak match score for the current
+    /// utterance (the max of any fire score and the live partial score seen
+    /// since the last [`Self::clear_peak`]). Returns `None` until something has
+    /// scored. The energy gate is not consulted — calibration always wants every
+    /// frame scored.
+    fn peak_score(&mut self, samples: &[f32]) -> Option<f32> {
+        self.buf.extend_from_slice(samples);
+        let spf = self.samples_per_frame;
+        while let Some(frame) = take_frame(&mut self.buf, spf) {
+            // A fire returns the peak and resets the window; otherwise the live
+            // partial holds the running max. Track the max of both so the peak
+            // survives even if the detector happens to fire mid-utterance.
+            if let Some(d) = self.rustpotter.process_samples::<f32>(frame) {
+                self.calib_peak = self.calib_peak.max(d.score);
+            } else if let Some(d) = self.rustpotter.get_partial_detection() {
+                self.calib_peak = self.calib_peak.max(d.score);
+            }
+        }
+        (self.calib_peak > 0.0).then_some(self.calib_peak)
+    }
+
+    /// Reset the running peak and rustpotter's window before the next utterance,
+    /// and drop any buffered sub-frame audio so a new utterance starts clean.
+    fn clear_peak(&mut self) {
+        self.calib_peak = 0.0;
+        self.buf.clear();
+        self.rustpotter.reset();
     }
 
     /// Leave calibration mode and apply the chosen cutoff as the new live
@@ -499,7 +516,7 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
     /// `self.config`) in the same `update_detector_config` call.
     fn end_calibration(&mut self, sensitivity: f32) -> Result<(), VoiceError> {
         self.calibrating = false;
-        self.last_peak = None;
+        self.calib_peak = 0.0;
         // Restore the user's eager setting; set_sensitivity (now that
         // `calibrating` is false) sets threshold = cutoff and pushes the whole
         // restored detector config to rustpotter in one update.
