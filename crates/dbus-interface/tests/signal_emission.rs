@@ -69,10 +69,13 @@ async fn emits_state_transcript_and_speaking_signals() {
     let (server, client) = connection_pair().await;
 
     let (state_tx, state_rx) = watch::channel(State::Idle);
+    let (_enabled_tx, enabled_rx) = watch::channel(true);
     let (signal_tx, signal_rx) = mpsc::channel::<VoiceSignal>(16);
 
     let emitter = SignalEmitter::new(&server, PATH).unwrap();
-    tokio::spawn(run_signal_forwarder(emitter, state_rx, signal_rx));
+    tokio::spawn(run_signal_forwarder(
+        emitter, state_rx, enabled_rx, signal_rx,
+    ));
 
     // Listen on the client side for incoming signals.
     let mut stream = MessageStream::from(client);
@@ -111,6 +114,66 @@ async fn emits_state_transcript_and_speaking_signals() {
     assert_eq!(arg, "It's sunny.");
 }
 
+/// Like `next_signal` but for a bool payload (EnabledChanged), voice#124.
+async fn next_enabled_signal(stream: &mut MessageStream) -> (String, bool) {
+    let deadline = tokio::time::sleep(Duration::from_secs(3));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => panic!("timed out waiting for a signal"),
+            msg = stream.next() => {
+                let msg = msg.expect("stream ended").expect("valid message");
+                let header = msg.header();
+                if header.message_type() != zbus::message::Type::Signal {
+                    continue;
+                }
+                let member = header.member().map(|m| m.to_string()).unwrap_or_default();
+                let iface = header.interface().map(|i| i.to_string()).unwrap_or_default();
+                let path = header.path().map(|p| p.to_string()).unwrap_or_default();
+                if iface != IFACE || path != PATH {
+                    continue;
+                }
+                let arg: bool = msg.body().deserialize().unwrap_or_default();
+                return (member, arg);
+            }
+        }
+    }
+}
+
+/// voice#124: toggling the enabled channel emits `EnabledChanged(bool)` so a
+/// client reflects mute (and, crucially, a timed *auto*-unmute) without polling.
+#[tokio::test]
+async fn emits_enabled_changed_signal() {
+    let (server, client) = connection_pair().await;
+
+    let (_state_tx, state_rx) = watch::channel(State::Idle);
+    let (enabled_tx, enabled_rx) = watch::channel(true);
+    let (_signal_tx, signal_rx) = mpsc::channel::<VoiceSignal>(16);
+
+    let emitter = SignalEmitter::new(&server, PATH).unwrap();
+    tokio::spawn(run_signal_forwarder(
+        emitter, state_rx, enabled_rx, signal_rx,
+    ));
+
+    let mut stream = MessageStream::from(client);
+
+    // Consume the initial StateChanged(Idle) the forwarder emits on start.
+    let (member, _) = next_signal(&mut stream).await;
+    assert_eq!(member, "StateChanged");
+
+    // Mute -> EnabledChanged(false).
+    enabled_tx.send(false).unwrap();
+    let (member, enabled) = next_enabled_signal(&mut stream).await;
+    assert_eq!(member, "EnabledChanged");
+    assert!(!enabled, "muting must emit EnabledChanged(false)");
+
+    // Unmute (as a timed mute's auto-unmute would) -> EnabledChanged(true).
+    enabled_tx.send(true).unwrap();
+    let (member, enabled) = next_enabled_signal(&mut stream).await;
+    assert_eq!(member, "EnabledChanged");
+    assert!(enabled, "unmuting must emit EnabledChanged(true)");
+}
+
 /// The forwarder shuts down cleanly when the pipeline drops both sources (so the
 /// daemon doesn't leak the task).
 #[tokio::test]
@@ -118,10 +181,13 @@ async fn forwarder_stops_when_pipeline_is_gone() {
     let (server, _client) = connection_pair().await;
 
     let (state_tx, state_rx) = watch::channel(State::Idle);
+    let (_enabled_tx, enabled_rx) = watch::channel(true);
     let (signal_tx, signal_rx) = mpsc::channel::<VoiceSignal>(16);
 
     let emitter = SignalEmitter::new(&server, PATH).unwrap();
-    let handle = tokio::spawn(run_signal_forwarder(emitter, state_rx, signal_rx));
+    let handle = tokio::spawn(run_signal_forwarder(
+        emitter, state_rx, enabled_rx, signal_rx,
+    ));
 
     drop(state_tx);
     drop(signal_tx);

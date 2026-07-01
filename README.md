@@ -124,7 +124,10 @@ The daemon owns **`org.desktopAssistant.Voice`** at `/org/desktopAssistant/Voice
 | Member | Kind | Purpose |
 |---|---|---|
 | `GetState() → s` | method | `Idle` / `Listening` / `Processing` / `Speaking` |
-| `SetEnabled(b)` / `GetEnabled() → b` | method | toggle wake-word processing |
+| `SetEnabled(b)` / `GetEnabled() → b` | method | toggle wake-word processing (fully **closes** the mic when off, not just muting wake detection) |
+| `MuteFor(u)` | method | **temporarily inhibit** voice — close the mic now, auto-unmuting after `u` seconds (`0` = indefinite, until re-enabled; clamped to 24h). The "mute for this meeting" control: silences passive listening so Adele won't answer other people on a call, while push-to-talk still works. A manual `SetEnabled` or a later `MuteFor` supersedes a pending timer |
+| `GetMuteSecondsRemaining() → u` | method | seconds left on a timed mute (`0` when enabled or muted indefinitely) — for a live countdown |
+| `EnabledChanged(b)` | signal | fires on every enabled transition — `SetEnabled`, `MuteFor`, or a timed mute **auto-unmuting** — so clients reflect the muted state without polling |
 | `PushToTalk()` | method | skip the wake word, start listening now — routes to the daemon's own session ("Voice Conversation") |
 | `PushToTalkInConversation(s)` | method | like `PushToTalk()`, but dictate into the given orchestrator conversation id (`""` = own session). The in-chat mic button passes the focused conversation so the prompt + spoken reply land in that chat |
 | `StopSpeaking()` | method | cancel current playback |

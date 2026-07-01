@@ -183,7 +183,10 @@ async fn main() -> Result<()> {
     {
         let emitter = zbus::object_server::SignalEmitter::new(&connection, DBUS_VOICE_PATH)?;
         tokio::spawn(adele_voice_dbus_interface::run_signal_forwarder(
-            emitter, state_rx, signal_rx,
+            emitter,
+            state_rx,
+            enabled_rx.clone(),
+            signal_rx,
         ));
     }
 
