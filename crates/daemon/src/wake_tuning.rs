@@ -96,6 +96,14 @@ const TP_MARGIN: f32 = 0.05;
 /// Margin above the strongest false-positive score for the target.
 const FP_MARGIN: f32 = 0.02;
 
+/// Clamp a cutoff to the detector's supported range, so the tuner's anchor and
+/// live mirror can never sit outside what the detector will actually apply (a
+/// hand-typed out-of-range `wake_word.sensitivity` is clamped by the detector,
+/// so the tuner must clamp the same way to stay in step).
+fn clamp_cutoff(cutoff: f32) -> f32 {
+    cutoff.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY)
+}
+
 /// The raw cutoff the observations argue for (before banding / slew), plus
 /// whether TP/FP overlap forced a compromise. `None` when there is no evidence
 /// of either kind yet.
@@ -162,6 +170,7 @@ impl WakeTuner {
     /// Create a tuner anchored at the current cutoff and mode. `enabled` is the
     /// `wake_word.auto_adapt` toggle (default off — log-only).
     pub fn new(cutoff: f32, eager: bool, enabled: bool) -> Self {
+        let cutoff = clamp_cutoff(cutoff);
         Self {
             enabled,
             eager,
@@ -180,6 +189,7 @@ impl WakeTuner {
     /// Re-anchor to a freshly calibrated cutoff + mode and forget history — start
     /// adapting again from the new known-good baseline.
     pub fn recalibrated(&mut self, cutoff: f32, eager: bool) {
+        let cutoff = clamp_cutoff(cutoff);
         self.anchor = cutoff;
         self.current = cutoff;
         self.eager = eager;
@@ -190,6 +200,7 @@ impl WakeTuner {
     /// Re-anchor to a new cutoff (a manual `wake_word.sensitivity` edit) without
     /// changing the mode, forgetting history.
     pub fn reanchor(&mut self, cutoff: f32) {
+        let cutoff = clamp_cutoff(cutoff);
         self.anchor = cutoff;
         self.current = cutoff;
         self.history.clear();
@@ -380,6 +391,17 @@ mod tests {
         let mut t = WakeTuner::new(MAX_SENSITIVITY - 0.03, true, true);
         feed(&mut t, fp(0.99), 200);
         assert!(t.current <= MAX_SENSITIVITY + 1e-6, "got {}", t.current);
+    }
+
+    #[test]
+    fn out_of_range_anchor_is_clamped_to_detector_range() {
+        // A hand-typed out-of-range sensitivity must not leave the tuner's mirror
+        // outside what the detector will apply (it clamps too).
+        assert!(WakeTuner::new(5.0, true, false).current <= MAX_SENSITIVITY + 1e-6);
+        assert!(WakeTuner::new(-1.0, true, false).current >= MIN_SENSITIVITY - 1e-6);
+        let mut t = WakeTuner::new(0.5, true, false);
+        t.reanchor(9.0);
+        assert!(t.current <= MAX_SENSITIVITY + 1e-6);
     }
 
     #[test]
