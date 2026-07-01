@@ -10,10 +10,11 @@ use adele_voice_core::ports::tts::TextToSpeech;
 use adele_voice_core::ports::vad::VoiceActivityDetector;
 use adele_voice_core::ports::wake::WakeWordDetector;
 use adele_voice_core::sentence_buffer::SentenceBuffer;
-use adele_voice_dbus_interface::{CaptureState, StopRequest, VoiceSignal};
+use adele_voice_dbus_interface::{CalibrationRequest, CaptureState, StopRequest, VoiceSignal};
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
+use crate::calibration;
 use crate::config::{self, ClientToolsConfig, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
 use crate::session::SessionGate;
@@ -27,10 +28,17 @@ async fn sleep_opt(dur: Option<Duration>) {
     }
 }
 
-/// Builds a fresh wake detector at a given sensitivity. rustpotter bakes the
-/// detection threshold in at construction, so changing it on reload (config#52)
-/// means rebuilding the detector rather than poking a setter.
-pub type WakeBuilder<W> = Box<dyn Fn(f32) -> Result<W, VoiceError> + Send>;
+/// Await the next calibration request if a channel is attached, else never
+/// resolve — so the `select!` arm is dormant when calibration isn't wired
+/// (mirrors [`sleep_opt`]). Returns `None` when the channel has closed.
+async fn recv_calibration(
+    rx: &mut Option<mpsc::Receiver<CalibrationRequest>>,
+) -> Option<CalibrationRequest> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Spoken when the assistant turn fails — short and human, never the raw error.
 const ERROR_APOLOGY: &str = "Sorry, I ran into an error and couldn't answer that.";
@@ -81,9 +89,9 @@ pub struct TurnTimeouts {
 
 /// The non-wiring configuration for a [`Pipeline`], grouped so `Pipeline::new`
 /// takes one options struct instead of a dozen positional scalars (voice#89).
-/// The audio backends, channels, and `wake_builder` stay positional arguments —
-/// they're wiring, not tunables — while everything here is plain config the
-/// constructor stores or forwards.
+/// The audio backends and channels stay positional arguments — they're wiring,
+/// not tunables — while everything here is plain config the constructor stores
+/// or forwards.
 pub struct PipelineConfig {
     /// Reloadable tunables snapshot (the on-disk truth we diff against).
     pub tunables: Tunables,
@@ -366,8 +374,6 @@ where
     /// the pipeline to re-read the config and apply any changed tunables live
     /// (config#52).
     reload_rx: mpsc::Receiver<()>,
-    /// Rebuilds the wake detector when `wake_word.sensitivity` changes.
-    wake_builder: WakeBuilder<W>,
     /// Snapshot of the live-applicable knobs, diffed against a freshly loaded
     /// config on each reload to decide what to apply.
     tunables: Tunables,
@@ -431,6 +437,10 @@ where
     /// D-Bus layer forwards as `TranscriptReady` / `SpeakingText` signals
     /// (voice#85). `None` when no D-Bus forwarder is attached (e.g. in tests).
     signal_tx: Option<mpsc::Sender<VoiceSignal>>,
+    /// Inbound wake-word calibration requests (#121). `None` when no calibration
+    /// channel is attached (e.g. in tests); when present, an idle pipeline can
+    /// take over the mic to measure the user's wake scores.
+    calibrate_rx: Option<mpsc::Receiver<CalibrationRequest>>,
     /// logind session-active gate (voice#103). When the session goes inactive
     /// (fast user switch) the mic is released; an inert gate (logind absent or
     /// the feature disabled) never pauses. Defaults to inert.
@@ -471,7 +481,6 @@ where
         ptt_rx: mpsc::Receiver<Option<String>>,
         stop_rx: mpsc::Receiver<StopRequest>,
         reload_rx: mpsc::Receiver<()>,
-        wake_builder: WakeBuilder<W>,
         config: PipelineConfig,
     ) -> Self {
         let PipelineConfig {
@@ -509,7 +518,6 @@ where
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             tunables,
             conversation_id: None,
             ptt_conversation_override: None,
@@ -532,6 +540,7 @@ where
             session_end_requested: false,
             listen_for_more_requested: false,
             signal_tx: None,
+            calibrate_rx: None,
             session: SessionGate::inert(),
             pending_ptt: None,
             // A detached sender (no receiver) so `capture_state_tx.send` is a
@@ -586,6 +595,14 @@ where
     /// (the default) capture is never paused for session reasons.
     pub fn with_session_gate(mut self, session: SessionGate) -> Self {
         self.session = session;
+        self
+    }
+
+    /// Attach the wake-word calibration channel (#121) so the D-Bus
+    /// `CalibrateWake` method can drive a calibration run on the idle pipeline.
+    /// Without it, calibration requests have nowhere to go.
+    pub fn with_calibrate(mut self, rx: mpsc::Receiver<CalibrationRequest>) -> Self {
+        self.calibrate_rx = Some(rx);
         self
     }
 
@@ -689,8 +706,7 @@ where
         let assistant = Arc::clone(&self.assistant);
         let timeout = self.connect_timeout.max(Duration::from_secs(30));
         tokio::spawn(async move {
-            if let Err(e) =
-                run_triage(assistant, voice_conv_id.clone(), transcripts, timeout).await
+            if let Err(e) = run_triage(assistant, voice_conv_id.clone(), transcripts, timeout).await
             {
                 tracing::warn!(%voice_conv_id, "post-session triage failed: {e}");
             }
@@ -880,19 +896,22 @@ where
                 "config reload: applied timeouts.narration_flush_ms"
             );
         }
-        if let Some(sensitivity) = plan.rebuild_wake_sensitivity {
-            match (self.wake_builder)(sensitivity) {
-                Ok(wake) => {
-                    self.wake = wake;
+        if let Some(sensitivity) = plan.apply_wake_sensitivity {
+            match self.wake.set_sensitivity(sensitivity) {
+                Ok(()) => {
+                    // Keep the tunables snapshot in step so a later reload (e.g.
+                    // the file-watcher ping after calibration persists the same
+                    // value) sees no change and doesn't re-apply needlessly.
+                    self.tunables.wake_sensitivity = sensitivity;
                     tracing::info!(
                         sensitivity,
-                        "config reload: rebuilt wake detector for wake_word.sensitivity"
+                        "config reload: applied wake_word.sensitivity live"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         sensitivity,
-                        "config reload: failed to rebuild wake detector, keeping current: {e}"
+                        "config reload: failed to apply wake sensitivity, keeping current: {e}"
                     );
                 }
             }
@@ -902,6 +921,203 @@ where
                 "config reload: audio device change ({change}) needs a daemon restart to take \
                  effect — `systemctl --user restart adele-voice`. All other knobs were applied live."
             );
+        }
+    }
+
+    /// Run a wake-word calibration session (#121): take over the mic, ask the
+    /// user to say the wake word `req.utterances` times (clamped), measure each
+    /// peak match score, set the sensitivity a margin below the worst, apply it
+    /// live, and persist it. Progress is reported via `CalibrationProgress`
+    /// signals and the outcome is sent back on `req.reply`.
+    ///
+    /// Calibration owns the mic and reconfigures the detector, so it only runs
+    /// from a clean Idle state (and is rejected otherwise). The main loop is
+    /// suspended for the duration — this is a deliberate, user-driven modal step.
+    async fn run_calibration(
+        &mut self,
+        req: CalibrationRequest,
+        audio_rx: &mut mpsc::Receiver<Vec<f32>>,
+    ) {
+        if self.state != State::Idle || self.speaker.is_playing() {
+            let _ = req.reply.send(Err(
+                "voice is busy — finish the current conversation before calibrating".to_string(),
+            ));
+            return;
+        }
+
+        let total = calibration::clamp_utterances(req.utterances);
+        tracing::info!(utterances = total, "wake calibration: starting");
+        self.wake.begin_calibration();
+
+        // Measure the room's background match level first (in silence), so we can
+        // tell whether standard (non-eager) mode has a usable gap below the peaks.
+        self.emit_signal(VoiceSignal::CalibrationProgress {
+            captured: 0,
+            total,
+            score: -3.0,
+        });
+        let noise_floor = self.measure_noise_floor(audio_rx).await;
+        tracing::info!(noise_floor, "wake calibration: measured background level");
+
+        let mut peaks: Vec<f32> = Vec::with_capacity(total as usize);
+        let max_attempts = calibration::max_attempts(total);
+        let mut attempts = 0u32;
+        while (peaks.len() as u32) < total && attempts < max_attempts {
+            attempts += 1;
+            // A negative score is a prompt, not a measurement: tell the client
+            // "say the next one now".
+            self.emit_signal(VoiceSignal::CalibrationProgress {
+                captured: peaks.len() as u32,
+                total,
+                score: -1.0,
+            });
+            match self.capture_one_wake(audio_rx, noise_floor).await {
+                Some(score) => {
+                    peaks.push(score);
+                    self.emit_signal(VoiceSignal::CalibrationProgress {
+                        captured: peaks.len() as u32,
+                        total,
+                        score: score as f64,
+                    });
+                    tracing::info!(
+                        score,
+                        captured = peaks.len(),
+                        total,
+                        "wake calibration: captured utterance"
+                    );
+                }
+                None => {
+                    // Timed out with nothing clear — prompt a retry (-2.0).
+                    self.emit_signal(VoiceSignal::CalibrationProgress {
+                        captured: peaks.len() as u32,
+                        total,
+                        score: -2.0,
+                    });
+                    tracing::warn!("wake calibration: no clear wake word heard, retrying");
+                }
+            }
+        }
+
+        // Decide the outcome, then ALWAYS leave calibration mode — applying the
+        // best mode + cutoff (success) or restoring the prior settings (failure).
+        let result = match calibration::recommend(&peaks, noise_floor) {
+            Some(outcome) => {
+                if let Err(e) = self
+                    .wake
+                    .end_calibration(outcome.sensitivity, outcome.eager)
+                {
+                    tracing::warn!("wake calibration: failed to apply result: {e}");
+                }
+                // Keep the tunables snapshot in step so the file-watcher reload
+                // triggered by the persist below is a no-op for sensitivity.
+                self.tunables.wake_sensitivity = outcome.sensitivity;
+                match config::persist_wake_settings(outcome.sensitivity, outcome.eager) {
+                    Ok(()) => Ok(outcome),
+                    Err(e) => Err(format!(
+                        "calibrated to {:.2} ({}) and applied it, but couldn't save it: {e}",
+                        outcome.sensitivity,
+                        if outcome.eager { "eager" } else { "standard" }
+                    )),
+                }
+            }
+            None => {
+                self.wake.cancel_calibration();
+                Err(format!(
+                    "couldn't hear enough clear wake words (got {} of {}) — check the \
+                     microphone and try again",
+                    peaks.len(),
+                    total
+                ))
+            }
+        };
+
+        match &result {
+            Ok(o) => tracing::info!(
+                sensitivity = o.sensitivity,
+                eager = o.eager,
+                samples = o.samples,
+                noise_floor = o.noise_floor,
+                "wake calibration: complete"
+            ),
+            Err(e) => tracing::warn!("wake calibration: {e}"),
+        }
+        let _ = req.reply.send(result);
+    }
+
+    /// Sample the room in silence for [`calibration::AMBIENT_MEASURE`] and return
+    /// the highest match score seen — the background level a non-eager cutoff has
+    /// to sit above. Runs the detector in calibration mode (already begun).
+    async fn measure_noise_floor(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) -> f32 {
+        self.wake.clear_peak();
+        let deadline = tokio::time::sleep(calibration::AMBIENT_MEASURE);
+        tokio::pin!(deadline);
+        let mut floor = 0.0f32;
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                chunk = audio_rx.recv() => {
+                    let Some(chunk) = chunk else { break };
+                    if let Some(p) = self.wake.peak_score(&chunk) {
+                        floor = floor.max(p);
+                    }
+                }
+            }
+        }
+        floor
+    }
+
+    /// Listen for one spoken wake word during a calibration session, returning
+    /// its peak match score — or `None` if nothing clear is heard before the
+    /// per-utterance timeout (or capture ends).
+    ///
+    /// We don't wait for the detector to "fire": at the low calibration threshold
+    /// a non-eager detector never falls back, so instead we track rustpotter's
+    /// running peak ([`WakeWordDetector::peak_score`]) and end the utterance once
+    /// that peak has cleared the utterance floor and then stopped rising for
+    /// [`calibration::PEAK_SETTLE`] (the word has finished). The floor is
+    /// [`calibration::min_utterance_peak`] of the measured `noise_floor`, so an
+    /// elevated room level isn't recorded as speech; a peak that never clears it
+    /// is treated as "didn't hear it".
+    async fn capture_one_wake(
+        &mut self,
+        audio_rx: &mut mpsc::Receiver<Vec<f32>>,
+        noise_floor: f32,
+    ) -> Option<f32> {
+        let min_peak = calibration::min_utterance_peak(noise_floor);
+        self.wake.clear_peak();
+        let deadline = tokio::time::sleep(calibration::UTTERANCE_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut best = 0.0f32;
+        let mut last_gain = Instant::now();
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                chunk = audio_rx.recv() => {
+                    let chunk = chunk?;
+                    if let Some(peak) = self.wake.peak_score(&chunk)
+                        && peak > best + 0.005
+                    {
+                        best = peak;
+                        last_gain = Instant::now();
+                    }
+                    // Once a real match has formed and the score has settled, the
+                    // utterance is done — record it without waiting out the timeout.
+                    if best >= min_peak && last_gain.elapsed() >= calibration::PEAK_SETTLE {
+                        break;
+                    }
+                }
+            }
+        }
+        if best >= min_peak {
+            tracing::info!(peak = best, "wake calibration: utterance peak measured");
+            Some(best)
+        } else {
+            tracing::info!(
+                peak = best,
+                min_peak,
+                "wake calibration: no clear match this utterance"
+            );
+            None
         }
     }
 
@@ -1189,6 +1405,18 @@ where
                 // file watcher (debounced) or the D-Bus `Reload` method.
                 Some(()) = self.reload_rx.recv() => {
                     self.reload();
+                }
+
+                // Wake-word calibration (#121): the D-Bus `CalibrateWake` method
+                // routes a request here. It takes over the mic to measure the
+                // user's wake-word scores, so it only runs from a clean Idle
+                // state (run_calibration rejects otherwise).
+                req = recv_calibration(&mut self.calibrate_rx) => {
+                    match req {
+                        Some(req) => self.run_calibration(req, &mut audio_rx).await,
+                        // Channel closed: disarm the arm so it stops resolving.
+                        None => self.calibrate_rx = None,
+                    }
                 }
 
                 // Process audio chunks
@@ -2207,8 +2435,7 @@ async fn run_triage<A: AssistantGateway + 'static>(
         archive — trivial (brief factual queries, simple commands, throwaway small talk)\n\
         keep — substantive (complex questions, tasks, anything worth reviewing later)";
 
-    let mut signal_rx =
-        bounded(timeout, "triage_subscribe", assistant.subscribe()).await?;
+    let mut signal_rx = bounded(timeout, "triage_subscribe", assistant.subscribe()).await?;
 
     let request_id = bounded(
         timeout,
@@ -2243,7 +2470,11 @@ async fn run_triage<A: AssistantGateway + 'static>(
         }
     };
 
-    let word = verdict.split_whitespace().next().unwrap_or("").to_lowercase();
+    let word = verdict
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
     tracing::info!(%voice_conv_id, verdict = %word, "post-session triage");
     match word.as_str() {
         "archive" => {
@@ -2423,12 +2654,20 @@ mod tests {
         h.handle.abort();
     }
 
+    #[derive(Default)]
     struct FakeWake {
         detects: bool,
+        /// Last sensitivity handed to `set_sensitivity` — lets a reload test
+        /// observe that the value was applied live (no rebuild).
+        applied_sensitivity: Option<f32>,
     }
     impl WakeWordDetector for FakeWake {
         fn detect(&mut self, _samples: &[f32]) -> Result<bool, adele_voice_core::VoiceError> {
             Ok(self.detects)
+        }
+        fn set_sensitivity(&mut self, s: f32) -> Result<(), adele_voice_core::VoiceError> {
+            self.applied_sensitivity = Some(s);
+            Ok(())
         }
     }
 
@@ -2651,10 +2890,7 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_conversation(
-            &self,
-            _id: &str,
-        ) -> Result<(), adele_voice_core::VoiceError> {
+        async fn delete_conversation(&self, _id: &str) -> Result<(), adele_voice_core::VoiceError> {
             Ok(())
         }
         async fn send_prompt_with_system_refinement(
@@ -2962,11 +3198,12 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let spoken = Arc::new(StdMutex::new(Vec::new()));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -2998,7 +3235,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -3046,11 +3282,12 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let spoken = Arc::new(StdMutex::new(Vec::new()));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -3082,7 +3319,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -3143,21 +3379,24 @@ mod tests {
     }
 
     #[test]
-    fn apply_plan_rebuilds_wake_detector_on_sensitivity_change() {
-        // The wake-sensitivity branch must invoke the builder; the builder here
-        // flips `detects` to true so we can observe the swap took effect.
+    fn apply_plan_applies_wake_sensitivity_live() {
+        // The wake-sensitivity branch must poke the running detector's
+        // `set_sensitivity` (no rebuild) and keep the tunables snapshot in step.
         let mut p = build_pipeline();
-        // Replace the builder with one that yields a detector that always fires.
-        p.wake_builder = Box::new(|_s| Ok(FakeWake { detects: true }));
-        assert!(!p.wake.detect(&[0.0; 10]).unwrap());
+        assert_eq!(p.wake.applied_sensitivity, None);
         let plan = config::ReloadPlan {
-            rebuild_wake_sensitivity: Some(0.9),
+            apply_wake_sensitivity: Some(0.9),
             ..config::ReloadPlan::default()
         };
         p.apply_plan(&plan);
-        assert!(
-            p.wake.detect(&[0.0; 10]).unwrap(),
-            "the wake detector must be rebuilt by the builder on a sensitivity change"
+        assert_eq!(
+            p.wake.applied_sensitivity,
+            Some(0.9),
+            "the sensitivity must be applied to the live detector"
+        );
+        assert_eq!(
+            p.tunables.wake_sensitivity, 0.9,
+            "the tunables snapshot must track the applied sensitivity"
         );
     }
 
@@ -3598,13 +3837,6 @@ mod tests {
         let (subscribed_tx, events_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
 
-        let wake_detects = cfg.wake_detects;
-        let wake_builder: WakeBuilder<FakeWake> = Box::new(move |_sensitivity| {
-            Ok(FakeWake {
-                detects: wake_detects,
-            })
-        });
-
         let stt_captured = Arc::new(StdMutex::new(Vec::new()));
         let sink = FakeSink::default();
         let cue_tts = SpawnTts {
@@ -3618,6 +3850,7 @@ mod tests {
         let pipeline = Pipeline::new(
             FakeWake {
                 detects: cfg.wake_detects,
+                ..Default::default()
             },
             FakeVad {
                 probs: StdMutex::new(VecDeque::from(cfg.vad)),
@@ -3646,7 +3879,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -5013,12 +5245,13 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
         let (reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -5052,7 +5285,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),
@@ -5249,12 +5481,13 @@ mod tests {
         let (registered_tx, _registered_rx) = mpsc::unbounded_channel();
         let (tool_result_tx, _tool_result_rx) = mpsc::unbounded_channel();
         let (_reload_tx, reload_rx) = mpsc::channel(4);
-        let wake_builder: WakeBuilder<FakeWake> =
-            Box::new(|_sensitivity| Ok(FakeWake { detects: false }));
         let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pipeline = Pipeline::new(
-            FakeWake { detects: false },
+            FakeWake {
+                detects: false,
+                ..Default::default()
+            },
             FakeVad {
                 probs: StdMutex::new(VecDeque::new()),
             },
@@ -5286,7 +5519,6 @@ mod tests {
             ptt_rx,
             stop_rx,
             reload_rx,
-            wake_builder,
             PipelineConfig {
                 tunables: test_tunables(),
                 conversation_title: "test".to_string(),

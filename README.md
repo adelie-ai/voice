@@ -133,6 +133,8 @@ The daemon owns **`org.desktopAssistant.Voice`** at `/org/desktopAssistant/Voice
 | `SynthesizeText(s) → ay` | method | return spoken text as WAV bytes (the caller routes its own audio) |
 | `ListVoices() → a(sssu)` · `GetVoice() → si` · `SetVoice(si)` | methods | enumerate / read / switch the active voice at runtime |
 | `Reload()` | method | re-read `config.toml` and apply changed tunables live (see below) |
+| `CalibrateWake(u) → (dbudddd)` | method | run [wake-word calibration](#calibration): measure your "Hey Adele" scores + background, pick the best mode, apply + persist `sensitivity`/`eager`. Returns `(sensitivity, eager, samples, mean_peak, noise_floor, eager_cutoff, non_eager_cutoff)` |
+| `CalibrationProgress` | signal | per-utterance progress during `CalibrateWake` (prompts + measured scores) so a client can guide the user |
 
 **TTS is independent of the assistant orchestrator.** `SayText` and `SynthesizeText` are handled **directly by this daemon** — they synthesize speech without ever contacting `org.desktopAssistant.Conversations` or any LLM. Other apps (an accessibility tool, or a future Orca / speech-dispatcher shim) can therefore use the on-device voice purely as a system TTS service. If the voice service isn't running, the name simply isn't on the bus — so dependent UI should degrade gracefully.
 
@@ -152,7 +154,7 @@ Tuning knobs in `~/.config/adele-voice/config.toml` take effect **without a serv
 | `timeouts.turn_budget_ms` | hot-applied (next turn) — overall per-turn ceiling (0 disables) |
 | `timeouts.status_narration_min_gap_ms` | hot-applied (next turn) — min gap between spoken progress narrations |
 | `timeouts.narration_flush_ms` | hot-applied (next turn) — mid-sentence quiet window before a settled clause is flushed to TTS (0 disables) |
-| `wake_word.sensitivity` | wake detector **rebuilt** (rustpotter bakes the threshold in at construction) |
+| `wake_word.sensitivity` | applied **live** — the detector is rebuilt in-process (no service restart). `wake_word.eager` / `wake_word.energy_gate` are startup-captured, so changing *those* still needs a restart |
 | `audio.input_device` / `audio.output_device` | **restart required** — the capture/playback stream isn't swapped live; the daemon logs a clear "restart required" note and applies every other changed knob |
 | `audio.mic_barge_in` | **restart required** — interrupt the reply by speaking. **Off by default**: without acoustic echo cancellation the mic hears Adele's own voice and she barges in on herself (clipping replies, looping). Turn on only with AEC in place; you can always interrupt via the stop control / push-to-talk / D-Bus |
 
@@ -186,6 +188,45 @@ say_this        = true
 ### Conversation reuse window (voice#53)
 
 `assistant.conversation_reuse_window_ms` (default `600000` = 10 min) keeps voice from opening a brand-new conversation on every wake. On a **fresh wake** (not an in-turn follow-up) within the window of the last turn's activity, the daemon's own session is continued so "what about tomorrow?" still has context; outside the window it starts fresh. `0` always starts fresh. A conversation the assistant ended via `stop_listening` (or a stop phrase) is never resurrected — the next wake always starts new. State is kept in memory, so it resets on a daemon restart.
+
+## Wake word
+
+"Hey Adele" is detected **entirely on-device** by [rustpotter](https://github.com/GiviMAD/rustpotter): every Idle frame is scored against the model and immediately discarded (see [Privacy](#when-is-the-microphone-capturing)). A cheap RMS **energy gate** runs in front of the detector so a silent room skips the expensive path, keeping idle CPU near-zero.
+
+### Options (`[wake_word]`)
+
+```toml
+[wake_word]
+sensitivity   = 0.4      # match-score cutoff, 0–1 — prefer calibration over hand-tuning (see below)
+eager         = true     # fire on the rising edge, vs. wait for the phrase to finish
+energy_gate   = true     # skip the detector during silence (lower idle CPU)
+listening_cue = "ding"   # cue when listening starts: "ding" | "phrase" | "off"
+pause_on_session_inactive = true   # release the mic when the logind session goes inactive
+# model_path  = "~/.local/share/adele-voice/models/hey-adele.rpw"
+```
+
+- **`sensitivity`** — how close a match "Hey Adele" must be to wake, `0`–`1`. Its exact meaning depends on `eager` (below), which is why **calibration is preferred over setting it by hand**. Applied **live** on reload (no restart).
+- **`eager`** — *eager* (`true`) fires the instant the match score crosses `sensitivity` on the way **up**, so `sensitivity` behaves like a plain dial: **lower = triggers more easily** (more false wakes), higher = stricter. *Standard* (`false`) instead waits for the score to peak and fall **back below** `sensitivity` at the end of the phrase — a match-quality gate with a *sweet spot*, where **too low never finalizes** (it never falls back). Captured at startup — changing it needs a restart.
+- **`energy_gate`** — the RMS pre-gate; fail-open and accuracy-neutral when there's speech. Set `false` to always run the detector. Startup-captured.
+- **`listening_cue`** — audible cue the instant listening starts: `ding` (instant earcon, default), `phrase` (a spoken "Yes?", adds ~1 s), or `off`.
+- **`pause_on_session_inactive`** — release the mic when the logind session goes inactive (e.g. fast-user-switch); inert where logind isn't present.
+
+### Calibration
+
+Instead of hand-tuning `sensitivity`, run a guided calibration that measures **your** voice and mic:
+
+```
+adele-voice calibrate        # then say "Hey Adele" a few times when prompted
+```
+
+(also available as **"Calibrate automatically…"** on the KDE Voice settings page). It:
+
+1. measures the room's **background** match level (a brief "stay quiet…"),
+2. records the peak match score of each spoken "Hey Adele",
+3. picks the **best mode** for your voice/mic — **standard** when there's a clean gap between the background and your peaks (it confirms the full match and false-wakes less), otherwise **eager** (which only has to sit below your peaks) — and sets `sensitivity` a safe margin into that range,
+4. **applies it live and saves** it to `config.toml`.
+
+The chosen mode, the cutoff, and what the *other* mode would have used are printed by the CLI and shown in the KCM, so the decision is transparent. Calibration runs inside the daemon (the mic owner) over D-Bus — `CalibrateWake` / `CalibrationProgress` — so the CLI and the settings UI drive the exact same flow. If your mic/room has a **high background level**, standard mode may not be reliable (there's no clean gap); calibration will say so and use eager.
 
 ## Text-to-speech backends
 
@@ -243,20 +284,14 @@ Environment=AWS_REGION=us-east-1
 
 The one part that needs *you* is the **wake word**: `hey-adele.rpw` is trained from your *own* recordings (rustpotter ships no "Hey Adele"). When run from a terminal, the script records the clips with [`rustpotter-cli`](https://github.com/GiviMAD/rustpotter-cli), force-converts each to **16 kHz mono** (the rate the runtime detector extracts features at — clips at the device default of 44.1 kHz stereo score ~0 and never fire, see #46), builds the `.rpw`, and validates that it self-detects before finishing. Needs `rustpotter-cli` (`cargo install rustpotter-cli`) plus `ffmpeg` or `sox` for the conversion. Re-run with `RETRAIN_WAKE=1` to record again.
 
-Then build/install (and optionally configure input/output devices, model paths, wake sensitivity, STT language, and the silence timeout):
+Then build/install (and optionally configure input/output devices, model paths, STT language, and the silence timeout):
 
 ```sh
 cargo install --path crates/daemon         # installs `adele-voice`
 $EDITOR ~/.config/adele-voice/config.toml  # optional; sensible defaults if absent
 ```
 
-The `[wake_word]` section also controls the wake→listen feel: `eager` (default
-`true`) fires the trigger as soon as the wake word is recognized rather than at
-the end of the phrase, so a command spoken in the same breath ("hey adele what
-time is it") is captured — set it `false` if eager raises false triggers in your
-environment. `listening_cue` sets the audible "Listening" feedback when the mic
-opens: `"ding"` (default, an instant earcon), `"phrase"` (a friendlier spoken
-micro-phrase, adds ~1 s), or `"off"`.
+For the wake word itself — sensitivity, `eager` vs. standard mode, and the listening cue — see [Wake word](#wake-word). The easiest path is to skip hand-tuning and run `adele-voice calibrate`, which sets it to your voice and mic for you.
 
 The desktop-assistant daemon must be running and exposing `org.desktopAssistant.Conversations` for prompts to be answered.
 

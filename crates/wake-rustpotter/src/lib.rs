@@ -79,6 +79,20 @@ use adele_voice_core::ports::wake::WakeWordDetector;
 use rustpotter::{Rustpotter, RustpotterConfig, SampleFormat};
 use std::path::Path;
 
+/// Hard lower bound for the live wake sensitivity (rustpotter's score
+/// threshold). Below this even ambient noise clears the bar (constant false
+/// wakes), so a calibrated or hand-set cutoff is clamped here.
+pub const MIN_SENSITIVITY: f32 = 0.10;
+/// Hard upper bound for the live wake sensitivity. At/above this essentially no
+/// real utterance scores high enough to fire, so the cutoff is clamped here.
+pub const MAX_SENSITIVITY: f32 = 0.95;
+/// Threshold used *only while calibrating*. Very low, so rustpotter forms a
+/// scoring partial for any speech (even a weak match) and its running peak can
+/// be read via `get_partial_detection` — calibration measures that peak directly
+/// rather than waiting for a non-eager "fire", which never happens when the
+/// threshold is below the score's noise floor.
+const CALIBRATION_THRESHOLD: f32 = 0.01;
+
 /// Open the gate at +12 dB over the noise floor (`20·log10(4) ≈ 12.0 dB`).
 const OPEN_RATIO: f32 = 4.0;
 /// Close the gate below +6 dB over the noise floor (`20·log10(2) ≈ 6.0 dB`); the
@@ -253,6 +267,18 @@ impl EnergyGate {
 
 pub struct RustpotterWakeWordDetector {
     rustpotter: Rustpotter,
+    /// The detector config rustpotter was built from. Holds the current
+    /// normal-operation settings (threshold + eager); a live sensitivity/mode
+    /// change updates this and REBUILDS rustpotter from it (see
+    /// [`Self::rebuild`]) rather than poking it in place — an in-place
+    /// `update_detector_config` was observed to leave the detector unable to fire
+    /// until a process restart. Calibration measurement is the one exception: it
+    /// drives a temporary low, non-eager config and reads the running peak.
+    config: RustpotterConfig,
+    /// Path to the wake-word model, kept so [`Self::rebuild`] can reload it.
+    model_path: std::path::PathBuf,
+    /// Whether the energy gate is enabled, so [`Self::rebuild`] recreates it.
+    energy_gate: bool,
     /// Exact number of samples rustpotter consumes per `process_samples` call.
     /// `process_samples` returns `None` (a silent no-op) for ANY other length and
     /// does not buffer across calls, so we must hand it exactly one frame.
@@ -264,6 +290,20 @@ pub struct RustpotterWakeWordDetector {
     /// Optional energy gate (`wake_word.energy_gate`). `None` restores the
     /// original always-run behaviour; `Some` skips rustpotter on silent frames.
     gate: Option<EnergyGate>,
+    /// True while a calibration session is in progress. Used to guard
+    /// `set_sensitivity` so a config reload can't clobber the calibration
+    /// threshold mid-session.
+    calibrating: bool,
+    /// Running peak match score for the current calibration utterance — the max
+    /// of every fire / partial score seen since the last [`Self::clear_peak`].
+    /// Read by [`Self::peak_score`].
+    calib_peak: f32,
+    /// The `eager` + `threshold` settings saved at [`Self::begin_calibration`],
+    /// so [`Self::cancel_calibration`] can restore them if calibration is aborted
+    /// (calibration mutates the stored `DetectorConfig` in place — it isn't
+    /// `Clone` — driving a low, non-eager measurement config meanwhile).
+    saved_eager: bool,
+    saved_threshold: f32,
 }
 
 /// Pop one complete `frame`-sized chunk from the front of `buf`, retaining the
@@ -278,6 +318,22 @@ fn take_frame(buf: &mut Vec<f32>, frame: usize) -> Option<Vec<f32>> {
     let out: Vec<f32> = buf[..frame].to_vec();
     buf.drain(..frame);
     Some(out)
+}
+
+/// Create a rustpotter instance from `config` with the "hey-adele" wake word
+/// loaded. Shared by construction and [`RustpotterWakeWordDetector::rebuild`] so
+/// a live settings change reproduces a fresh detector exactly.
+fn build_rustpotter(
+    model_path: &Path,
+    config: &RustpotterConfig,
+) -> Result<Rustpotter, VoiceError> {
+    let mut rustpotter = Rustpotter::new(config)
+        .map_err(|e| VoiceError::WakeWord(format!("failed to create rustpotter: {e}")))?;
+    let model_str = model_path.to_string_lossy();
+    rustpotter
+        .add_wakeword_from_file("hey-adele", &model_str)
+        .map_err(|e| VoiceError::WakeWord(format!("failed to load wake word model: {e}")))?;
+    Ok(rustpotter)
 }
 
 impl RustpotterWakeWordDetector {
@@ -300,7 +356,7 @@ impl RustpotterWakeWordDetector {
         config.fmt.sample_rate = SAMPLE_RATE as usize;
         config.fmt.sample_format = SampleFormat::F32;
         config.fmt.channels = 1;
-        config.detector.threshold = sensitivity;
+        config.detector.threshold = sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
         // Fire as soon as `min_scores` partials clear the threshold rather than at
         // the END of the utterance (score peak → fall-back), shaving the wake→
         // listen latency. Off by default in rustpotter; we make it a config knob
@@ -317,14 +373,7 @@ impl RustpotterWakeWordDetector {
         // match collapses to ~0 (measured: same utterance scores 0.46 with the
         // normalizer off, 0.0 with it on at any max_gain). See #44.
 
-        let mut rustpotter = Rustpotter::new(&config)
-            .map_err(|e| VoiceError::WakeWord(format!("failed to create rustpotter: {e}")))?;
-
-        let model_str = model_path.to_string_lossy();
-        rustpotter
-            .add_wakeword_from_file("hey-adele", &model_str)
-            .map_err(|e| VoiceError::WakeWord(format!("failed to load wake word model: {e}")))?;
-
+        let rustpotter = build_rustpotter(model_path, &config)?;
         let samples_per_frame = rustpotter.get_samples_per_frame();
 
         tracing::info!(
@@ -338,10 +387,40 @@ impl RustpotterWakeWordDetector {
 
         Ok(Self {
             rustpotter,
+            config,
+            model_path: model_path.to_path_buf(),
+            energy_gate,
             samples_per_frame,
             buf: Vec::new(),
             gate: energy_gate.then(|| EnergyGate::new(samples_per_frame)),
+            calibrating: false,
+            calib_peak: 0.0,
+            saved_eager: eager,
+            saved_threshold: sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY),
         })
+    }
+
+    /// Rebuild rustpotter (and the energy gate) from the current `self.config`,
+    /// exactly reproducing a fresh detector — used to apply a new sensitivity or
+    /// wake mode without a process restart. A restart is known-good; poking
+    /// rustpotter's config in place (`update_detector_config`) is not (it left
+    /// the detector unable to fire), so we reconstruct instead.
+    fn rebuild(&mut self) -> Result<(), VoiceError> {
+        self.rustpotter = build_rustpotter(&self.model_path, &self.config)?;
+        self.samples_per_frame = self.rustpotter.get_samples_per_frame();
+        // Fresh gate (its adaptive floor re-learns) and empty re-framing buffer,
+        // matching startup state.
+        self.gate = self
+            .energy_gate
+            .then(|| EnergyGate::new(self.samples_per_frame));
+        self.buf.clear();
+        self.calib_peak = 0.0;
+        tracing::info!(
+            sensitivity = self.config.detector.threshold,
+            eager = self.config.detector.eager,
+            "wake detector rebuilt"
+        );
+        Ok(())
     }
 
     /// Run rustpotter on exactly one frame, logging and reporting a detection.
@@ -362,6 +441,12 @@ impl RustpotterWakeWordDetector {
         } else {
             false
         }
+    }
+
+    /// The currently-configured sensitivity (rustpotter's live score threshold).
+    /// Mainly for tests and diagnostics.
+    pub fn sensitivity(&self) -> f32 {
+        self.config.detector.threshold
     }
 }
 
@@ -393,6 +478,94 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
             }
         }
         Ok(detected)
+    }
+
+    /// Apply a new sensitivity to the detector without a process restart, by
+    /// updating `self.config` and REBUILDING rustpotter from it ([`Self::rebuild`]).
+    ///
+    /// We reconstruct rather than poke the running detector in place: an in-place
+    /// `update_detector_config` left the detector unable to fire until a restart.
+    /// A rebuild reproduces a fresh (known-good) detector and still applies live —
+    /// no daemon restart needed. Skipped while calibrating (the measurement config
+    /// is in effect; `end_calibration` rebuilds with the chosen result).
+    fn set_sensitivity(&mut self, sensitivity: f32) -> Result<(), VoiceError> {
+        let clamped = sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
+        self.config.detector.threshold = clamped;
+        if self.calibrating {
+            return Ok(());
+        }
+        self.rebuild()
+    }
+
+    /// Enter calibration: drive rustpotter at a very low threshold so a scoring
+    /// partial forms for any speech and its running peak can be read via
+    /// [`Self::peak_score`]. (We don't rely on the detector "firing": at a
+    /// threshold below the score noise floor a non-eager detector never falls
+    /// back, so we read the partial's peak directly instead.)
+    fn begin_calibration(&mut self) {
+        self.calibrating = true;
+        self.saved_eager = self.config.detector.eager;
+        self.saved_threshold = self.config.detector.threshold;
+        // Drive rustpotter at the low, non-eager calibration settings. We mutate
+        // the stored detector config in place (it isn't `Clone`); `end_calibration`
+        // overwrites `eager`/`threshold` with the chosen result, and
+        // `cancel_calibration` restores the saved values.
+        self.config.detector.eager = false;
+        self.config.detector.threshold = CALIBRATION_THRESHOLD;
+        self.rustpotter
+            .update_detector_config(&self.config.detector);
+        self.clear_peak();
+    }
+
+    /// Feed audio and return the running peak match score for the current
+    /// utterance (the max of any fire score and the live partial score seen
+    /// since the last [`Self::clear_peak`]). Returns `None` until something has
+    /// scored. The energy gate is not consulted — calibration always wants every
+    /// frame scored.
+    fn peak_score(&mut self, samples: &[f32]) -> Option<f32> {
+        self.buf.extend_from_slice(samples);
+        let spf = self.samples_per_frame;
+        while let Some(frame) = take_frame(&mut self.buf, spf) {
+            // A fire returns the peak and resets the window; otherwise the live
+            // partial holds the running max. Track the max of both so the peak
+            // survives even if the detector happens to fire mid-utterance.
+            if let Some(d) = self.rustpotter.process_samples::<f32>(frame) {
+                self.calib_peak = self.calib_peak.max(d.score);
+            } else if let Some(d) = self.rustpotter.get_partial_detection() {
+                self.calib_peak = self.calib_peak.max(d.score);
+            }
+        }
+        (self.calib_peak > 0.0).then_some(self.calib_peak)
+    }
+
+    /// Reset the running peak and rustpotter's window before the next utterance,
+    /// and drop any buffered sub-frame audio so a new utterance starts clean.
+    fn clear_peak(&mut self) {
+        self.calib_peak = 0.0;
+        self.buf.clear();
+        self.rustpotter.reset();
+    }
+
+    /// Leave calibration mode and apply the calibrated result: set the wake mode
+    /// to `eager` and the cutoff to `sensitivity`, then rebuild the detector
+    /// (`set_sensitivity`, now that `calibrating` is false again, reconstructs it
+    /// cleanly — so the detector fires normally rather than sitting in the dead
+    /// live-update state).
+    fn end_calibration(&mut self, sensitivity: f32, eager: bool) -> Result<(), VoiceError> {
+        self.calibrating = false;
+        self.calib_peak = 0.0;
+        self.config.detector.eager = eager;
+        self.set_sensitivity(sensitivity)
+    }
+
+    /// Abort calibration: restore the `eager`/`threshold` saved at
+    /// `begin_calibration` and rebuild, so the detector is exactly as it was.
+    fn cancel_calibration(&mut self) {
+        self.calibrating = false;
+        self.calib_peak = 0.0;
+        self.config.detector.eager = self.saved_eager;
+        // set_sensitivity re-clamps + rebuilds from the restored config.
+        let _ = self.set_sensitivity(self.saved_threshold);
     }
 }
 
