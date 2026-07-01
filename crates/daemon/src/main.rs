@@ -10,6 +10,7 @@ mod cue;
 mod pipeline;
 mod session;
 mod tts_service;
+mod wake_tuning;
 
 use adele_voice_assistant_connector::ConnectorAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
@@ -241,6 +242,7 @@ async fn main() -> Result<()> {
                 .then(|| Duration::from_millis(config.idle_exit_timeout_ms)),
             spoken_response_hint: config.assistant.spoken_response_hint,
             listening_cue: config.wake_word.listening_cue,
+            wake_eager: config.wake_word.eager,
             timeouts: turn_timeouts,
             client_tools: config.assistant.client_tools,
         },

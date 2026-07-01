@@ -129,6 +129,14 @@ pub struct WakeWordConfig {
     /// isn't present at all (headless/container/non-systemd) the gate is inert
     /// regardless and capture proceeds as before.
     pub pause_on_session_inactive: bool,
+    /// Online wake-sensitivity adaptation (#121, Phase 2): after calibration
+    /// sets the cutoff, nudge it slowly (within a band around the calibrated
+    /// value) from per-turn signals — a wake that led to a real command vs one
+    /// that produced no speech. **Default `false`**: while `false` the tuner
+    /// still runs and LOGS what it would do (so its decisions can be reviewed)
+    /// but never touches the live cutoff. Set `true` to let it apply its
+    /// adjustments live. Hot-reloadable — flip it without a restart.
+    pub auto_adapt: bool,
 }
 
 /// How the daemon announces that it has started Listening (#51).
@@ -245,6 +253,7 @@ impl Default for WakeWordConfig {
             listening_cue: ListeningCue::Ding,
             energy_gate: true,
             pause_on_session_inactive: true,
+            auto_adapt: false,
         }
     }
 }
@@ -344,6 +353,9 @@ pub struct Tunables {
     /// Requires rebuilding the wake detector (rustpotter bakes the threshold in
     /// at construction).
     pub wake_sensitivity: f32,
+    /// Whether the online wake-sensitivity tuner may APPLY its adjustments live
+    /// (#121). Hot-toggled on the tuner; the tuner always records/logs.
+    pub wake_auto_adapt: bool,
     /// Per-event response stall deadline (#58). Hot-swapped on the pipeline
     /// (affects the next turn). 0 disables.
     pub response_stall_ms: u64,
@@ -373,6 +385,7 @@ impl Config {
             conversation_mode: self.assistant.conversation_mode,
             idle_exit_timeout_ms: self.idle_exit_timeout_ms,
             wake_sensitivity: self.wake_word.sensitivity,
+            wake_auto_adapt: self.wake_word.auto_adapt,
             response_stall_ms: self.timeouts.response_stall_ms,
             turn_budget_ms: self.timeouts.turn_budget_ms,
             status_narration_min_gap_ms: self.timeouts.status_narration_min_gap_ms,
@@ -409,9 +422,13 @@ pub struct ReloadPlan {
     pub set_status_narration_min_gap_ms: Option<u64>,
     /// Update the pipeline's mid-sentence narration-flush window (0 disables).
     pub set_narration_flush_ms: Option<u64>,
-    /// Apply this wake-word sensitivity to the running detector (live, no
-    /// rebuild — see `WakeWordDetector::set_sensitivity`).
+    /// Apply this wake-word sensitivity to the running detector (rebuilds it —
+    /// see `WakeWordDetector::set_sensitivity`) and re-anchor the online tuner
+    /// to the new baseline (#121).
     pub apply_wake_sensitivity: Option<f32>,
+    /// Enable/disable the online wake-sensitivity tuner applying its adjustments
+    /// (#121). `None` = unchanged.
+    pub set_wake_auto_adapt: Option<bool>,
     /// A device changed; the capture/playback stream would need a restart, which
     /// is not done live. Carries the human-readable change for the log.
     pub restart_required_for_device: Option<String>,
@@ -467,6 +484,9 @@ pub fn plan_reload(old: &Tunables, new: &Tunables) -> ReloadPlan {
     }
     if old.wake_sensitivity != new.wake_sensitivity {
         plan.apply_wake_sensitivity = Some(new.wake_sensitivity);
+    }
+    if old.wake_auto_adapt != new.wake_auto_adapt {
+        plan.set_wake_auto_adapt = Some(new.wake_auto_adapt);
     }
     if old.input_device != new.input_device || old.output_device != new.output_device {
         plan.restart_required_for_device = Some(format!(
@@ -701,6 +721,20 @@ speech_threshold = 0.7
         // Only the wake detector — nothing else changed.
         assert_eq!(plan.set_speech_threshold, None);
         assert_eq!(plan.restart_required_for_device, None);
+    }
+
+    #[test]
+    fn wake_auto_adapt_toggle_is_applied_live() {
+        let old = Config::default().tunables();
+        let new = Tunables {
+            wake_auto_adapt: !old.wake_auto_adapt,
+            ..old.clone()
+        };
+        let plan = plan_reload(&old, &new);
+        assert_eq!(plan.set_wake_auto_adapt, Some(new.wake_auto_adapt));
+        // Toggling the tuner doesn't rebuild the detector on its own.
+        assert_eq!(plan.apply_wake_sensitivity, None);
+        assert!(!plan.is_empty());
     }
 
     #[test]

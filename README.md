@@ -202,6 +202,7 @@ eager         = true     # fire on the rising edge, vs. wait for the phrase to f
 energy_gate   = true     # skip the detector during silence (lower idle CPU)
 listening_cue = "ding"   # cue when listening starts: "ding" | "phrase" | "off"
 pause_on_session_inactive = true   # release the mic when the logind session goes inactive
+auto_adapt    = false    # keep sensitivity tuned online from real wakes (default off = log-only)
 # model_path  = "~/.local/share/adele-voice/models/hey-adele.rpw"
 ```
 
@@ -210,6 +211,7 @@ pause_on_session_inactive = true   # release the mic when the logind session goe
 - **`energy_gate`** — the RMS pre-gate; fail-open and accuracy-neutral when there's speech. Set `false` to always run the detector. Startup-captured.
 - **`listening_cue`** — audible cue the instant listening starts: `ding` (instant earcon, default), `phrase` (a spoken "Yes?", adds ~1 s), or `off`.
 - **`pause_on_session_inactive`** — release the mic when the logind session goes inactive (e.g. fast-user-switch); inert where logind isn't present.
+- **`auto_adapt`** — keep `sensitivity` tuned over time from signals every turn already provides (a wake that led to a real command vs. one that produced no speech), within a band around the calibrated value. **Default `false` = log-only**: it runs and logs the adjustments it *would* make (`wake auto-tune: …`) without touching the live cutoff, so you can review them first; set `true` to let it apply them. Hot-reloadable. See [Online adaptation](#online-adaptation).
 
 ### Calibration
 
@@ -227,6 +229,12 @@ adele-voice calibrate        # then say "Hey Adele" a few times when prompted
 4. **applies it live and saves** it to `config.toml`.
 
 The chosen mode, the cutoff, and what the *other* mode would have used are printed by the CLI and shown in the KCM, so the decision is transparent. Calibration runs inside the daemon (the mic owner) over D-Bus — `CalibrateWake` / `CalibrationProgress` — so the CLI and the settings UI drive the exact same flow. If your mic/room has a **high background level**, standard mode may not be reliable (there's no clean gap); calibration will say so and use eager.
+
+### Online adaptation
+
+Calibration sets the cutoff once. With **`auto_adapt`** the daemon also keeps it tuned as your room, mic, or voice drift — no second wizard — using labels it can read for free after each wake: a wake that led to a real transcribed command (a **true positive**) versus one that produced no speech at all (a **false positive**). It nudges `sensitivity` toward sitting just below where your real wakes land and above where false fires do, but **slowly and safely**: never more than a small band away from the last calibrated value, at most a tiny step at a time, and clamped to the detector's range (in standard mode it only ever *raises*, since a lowered non-eager cutoff can stop firing).
+
+It is **off by default, and even off it still runs** — logging every adjustment it *would* apply (`wake auto-tune: proposed cutoff adjustment …`) so you can watch its decisions before trusting it. Flip `auto_adapt = true` (a live reload, no restart) to let it apply them. Recalibrating or hand-editing `sensitivity` re-anchors it to the new baseline. It can only tighten toward wakes that *did* fire and reject observed false fires; catching a real wake that scores *just under* the cutoff and is silently missed is a planned follow-up.
 
 ## Text-to-speech backends
 

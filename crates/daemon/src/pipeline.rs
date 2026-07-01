@@ -18,6 +18,7 @@ use crate::calibration;
 use crate::config::{self, ClientToolsConfig, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
 use crate::session::SessionGate;
+use crate::wake_tuning::{WakeLabel, WakeTuner};
 
 /// Sleep for `dur` if `Some`, else never resolve. Used to make a `select!` arm
 /// conditional on an optional deadline without a separate `if` guard pre-check.
@@ -116,6 +117,9 @@ pub struct PipelineConfig {
     pub spoken_response_hint: String,
     /// Audible "Listening" cue mode (#51).
     pub listening_cue: ListeningCue,
+    /// Current wake mode (`wake_word.eager`), so the online tuner knows which
+    /// band direction is safe (#121). Startup-only, like the detector's own mode.
+    pub wake_eager: bool,
     /// Per-turn timeout bounds (#58).
     pub timeouts: TurnTimeouts,
     /// Which session-control client tools to advertise (voice#61).
@@ -457,6 +461,16 @@ where
     /// accumulated across turns in the reuse window and used by the post-session
     /// LLM triage task to judge whether the conversation is worth keeping.
     session_transcripts: Vec<String>,
+    /// Online wake-sensitivity tuner (#121, Phase 2). Fed a labeled observation
+    /// after each wake-initiated turn; proposes bounded, slow cutoff nudges that
+    /// are always logged and (when `wake_word.auto_adapt` is on) applied live.
+    wake_tuner: WakeTuner,
+    /// The match score of the fire that started the current turn, captured at the
+    /// wake site and consumed in `process_utterance` to label the wake
+    /// (true/false positive) for `wake_tuner`. `None` for turns not started by a
+    /// wake (push-to-talk, or a conversation-mode follow-up) — those aren't tuning
+    /// signals (#121).
+    pending_wake_score: Option<f32>,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -495,11 +509,19 @@ where
             idle_exit_timeout,
             spoken_response_hint,
             listening_cue,
+            wake_eager,
             timeouts,
             client_tools,
         } = config;
         let mut speaker = Speaker::new(Arc::new(tts), Arc::clone(&sink));
         speaker.set_synth_timeout(timeouts.synth);
+        // The tuner starts anchored at the calibrated/on-disk cutoff and mode,
+        // enabled per `wake_word.auto_adapt` (default off = log-only) (#121).
+        let wake_tuner = WakeTuner::new(
+            tunables.wake_sensitivity,
+            wake_eager,
+            tunables.wake_auto_adapt,
+        );
         Self {
             wake,
             vad,
@@ -547,6 +569,8 @@ where
             // harmless no-op until `with_capture_state` wires the real channel.
             capture_state_tx: watch::channel(CaptureState::Capturing).0,
             session_transcripts: Vec::new(),
+            wake_tuner,
+            pending_wake_score: None,
         }
     }
 
@@ -903,6 +927,10 @@ where
                     // the file-watcher ping after calibration persists the same
                     // value) sees no change and doesn't re-apply needlessly.
                     self.tunables.wake_sensitivity = sensitivity;
+                    // The on-disk cutoff is a fresh baseline for the online tuner
+                    // (#121): re-anchor to it and drop any drift history so a
+                    // reload re-asserts the on-disk value as the band center.
+                    self.wake_tuner.reanchor(sensitivity);
                     tracing::info!(
                         sensitivity,
                         "config reload: applied wake_word.sensitivity live"
@@ -915,6 +943,14 @@ where
                     );
                 }
             }
+        }
+        if let Some(enabled) = plan.set_wake_auto_adapt {
+            self.wake_tuner.set_enabled(enabled);
+            self.tunables.wake_auto_adapt = enabled;
+            tracing::info!(
+                auto_adapt = enabled,
+                "config reload: applied wake_word.auto_adapt"
+            );
         }
         if let Some(change) = &plan.restart_required_for_device {
             tracing::warn!(
@@ -1011,6 +1047,11 @@ where
                 // Keep the tunables snapshot in step so the file-watcher reload
                 // triggered by the persist below is a no-op for sensitivity.
                 self.tunables.wake_sensitivity = outcome.sensitivity;
+                // Re-anchor the online tuner to the freshly calibrated cutoff and
+                // mode, forgetting prior drift — start adapting from the new
+                // known-good baseline (#121).
+                self.wake_tuner
+                    .recalibrated(outcome.sensitivity, outcome.eager);
                 match config::persist_wake_settings(outcome.sensitivity, outcome.eager) {
                     Ok(()) => Ok(outcome),
                     Err(e) => Err(format!(
@@ -1515,6 +1556,11 @@ where
                             if self.wake.detect(&chunk)? {
                                 tracing::info!("wake word detected");
                                 if self.apply(StateEvent::WakeWordDetected) {
+                                    // Capture the fire score for the online tuner
+                                    // (#121) — consumed when this turn's transcript
+                                    // reveals whether it was a true/false positive.
+                                    self.pending_wake_score =
+                                        self.wake.take_last_fire_score();
                                     // Wake word always uses the daemon's own
                                     // session; clear any push-to-talk target
                                     // left over from a session ended via
@@ -1770,6 +1816,12 @@ where
         self.session_end_requested = false;
         self.listen_for_more_requested = false;
 
+        // The score of the wake that started this turn, if it was wake-initiated.
+        // Taken (not peeked) so a conversation-mode follow-up in the same turn
+        // can't reuse a stale score; only wake-initiated turns are tuning signals
+        // (a push-to-talk leaves this `None`) (#121).
+        let wake_score = self.pending_wake_score.take();
+
         // Energy-gate + transcribe (in the module's `Transcriber`). The gate
         // discards near-silent captures — ambient noise or the tail of our own
         // playback can trip the VAD without real speech, and Whisper then
@@ -1779,7 +1831,15 @@ where
         // command needn't create or poke the conversation.
         let transcript = match self.transcriber.transcribe(&samples).await? {
             Some(t) => t,
-            None => return Ok(UtteranceOutcome::Continue),
+            None => {
+                // A wake that produced no usable speech at all is the clean
+                // false-positive signal: the cutoff sits low enough that noise
+                // fired it. Feed it to the tuner (#121).
+                if let Some(score) = wake_score {
+                    self.observe_wake(score, WakeLabel::FalsePositive);
+                }
+                return Ok(UtteranceOutcome::Continue);
+            }
         };
         tracing::info!(text = %transcript.text, "transcribed");
         // Let clients (the KDE widget) show what was heard without polling
@@ -1803,6 +1863,18 @@ where
             self.apply(StateEvent::ResponseStarted);
             self.speaker.say("Okay.").await?;
             return Ok(UtteranceOutcome::EndConversation);
+        }
+
+        // Past the self-echo and stop-phrase gates, a real transcribed command
+        // means the wake was a true positive — the cutoff is correctly at/below
+        // it. Feed the tuner now, before the slower orchestrator round-trip
+        // (whose success is irrelevant to whether the WAKE was real) (#121).
+        // Self-echo and stop phrases are deliberately not labeled: an echo fire
+        // may still have been a genuine wake, and a lone "stop"/"never mind" is
+        // too ambiguous to score as a false wake without risking pushing the
+        // cutoff up into misses.
+        if let Some(score) = wake_score {
+            self.observe_wake(score, WakeLabel::TruePositive);
         }
 
         // Resolve the target conversation. A push-to-talk into a specific
@@ -1943,6 +2015,41 @@ where
             return Ok(UtteranceOutcome::KeepListening);
         }
         Ok(UtteranceOutcome::Continue)
+    }
+
+    /// Feed a labeled wake to the online tuner (#121) and act on any proposal:
+    /// ALWAYS log it (so the tuner's decisions are reviewable while it runs
+    /// log-only), and apply it live only when `wake_word.auto_adapt` is on.
+    /// Applying rebuilds the detector at the new cutoff and keeps the reload
+    /// snapshot + the tuner's mirror in step, exactly like the reload path.
+    fn observe_wake(&mut self, score: f32, label: WakeLabel) {
+        let Some(adj) = self.wake_tuner.observe(score, label) else {
+            return;
+        };
+        tracing::info!(
+            ?label,
+            score,
+            from = adj.from,
+            to = adj.to,
+            target = adj.target,
+            ambiguous = adj.ambiguous,
+            apply = adj.apply,
+            "wake auto-tune: proposed cutoff adjustment"
+        );
+        if !adj.apply {
+            return;
+        }
+        match self.wake.set_sensitivity(adj.to) {
+            Ok(()) => {
+                self.tunables.wake_sensitivity = adj.to;
+                self.wake_tuner.commit(adj.to);
+                tracing::info!(sensitivity = adj.to, "wake auto-tune: applied cutoff live");
+            }
+            Err(e) => tracing::warn!(
+                sensitivity = adj.to,
+                "wake auto-tune: failed to apply cutoff, keeping current: {e}"
+            ),
+        }
     }
 
     /// After an interrupt drops the streaming subscription mid-turn (voice#82),
@@ -3129,6 +3236,7 @@ mod tests {
             conversation_mode: false,
             idle_exit_timeout_ms: 0,
             wake_sensitivity: 0.5,
+            wake_auto_adapt: false,
             response_stall_ms: 0,
             turn_budget_ms: 0,
             status_narration_min_gap_ms: 0,
@@ -3247,6 +3355,7 @@ mod tests {
                 idle_exit_timeout: None,
                 spoken_response_hint: String::new(),
                 listening_cue: ListeningCue::Off,
+                wake_eager: true,
                 timeouts: test_timeouts(),
                 client_tools: ClientToolsConfig::default(),
             },
@@ -3332,6 +3441,7 @@ mod tests {
                 idle_exit_timeout: None,
                 spoken_response_hint: String::new(),
                 listening_cue: ListeningCue::Off,
+                wake_eager: true,
                 timeouts,
                 client_tools: ClientToolsConfig::default(),
             },
@@ -3397,6 +3507,51 @@ mod tests {
         assert_eq!(
             p.tunables.wake_sensitivity, 0.9,
             "the tunables snapshot must track the applied sensitivity"
+        );
+    }
+
+    #[test]
+    fn auto_tune_applies_cutoff_live_when_enabled() {
+        // With auto-adapt enabled (via the reload toggle), a run of true
+        // positives above the cutoff nudges it up one slew step through the live
+        // detector, and the tunables snapshot tracks it (#121).
+        let mut p = build_pipeline();
+        p.apply_plan(&config::ReloadPlan {
+            set_wake_auto_adapt: Some(true),
+            ..config::ReloadPlan::default()
+        });
+        assert_eq!(
+            p.wake.applied_sensitivity, None,
+            "toggling doesn't apply a cutoff"
+        );
+        for _ in 0..crate::wake_tuning::MIN_OBSERVATIONS {
+            p.observe_wake(0.62, WakeLabel::TruePositive);
+        }
+        let applied = p
+            .wake
+            .applied_sensitivity
+            .expect("an enabled tuner applies the cutoff to the live detector");
+        assert!(
+            applied > 0.5 && applied <= 0.52 + 1e-6,
+            "raised at most one slew step from the 0.5 anchor: {applied}"
+        );
+        assert_eq!(
+            p.tunables.wake_sensitivity, applied,
+            "the tunables snapshot must track the auto-tuned cutoff"
+        );
+    }
+
+    #[test]
+    fn auto_tune_log_only_leaves_the_detector_untouched() {
+        // Default (`auto_adapt` off): the tuner records and would log its
+        // proposals, but must never touch the live cutoff (#121).
+        let mut p = build_pipeline();
+        for _ in 0..(crate::wake_tuning::MIN_OBSERVATIONS * 3) {
+            p.observe_wake(0.62, WakeLabel::TruePositive);
+        }
+        assert_eq!(
+            p.wake.applied_sensitivity, None,
+            "log-only auto-tune must not call the detector's set_sensitivity"
         );
     }
 
@@ -3891,6 +4046,7 @@ mod tests {
                 idle_exit_timeout: cfg.idle_exit_timeout,
                 spoken_response_hint: cfg.spoken_response_hint,
                 listening_cue: cfg.listening_cue,
+                wake_eager: true,
                 timeouts: test_timeouts(),
                 client_tools: cfg.client_tools,
             },
@@ -5297,6 +5453,7 @@ mod tests {
                 idle_exit_timeout: None,
                 spoken_response_hint: String::new(),
                 listening_cue: ListeningCue::Off,
+                wake_eager: true,
                 timeouts: test_timeouts(),
                 client_tools: ClientToolsConfig::default(),
             },
@@ -5531,6 +5688,7 @@ mod tests {
                 idle_exit_timeout: None,
                 spoken_response_hint: String::new(),
                 listening_cue: ListeningCue::Off,
+                wake_eager: true,
                 timeouts: test_timeouts(),
                 client_tools: ClientToolsConfig::default(),
             },
