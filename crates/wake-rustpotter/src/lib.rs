@@ -304,6 +304,12 @@ pub struct RustpotterWakeWordDetector {
     /// `Clone` — driving a low, non-eager measurement config meanwhile).
     saved_eager: bool,
     saved_threshold: f32,
+    /// The match score of the most recent fire within the current [`Self::detect`]
+    /// call, exposed via [`Self::take_last_fire_score`] so a fired wake can be
+    /// labeled by strength (online tuning, #121). Reset at the start of each
+    /// `detect`, so it only ever reflects the just-finished call; `None` when
+    /// that call did not fire.
+    last_fire_score: Option<f32>,
 }
 
 /// Pop one complete `frame`-sized chunk from the front of `buf`, retaining the
@@ -397,6 +403,7 @@ impl RustpotterWakeWordDetector {
             calib_peak: 0.0,
             saved_eager: eager,
             saved_threshold: sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY),
+            last_fire_score: None,
         })
     }
 
@@ -415,6 +422,7 @@ impl RustpotterWakeWordDetector {
             .then(|| EnergyGate::new(self.samples_per_frame));
         self.buf.clear();
         self.calib_peak = 0.0;
+        self.last_fire_score = None;
         tracing::info!(
             sensitivity = self.config.detector.threshold,
             eager = self.config.detector.eager,
@@ -437,6 +445,12 @@ impl RustpotterWakeWordDetector {
                 gain = detection.gain,
                 "wake word detected"
             );
+            // Expose the fire score for online tuning (#121). Keep the strongest
+            // if a `detect` call somehow fires on more than one frame.
+            self.last_fire_score = Some(
+                self.last_fire_score
+                    .map_or(detection.score, |prev| prev.max(detection.score)),
+            );
             true
         } else {
             false
@@ -456,6 +470,9 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         // call and silently no-ops otherwise (#44), so accumulate and feed it one
         // frame at a time, keeping the sub-frame remainder for the next call.
         self.buf.extend_from_slice(samples);
+        // Only the current call's fire score is meaningful to the caller, so
+        // clear any stale one up front (#121).
+        self.last_fire_score = None;
 
         let mut detected = false;
         let spf = self.samples_per_frame;
@@ -478,6 +495,12 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
             }
         }
         Ok(detected)
+    }
+
+    /// Take the score of the fire from the just-finished `detect` call (`None` if
+    /// it did not fire), for online tuning (#121).
+    fn take_last_fire_score(&mut self) -> Option<f32> {
+        self.last_fire_score.take()
     }
 
     /// Apply a new sensitivity to the detector without a process restart, by
