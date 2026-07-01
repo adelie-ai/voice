@@ -177,11 +177,6 @@ impl WakeTuner {
         self.enabled = enabled;
     }
 
-    /// The live cutoff the tuner believes is in effect.
-    pub fn current(&self) -> f32 {
-        self.current
-    }
-
     /// Re-anchor to a freshly calibrated cutoff + mode and forget history — start
     /// adapting again from the new known-good baseline.
     pub fn recalibrated(&mut self, cutoff: f32, eager: bool) {
@@ -362,11 +357,7 @@ mod tests {
         // anchor + ANCHOR_BAND however long it runs.
         let mut t = WakeTuner::new(0.30, true, true);
         feed(&mut t, tp(0.95), 200);
-        assert!(
-            t.current() <= 0.30 + ANCHOR_BAND + 1e-6,
-            "got {}",
-            t.current()
-        );
+        assert!(t.current <= 0.30 + ANCHOR_BAND + 1e-6, "got {}", t.current);
     }
 
     #[test]
@@ -376,9 +367,9 @@ mod tests {
         let mut t = WakeTuner::new(0.40, false, true);
         feed(&mut t, tp(0.42), 200);
         assert!(
-            t.current() >= 0.40 - 1e-6,
+            t.current >= 0.40 - 1e-6,
             "non-eager lowered below anchor: {}",
-            t.current()
+            t.current
         );
     }
 
@@ -388,7 +379,7 @@ mod tests {
         // MAX_SENSITIVITY, so the hard clamp must cap the live cutoff.
         let mut t = WakeTuner::new(MAX_SENSITIVITY - 0.03, true, true);
         feed(&mut t, fp(0.99), 200);
-        assert!(t.current() <= MAX_SENSITIVITY + 1e-6, "got {}", t.current());
+        assert!(t.current <= MAX_SENSITIVITY + 1e-6, "got {}", t.current);
     }
 
     #[test]
@@ -447,10 +438,10 @@ mod tests {
         let mut t = WakeTuner::new(0.30, false, true);
         let _ = feed(&mut t, fp(0.28), MIN_OBSERVATIONS * 2);
         t.reanchor(0.50);
-        assert!((t.current() - 0.50).abs() < 1e-6);
+        assert!((t.current - 0.50).abs() < 1e-6);
         feed(&mut t, tp(0.52), 50);
         assert!(
-            t.current() >= 0.50 - 1e-6,
+            t.current >= 0.50 - 1e-6,
             "reanchor must preserve non-eager raise-only"
         );
     }
@@ -460,7 +451,7 @@ mod tests {
         let mut t = WakeTuner::new(0.30, true, true);
         let _ = feed(&mut t, fp(0.25), MIN_OBSERVATIONS * 2);
         t.recalibrated(0.45, false);
-        assert!((t.current() - 0.45).abs() < 1e-6);
+        assert!((t.current - 0.45).abs() < 1e-6);
         // History cleared → the next partial batch produces no proposal yet.
         for _ in 0..(MIN_OBSERVATIONS - 1) {
             assert_eq!(t.observe(0.50, WakeLabel::TruePositive), None);
@@ -486,9 +477,9 @@ mod tests {
             }
         }
         assert!(
-            (t.current() - 0.37).abs() < 0.02,
+            (t.current - 0.37).abs() < 0.02,
             "did not converge: {}",
-            t.current()
+            t.current
         );
     }
 
@@ -499,9 +490,9 @@ mod tests {
         let mut t = WakeTuner::new(0.20, true, true);
         feed(&mut t, fp(0.25), 200);
         assert!(
-            (t.current() - (0.25 + FP_MARGIN)).abs() < 0.02,
+            (t.current - (0.25 + FP_MARGIN)).abs() < 0.02,
             "got {}",
-            t.current()
+            t.current
         );
     }
 }
