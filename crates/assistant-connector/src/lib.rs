@@ -221,7 +221,11 @@ fn map_signal(event: SignalEvent) -> Option<AssistantEvent> {
 }
 
 impl AssistantGateway for ConnectorAssistantGateway {
-    async fn create_conversation(&self, title: &str, tags: Vec<String>) -> Result<String, VoiceError> {
+    async fn create_conversation(
+        &self,
+        title: &str,
+        tags: Vec<String>,
+    ) -> Result<String, VoiceError> {
         let connector = self.current().await?;
         match connector.create_conversation_with_tags(title, tags).await {
             Ok(id) => Ok(id),
