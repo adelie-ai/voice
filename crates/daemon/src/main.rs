@@ -56,13 +56,15 @@ async fn main() -> Result<()> {
 
     // Initialize components. The wake builder rebuilds the detector at a new
     // sensitivity on reload (rustpotter bakes the threshold in at construction).
-    // `eager` (#50) is captured at startup — changing it needs a restart.
+    // `eager` (#50) and `energy_gate` are captured at startup — changing either
+    // needs a restart (the detector is rebuilt only on a `sensitivity` reload).
     let wake_model_path = config.wake_word.model_path.clone();
     let wake_eager = config.wake_word.eager;
+    let wake_energy_gate = config.wake_word.energy_gate;
     let wake_builder: pipeline::WakeBuilder<RustpotterWakeWordDetector> = {
         let model_path = wake_model_path.clone();
         Box::new(move |sensitivity| {
-            RustpotterWakeWordDetector::new(&model_path, sensitivity, wake_eager)
+            RustpotterWakeWordDetector::new(&model_path, sensitivity, wake_eager, wake_energy_gate)
         })
     };
     let wake = wake_builder(config.wake_word.sensitivity)?;
