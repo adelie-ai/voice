@@ -10,6 +10,7 @@ mod cue;
 mod pipeline;
 mod session;
 mod tts_service;
+mod wake_tuning;
 
 use adele_voice_assistant_connector::ConnectorAssistantGateway;
 use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
