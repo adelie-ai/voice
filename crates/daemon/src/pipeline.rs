@@ -947,7 +947,10 @@ where
         if let Some(enabled) = plan.set_wake_auto_adapt {
             self.wake_tuner.set_enabled(enabled);
             self.tunables.wake_auto_adapt = enabled;
-            tracing::info!(auto_adapt = enabled, "config reload: applied wake_word.auto_adapt");
+            tracing::info!(
+                auto_adapt = enabled,
+                "config reload: applied wake_word.auto_adapt"
+            );
         }
         if let Some(change) = &plan.restart_required_for_device {
             tracing::warn!(
@@ -1047,7 +1050,8 @@ where
                 // Re-anchor the online tuner to the freshly calibrated cutoff and
                 // mode, forgetting prior drift — start adapting from the new
                 // known-good baseline (#121).
-                self.wake_tuner.recalibrated(outcome.sensitivity, outcome.eager);
+                self.wake_tuner
+                    .recalibrated(outcome.sensitivity, outcome.eager);
                 match config::persist_wake_settings(outcome.sensitivity, outcome.eager) {
                     Ok(()) => Ok(outcome),
                     Err(e) => Err(format!(
@@ -3516,7 +3520,10 @@ mod tests {
             set_wake_auto_adapt: Some(true),
             ..config::ReloadPlan::default()
         });
-        assert_eq!(p.wake.applied_sensitivity, None, "toggling doesn't apply a cutoff");
+        assert_eq!(
+            p.wake.applied_sensitivity, None,
+            "toggling doesn't apply a cutoff"
+        );
         for _ in 0..crate::wake_tuning::MIN_OBSERVATIONS {
             p.observe_wake(0.62, WakeLabel::TruePositive);
         }

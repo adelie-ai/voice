@@ -362,7 +362,11 @@ mod tests {
         // anchor + ANCHOR_BAND however long it runs.
         let mut t = WakeTuner::new(0.30, true, true);
         feed(&mut t, tp(0.95), 200);
-        assert!(t.current() <= 0.30 + ANCHOR_BAND + 1e-6, "got {}", t.current());
+        assert!(
+            t.current() <= 0.30 + ANCHOR_BAND + 1e-6,
+            "got {}",
+            t.current()
+        );
     }
 
     #[test]
@@ -371,7 +375,11 @@ mod tests {
         // (a LOWER move) — non-eager must refuse to drop below the anchor.
         let mut t = WakeTuner::new(0.40, false, true);
         feed(&mut t, tp(0.42), 200);
-        assert!(t.current() >= 0.40 - 1e-6, "non-eager lowered below anchor: {}", t.current());
+        assert!(
+            t.current() >= 0.40 - 1e-6,
+            "non-eager lowered below anchor: {}",
+            t.current()
+        );
     }
 
     #[test]
@@ -387,7 +395,10 @@ mod tests {
     fn log_only_marks_apply_false() {
         let mut t = WakeTuner::new(0.20, true, false);
         let adj = feed(&mut t, fp(0.24), MIN_OBSERVATIONS).unwrap();
-        assert!(!adj.apply, "a disabled tuner must not mark proposals applyable");
+        assert!(
+            !adj.apply,
+            "a disabled tuner must not mark proposals applyable"
+        );
     }
 
     #[test]
@@ -410,8 +421,15 @@ mod tests {
         }
         // After a further eval the proposal must reflect TP-only targeting.
         let adj = feed(&mut t, tp(0.42), MIN_OBSERVATIONS).unwrap();
-        assert!(!adj.ambiguous, "aged-out FPs should no longer force overlap");
-        assert!((adj.target - (0.42 - TP_MARGIN)).abs() < 1e-6, "got {}", adj.target);
+        assert!(
+            !adj.ambiguous,
+            "aged-out FPs should no longer force overlap"
+        );
+        assert!(
+            (adj.target - (0.42 - TP_MARGIN)).abs() < 1e-6,
+            "got {}",
+            adj.target
+        );
     }
 
     #[test]
@@ -431,7 +449,10 @@ mod tests {
         t.reanchor(0.50);
         assert!((t.current() - 0.50).abs() < 1e-6);
         feed(&mut t, tp(0.52), 50);
-        assert!(t.current() >= 0.50 - 1e-6, "reanchor must preserve non-eager raise-only");
+        assert!(
+            t.current() >= 0.50 - 1e-6,
+            "reanchor must preserve non-eager raise-only"
+        );
     }
 
     #[test]
@@ -464,7 +485,11 @@ mod tests {
                 assert!(adj.to >= MIN_SENSITIVITY && adj.to <= MAX_SENSITIVITY);
             }
         }
-        assert!((t.current() - 0.37).abs() < 0.02, "did not converge: {}", t.current());
+        assert!(
+            (t.current() - 0.37).abs() < 0.02,
+            "did not converge: {}",
+            t.current()
+        );
     }
 
     #[test]
@@ -473,6 +498,10 @@ mod tests {
         // above them (~0.27), bounded by the anchor band.
         let mut t = WakeTuner::new(0.20, true, true);
         feed(&mut t, fp(0.25), 200);
-        assert!((t.current() - (0.25 + FP_MARGIN)).abs() < 0.02, "got {}", t.current());
+        assert!(
+            (t.current() - (0.25 + FP_MARGIN)).abs() < 0.02,
+            "got {}",
+            t.current()
+        );
     }
 }
