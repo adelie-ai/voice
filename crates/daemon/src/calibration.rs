@@ -47,13 +47,18 @@ pub const PEAK_SETTLE: Duration = Duration::from_millis(800);
 /// up, so it just needs to sit a little under the worst utterance.
 const EAGER_MARGIN: f32 = 0.05;
 /// Minimum separation between the background match level and the weakest peak
-/// for STANDARD (non-eager) mode to be reliable. Below this the score can't
-/// dependably fall back under a cutoff that also clears the peaks.
-const MIN_GAP: f32 = 0.12;
+/// for STANDARD (non-eager) mode to be chosen. Non-eager only fires when the
+/// score falls *back below* the cutoff, so the cutoff must sit both well above
+/// the background (to fall back at all) AND below the peaks (to clear them) —
+/// and it must do so before the energy gate resets the detector after speech.
+/// A *generous* gap is required; anything tighter is handed to eager, which only
+/// needs to sit below the peaks and is unaffected by the fall-back timing.
+const MIN_GAP: f32 = 0.18;
 /// Where in the floor→peak gap the non-eager cutoff sits, as a fraction up from
-/// the floor. Biased low (0.4) for recall while keeping headroom above the floor
-/// so the score reliably falls back below the cutoff at the end of the phrase.
-const NON_EAGER_FLOOR_FRACTION: f32 = 0.4;
+/// the floor. Biased toward the middle-high (0.55) so there's real headroom
+/// above the background — the score reliably drops below the cutoff at the end
+/// of the phrase — while still clearing below the peaks.
+const NON_EAGER_FLOOR_FRACTION: f32 = 0.55;
 
 /// Clamp a requested utterance count into the supported range, mapping 0 to the
 /// default.
@@ -159,6 +164,23 @@ mod tests {
             (out.sensitivity - 0.23).abs() < 1e-3,
             "got {}",
             out.sensitivity
+        );
+    }
+
+    #[test]
+    fn marginal_gap_falls_back_to_eager() {
+        // The real regression: strong, consistent peaks (~0.42) but a HIGH
+        // background (~0.29), so the gap (~0.13) is too small for a dependable
+        // non-eager fall-back → eager, not a cutoff that sits right on the noise.
+        let out = recommend(&[0.42, 0.43, 0.42, 0.43, 0.42], 0.29).unwrap();
+        assert!(out.eager, "a marginal gap must not choose non-eager");
+        assert!(
+            out.non_eager_cutoff < 0.0,
+            "standard mode flagged unavailable"
+        );
+        assert!(
+            out.sensitivity > 0.29,
+            "the eager cutoff must sit above the background"
         );
     }
 
