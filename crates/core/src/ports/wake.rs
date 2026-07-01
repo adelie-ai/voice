@@ -36,9 +36,15 @@ pub trait WakeWordDetector: Send {
     /// calibration utterance. Default no-op.
     fn clear_peak(&mut self) {}
 
-    /// Leave calibration mode and apply `sensitivity` as the new live cutoff.
-    /// The default just applies the sensitivity (calibration was a no-op).
-    fn end_calibration(&mut self, sensitivity: f32) -> Result<(), VoiceError> {
+    /// Leave calibration mode and apply the calibrated result: `sensitivity` as
+    /// the live cutoff and `eager` as the wake mode (calibration picks the best
+    /// available mode). The default applies the sensitivity; detectors that
+    /// support an eager mode also switch it.
+    fn end_calibration(&mut self, sensitivity: f32, _eager: bool) -> Result<(), VoiceError> {
         self.set_sensitivity(sensitivity)
     }
+
+    /// Abort calibration without applying a result — restore the detector to the
+    /// settings it had before [`Self::begin_calibration`]. Default no-op.
+    fn cancel_calibration(&mut self) {}
 }

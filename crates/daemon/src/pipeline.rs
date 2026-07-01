@@ -949,6 +949,16 @@ where
         tracing::info!(utterances = total, "wake calibration: starting");
         self.wake.begin_calibration();
 
+        // Measure the room's background match level first (in silence), so we can
+        // tell whether standard (non-eager) mode has a usable gap below the peaks.
+        self.emit_signal(VoiceSignal::CalibrationProgress {
+            captured: 0,
+            total,
+            score: -3.0,
+        });
+        let noise_floor = self.measure_noise_floor(audio_rx).await;
+        tracing::info!(noise_floor, "wake calibration: measured background level");
+
         let mut peaks: Vec<f32> = Vec::with_capacity(total as usize);
         let max_attempts = calibration::max_attempts(total);
         let mut attempts = 0u32;
@@ -988,27 +998,30 @@ where
             }
         }
 
-        // Decide the outcome, then ALWAYS leave calibration mode — restoring the
-        // user's eager setting and applying either the new cutoff (success) or
-        // the prior sensitivity unchanged (failure).
-        let result = match calibration::recommend(&peaks) {
+        // Decide the outcome, then ALWAYS leave calibration mode — applying the
+        // best mode + cutoff (success) or restoring the prior settings (failure).
+        let result = match calibration::recommend(&peaks, noise_floor) {
             Some(outcome) => {
-                if let Err(e) = self.wake.end_calibration(outcome.sensitivity) {
-                    tracing::warn!("wake calibration: failed to apply new cutoff: {e}");
+                if let Err(e) = self
+                    .wake
+                    .end_calibration(outcome.sensitivity, outcome.eager)
+                {
+                    tracing::warn!("wake calibration: failed to apply result: {e}");
                 }
                 // Keep the tunables snapshot in step so the file-watcher reload
                 // triggered by the persist below is a no-op for sensitivity.
                 self.tunables.wake_sensitivity = outcome.sensitivity;
-                match config::persist_wake_sensitivity(outcome.sensitivity) {
+                match config::persist_wake_settings(outcome.sensitivity, outcome.eager) {
                     Ok(()) => Ok(outcome),
                     Err(e) => Err(format!(
-                        "calibrated to {:.2} and applied it, but couldn't save it: {e}",
-                        outcome.sensitivity
+                        "calibrated to {:.2} ({}) and applied it, but couldn't save it: {e}",
+                        outcome.sensitivity,
+                        if outcome.eager { "eager" } else { "standard" }
                     )),
                 }
             }
             None => {
-                let _ = self.wake.end_calibration(self.tunables.wake_sensitivity);
+                self.wake.cancel_calibration();
                 Err(format!(
                     "couldn't hear enough clear wake words (got {} of {}) — check the \
                      microphone and try again",
@@ -1021,12 +1034,36 @@ where
         match &result {
             Ok(o) => tracing::info!(
                 sensitivity = o.sensitivity,
+                eager = o.eager,
                 samples = o.samples,
+                noise_floor = o.noise_floor,
                 "wake calibration: complete"
             ),
             Err(e) => tracing::warn!("wake calibration: {e}"),
         }
         let _ = req.reply.send(result);
+    }
+
+    /// Sample the room in silence for [`calibration::AMBIENT_MEASURE`] and return
+    /// the highest match score seen — the background level a non-eager cutoff has
+    /// to sit above. Runs the detector in calibration mode (already begun).
+    async fn measure_noise_floor(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) -> f32 {
+        self.wake.clear_peak();
+        let deadline = tokio::time::sleep(calibration::AMBIENT_MEASURE);
+        tokio::pin!(deadline);
+        let mut floor = 0.0f32;
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                chunk = audio_rx.recv() => {
+                    let Some(chunk) = chunk else { break };
+                    if let Some(p) = self.wake.peak_score(&chunk) {
+                        floor = floor.max(p);
+                    }
+                }
+            }
+        }
+        floor
     }
 
     /// Listen for one spoken wake word during a calibration session, returning

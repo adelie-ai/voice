@@ -293,10 +293,12 @@ pub struct RustpotterWakeWordDetector {
     /// of every fire / partial score seen since the last [`Self::clear_peak`].
     /// Read by [`Self::peak_score`].
     calib_peak: f32,
-    /// The user's `eager` setting, saved across a calibration session so it can
-    /// be restored afterwards (calibration forces non-eager to measure true
-    /// peaks, and `DetectorConfig` isn't `Clone`, so we mutate-and-restore).
+    /// The `eager` + `threshold` settings saved at [`Self::begin_calibration`],
+    /// so [`Self::cancel_calibration`] can restore them if calibration is aborted
+    /// (calibration mutates the stored `DetectorConfig` in place — it isn't
+    /// `Clone` — driving a low, non-eager measurement config meanwhile).
     saved_eager: bool,
+    saved_threshold: f32,
 }
 
 /// Pop one complete `frame`-sized chunk from the front of `buf`, retaining the
@@ -378,6 +380,7 @@ impl RustpotterWakeWordDetector {
             calibrating: false,
             calib_peak: 0.0,
             saved_eager: eager,
+            saved_threshold: sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY),
         })
     }
 
@@ -470,11 +473,11 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
     fn begin_calibration(&mut self) {
         self.calibrating = true;
         self.saved_eager = self.config.detector.eager;
+        self.saved_threshold = self.config.detector.threshold;
         // Drive rustpotter at the low, non-eager calibration settings. We mutate
-        // the stored detector config in place (it isn't `Clone`) — `eager` is
-        // restored from `saved_eager` and `threshold` is overwritten by the
-        // chosen cutoff in `end_calibration`, so the stored config is correct
-        // again once calibration ends.
+        // the stored detector config in place (it isn't `Clone`); `end_calibration`
+        // overwrites `eager`/`threshold` with the chosen result, and
+        // `cancel_calibration` restores the saved values.
         self.config.detector.eager = false;
         self.config.detector.threshold = CALIBRATION_THRESHOLD;
         self.rustpotter
@@ -511,17 +514,25 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         self.rustpotter.reset();
     }
 
-    /// Leave calibration mode and apply the chosen cutoff as the new live
-    /// sensitivity. Restores the user's `eager` setting (carried in
-    /// `self.config`) in the same `update_detector_config` call.
-    fn end_calibration(&mut self, sensitivity: f32) -> Result<(), VoiceError> {
+    /// Leave calibration mode and apply the calibrated result: set the wake mode
+    /// to `eager` and the cutoff to `sensitivity`, pushed to rustpotter in one
+    /// `update_detector_config` (via `set_sensitivity`, now that `calibrating` is
+    /// false again).
+    fn end_calibration(&mut self, sensitivity: f32, eager: bool) -> Result<(), VoiceError> {
         self.calibrating = false;
         self.calib_peak = 0.0;
-        // Restore the user's eager setting; set_sensitivity (now that
-        // `calibrating` is false) sets threshold = cutoff and pushes the whole
-        // restored detector config to rustpotter in one update.
-        self.config.detector.eager = self.saved_eager;
+        self.config.detector.eager = eager;
         self.set_sensitivity(sensitivity)
+    }
+
+    /// Abort calibration: restore the `eager`/`threshold` saved at
+    /// `begin_calibration` so the detector is exactly as it was before.
+    fn cancel_calibration(&mut self) {
+        self.calibrating = false;
+        self.calib_peak = 0.0;
+        self.config.detector.eager = self.saved_eager;
+        // set_sensitivity re-clamps + pushes the restored config to rustpotter.
+        let _ = self.set_sensitivity(self.saved_threshold);
     }
 }
 

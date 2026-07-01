@@ -493,11 +493,12 @@ pub fn load() -> Result<Config> {
     Ok(config)
 }
 
-/// Persist a (calibrated) wake sensitivity to `wake_word.sensitivity` in the
-/// config file, preserving everything else — comments, formatting, key order —
-/// by editing the document in place instead of re-serializing the whole Config
-/// (#121). Creates the file and the `[wake_word]` table if they don't exist.
-pub fn persist_wake_sensitivity(sensitivity: f32) -> Result<()> {
+/// Persist the calibrated wake settings — `wake_word.sensitivity` and
+/// `wake_word.eager` (the best mode calibration chose) — to the config file,
+/// preserving everything else (comments, formatting, key order) by editing the
+/// document in place instead of re-serializing the whole Config (#121). Creates
+/// the file and the `[wake_word]` table if they don't exist.
+pub fn persist_wake_settings(sensitivity: f32, eager: bool) -> Result<()> {
     let path = config_path();
     let mut doc = if path.exists() {
         std::fs::read_to_string(&path)
@@ -513,12 +514,14 @@ pub fn persist_wake_sensitivity(sensitivity: f32) -> Result<()> {
     };
     // Mutable indexing auto-creates the `[wake_word]` table if absent.
     doc["wake_word"]["sensitivity"] = toml_edit::value(sensitivity as f64);
+    doc["wake_word"]["eager"] = toml_edit::value(eager);
     std::fs::write(&path, doc.to_string())
         .with_context(|| format!("failed to write config to {}", path.display()))?;
     tracing::info!(
         sensitivity,
+        eager,
         path = %path.display(),
-        "persisted calibrated wake sensitivity"
+        "persisted calibrated wake settings"
     );
     Ok(())
 }

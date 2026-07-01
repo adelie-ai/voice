@@ -537,7 +537,9 @@ async fn run_calibrate_cli(utterances: u32) -> Result<()> {
             let Ok((captured, total, score)) = msg.body().deserialize::<(u32, u32, f64)>() else {
                 continue;
             };
-            if score < -1.5 {
+            if score < -2.5 {
+                println!("   Measuring background noise — please stay quiet…");
+            } else if score < -1.5 {
                 println!("   …didn't catch that — try again.");
             } else if score < 0.0 {
                 println!("-> Say \"Hey Adele\" now ({}/{})", captured + 1, total);
@@ -551,17 +553,40 @@ async fn run_calibrate_cli(utterances: u32) -> Result<()> {
     printer.abort();
     let reply = reply.map_err(|e| anyhow::anyhow!("calibration failed: {e}"))?;
 
-    let (sensitivity, samples, min, max, mean): (f64, u32, f64, f64, f64) = reply
+    let (sensitivity, eager, samples, mean, noise_floor, eager_cutoff, non_eager_cutoff): (
+        f64,
+        bool,
+        u32,
+        f64,
+        f64,
+        f64,
+        f64,
+    ) = reply
         .body()
         .deserialize()
         .context("unexpected calibration reply from the daemon")?;
 
+    let mode = if eager { "eager" } else { "standard" };
     println!("\nCalibration complete.");
-    println!("   Heard {samples} clear wake words (scores {min:.2}-{max:.2}, average {mean:.2}).");
     println!(
-        "   Wake sensitivity set to {sensitivity:.2} (a margin below your weakest), \
-         applied live and saved."
+        "   Heard {samples} clear wake words (average match {mean:.2}); \
+         background level {noise_floor:.2}."
     );
+    println!("   Best mode for your voice/mic: {mode} — switched on.");
+    println!("   Wake sensitivity set to {sensitivity:.2}, applied live and saved.");
+    // Show the other mode's value so the choice is transparent.
+    if eager {
+        if non_eager_cutoff < 0.0 {
+            println!(
+                "   (Standard mode isn't reliable here — your wake word is too close \
+                 to the background level.)"
+            );
+        } else {
+            println!("   (Standard mode would use {non_eager_cutoff:.2}.)");
+        }
+    } else {
+        println!("   (Eager mode would use {eager_cutoff:.2}.)");
+    }
     Ok(())
 }
 
