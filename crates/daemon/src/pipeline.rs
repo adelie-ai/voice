@@ -971,7 +971,7 @@ where
                 total,
                 score: -1.0,
             });
-            match self.capture_one_wake(audio_rx).await {
+            match self.capture_one_wake(audio_rx, noise_floor).await {
                 Some(score) => {
                     peaks.push(score);
                     self.emit_signal(VoiceSignal::CalibrationProgress {
@@ -1073,10 +1073,17 @@ where
     /// We don't wait for the detector to "fire": at the low calibration threshold
     /// a non-eager detector never falls back, so instead we track rustpotter's
     /// running peak ([`WakeWordDetector::peak_score`]) and end the utterance once
-    /// that peak has reached [`calibration::MIN_PEAK`] and then stopped rising for
-    /// [`calibration::PEAK_SETTLE`] (the word has finished). A peak that never
-    /// clears `MIN_PEAK` within the window is treated as "didn't hear it".
-    async fn capture_one_wake(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) -> Option<f32> {
+    /// that peak has cleared the utterance floor and then stopped rising for
+    /// [`calibration::PEAK_SETTLE`] (the word has finished). The floor is
+    /// [`calibration::min_utterance_peak`] of the measured `noise_floor`, so an
+    /// elevated room level isn't recorded as speech; a peak that never clears it
+    /// is treated as "didn't hear it".
+    async fn capture_one_wake(
+        &mut self,
+        audio_rx: &mut mpsc::Receiver<Vec<f32>>,
+        noise_floor: f32,
+    ) -> Option<f32> {
+        let min_peak = calibration::min_utterance_peak(noise_floor);
         self.wake.clear_peak();
         let deadline = tokio::time::sleep(calibration::UTTERANCE_TIMEOUT);
         tokio::pin!(deadline);
@@ -1095,19 +1102,19 @@ where
                     }
                     // Once a real match has formed and the score has settled, the
                     // utterance is done — record it without waiting out the timeout.
-                    if best >= calibration::MIN_PEAK && last_gain.elapsed() >= calibration::PEAK_SETTLE
-                    {
+                    if best >= min_peak && last_gain.elapsed() >= calibration::PEAK_SETTLE {
                         break;
                     }
                 }
             }
         }
-        if best >= calibration::MIN_PEAK {
+        if best >= min_peak {
             tracing::info!(peak = best, "wake calibration: utterance peak measured");
             Some(best)
         } else {
             tracing::info!(
                 peak = best,
+                min_peak,
                 "wake calibration: no clear match this utterance"
             );
             None

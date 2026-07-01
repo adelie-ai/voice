@@ -38,10 +38,21 @@ pub const AMBIENT_MEASURE: Duration = Duration::from_millis(2500);
 /// noise and well below a genuine "Hey Adele" (~0.4+), so noise can't latch the
 /// settle timer before the user actually speaks.
 pub const MIN_PEAK: f32 = 0.20;
-/// Once the running peak has reached [`MIN_PEAK`] and then stopped rising for
-/// this long, the utterance is considered finished and its peak is recorded —
-/// no dependence on the detector "firing".
+/// A calibration utterance's peak must clear the measured background level by at
+/// least this much to count as real speech rather than the room itself. Without
+/// it, a high background (above [`MIN_PEAK`]) gets recorded as "utterances".
+pub const PEAK_OVER_FLOOR: f32 = 0.05;
+/// Once the running peak has reached the utterance floor and then stopped rising
+/// for this long, the utterance is considered finished and its peak is recorded
+/// — no dependence on the detector "firing".
 pub const PEAK_SETTLE: Duration = Duration::from_millis(800);
+
+/// The minimum peak that counts as a real utterance given the measured
+/// background: above the fixed floor AND clearly above the background, so an
+/// elevated room level can't be mistaken for the wake word.
+pub fn min_utterance_peak(noise_floor: f32) -> f32 {
+    MIN_PEAK.max(noise_floor + PEAK_OVER_FLOOR)
+}
 
 /// Margin below the weakest peak for the EAGER cutoff — eager fires on the way
 /// up, so it just needs to sit a little under the worst utterance.
