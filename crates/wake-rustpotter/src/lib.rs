@@ -267,13 +267,18 @@ impl EnergyGate {
 
 pub struct RustpotterWakeWordDetector {
     rustpotter: Rustpotter,
-    /// The detector config we built rustpotter from, kept so the sensitivity
-    /// (`detector.threshold`) can be poked at runtime via
-    /// [`Rustpotter::update_detector_config`] instead of rebuilding the whole
-    /// detector. Always holds the *normal-operation* settings (notably the
-    /// user's `eager`); calibration drives rustpotter from a temporary config
-    /// and restores from this one.
+    /// The detector config rustpotter was built from. Holds the current
+    /// normal-operation settings (threshold + eager); a live sensitivity/mode
+    /// change updates this and REBUILDS rustpotter from it (see
+    /// [`Self::rebuild`]) rather than poking it in place — an in-place
+    /// `update_detector_config` was observed to leave the detector unable to fire
+    /// until a process restart. Calibration measurement is the one exception: it
+    /// drives a temporary low, non-eager config and reads the running peak.
     config: RustpotterConfig,
+    /// Path to the wake-word model, kept so [`Self::rebuild`] can reload it.
+    model_path: std::path::PathBuf,
+    /// Whether the energy gate is enabled, so [`Self::rebuild`] recreates it.
+    energy_gate: bool,
     /// Exact number of samples rustpotter consumes per `process_samples` call.
     /// `process_samples` returns `None` (a silent no-op) for ANY other length and
     /// does not buffer across calls, so we must hand it exactly one frame.
@@ -315,6 +320,22 @@ fn take_frame(buf: &mut Vec<f32>, frame: usize) -> Option<Vec<f32>> {
     Some(out)
 }
 
+/// Create a rustpotter instance from `config` with the "hey-adele" wake word
+/// loaded. Shared by construction and [`RustpotterWakeWordDetector::rebuild`] so
+/// a live settings change reproduces a fresh detector exactly.
+fn build_rustpotter(
+    model_path: &Path,
+    config: &RustpotterConfig,
+) -> Result<Rustpotter, VoiceError> {
+    let mut rustpotter = Rustpotter::new(config)
+        .map_err(|e| VoiceError::WakeWord(format!("failed to create rustpotter: {e}")))?;
+    let model_str = model_path.to_string_lossy();
+    rustpotter
+        .add_wakeword_from_file("hey-adele", &model_str)
+        .map_err(|e| VoiceError::WakeWord(format!("failed to load wake word model: {e}")))?;
+    Ok(rustpotter)
+}
+
 impl RustpotterWakeWordDetector {
     /// `eager`: when true, fire the moment `min_scores` partial frames clear the
     /// threshold instead of waiting for the score to peak and fall back below it.
@@ -352,14 +373,7 @@ impl RustpotterWakeWordDetector {
         // match collapses to ~0 (measured: same utterance scores 0.46 with the
         // normalizer off, 0.0 with it on at any max_gain). See #44.
 
-        let mut rustpotter = Rustpotter::new(&config)
-            .map_err(|e| VoiceError::WakeWord(format!("failed to create rustpotter: {e}")))?;
-
-        let model_str = model_path.to_string_lossy();
-        rustpotter
-            .add_wakeword_from_file("hey-adele", &model_str)
-            .map_err(|e| VoiceError::WakeWord(format!("failed to load wake word model: {e}")))?;
-
+        let rustpotter = build_rustpotter(model_path, &config)?;
         let samples_per_frame = rustpotter.get_samples_per_frame();
 
         tracing::info!(
@@ -374,6 +388,8 @@ impl RustpotterWakeWordDetector {
         Ok(Self {
             rustpotter,
             config,
+            model_path: model_path.to_path_buf(),
+            energy_gate,
             samples_per_frame,
             buf: Vec::new(),
             gate: energy_gate.then(|| EnergyGate::new(samples_per_frame)),
@@ -382,6 +398,29 @@ impl RustpotterWakeWordDetector {
             saved_eager: eager,
             saved_threshold: sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY),
         })
+    }
+
+    /// Rebuild rustpotter (and the energy gate) from the current `self.config`,
+    /// exactly reproducing a fresh detector — used to apply a new sensitivity or
+    /// wake mode without a process restart. A restart is known-good; poking
+    /// rustpotter's config in place (`update_detector_config`) is not (it left
+    /// the detector unable to fire), so we reconstruct instead.
+    fn rebuild(&mut self) -> Result<(), VoiceError> {
+        self.rustpotter = build_rustpotter(&self.model_path, &self.config)?;
+        self.samples_per_frame = self.rustpotter.get_samples_per_frame();
+        // Fresh gate (its adaptive floor re-learns) and empty re-framing buffer,
+        // matching startup state.
+        self.gate = self
+            .energy_gate
+            .then(|| EnergyGate::new(self.samples_per_frame));
+        self.buf.clear();
+        self.calib_peak = 0.0;
+        tracing::info!(
+            sensitivity = self.config.detector.threshold,
+            eager = self.config.detector.eager,
+            "wake detector rebuilt"
+        );
+        Ok(())
     }
 
     /// Run rustpotter on exactly one frame, logging and reporting a detection.
@@ -441,28 +480,21 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
         Ok(detected)
     }
 
-    /// Apply a new sensitivity to the *running* detector with no rebuild, by
-    /// mutating rustpotter's score threshold via
-    /// [`Rustpotter::update_detector_config`].
+    /// Apply a new sensitivity to the detector without a process restart, by
+    /// updating `self.config` and REBUILDING rustpotter from it ([`Self::rebuild`]).
     ///
-    /// This keeps rustpotter's own threshold equal to our effective cutoff, so
-    /// firing semantics are unchanged in BOTH modes — including eager, where the
-    /// detector fires the instant `min_scores` partials clear the threshold and
-    /// then `reset()`s. (A "low catch-all threshold + post-filter on
-    /// `detection.score`" design would break eager: it would fire-and-reset on an
-    /// early sub-cutoff partial and could miss the true peak in the post-reset
-    /// re-buffering window.) `update_detector_config` clears rustpotter's window,
-    /// which is harmless between utterances; the energy gate's learned floor is
-    /// left intact.
+    /// We reconstruct rather than poke the running detector in place: an in-place
+    /// `update_detector_config` left the detector unable to fire until a restart.
+    /// A rebuild reproduces a fresh (known-good) detector and still applies live —
+    /// no daemon restart needed. Skipped while calibrating (the measurement config
+    /// is in effect; `end_calibration` rebuilds with the chosen result).
     fn set_sensitivity(&mut self, sensitivity: f32) -> Result<(), VoiceError> {
         let clamped = sensitivity.clamp(MIN_SENSITIVITY, MAX_SENSITIVITY);
         self.config.detector.threshold = clamped;
-        if !self.calibrating {
-            self.rustpotter
-                .update_detector_config(&self.config.detector);
+        if self.calibrating {
+            return Ok(());
         }
-        tracing::info!(sensitivity = clamped, "wake sensitivity applied live");
-        Ok(())
+        self.rebuild()
     }
 
     /// Enter calibration: drive rustpotter at a very low threshold so a scoring
@@ -515,9 +547,10 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
     }
 
     /// Leave calibration mode and apply the calibrated result: set the wake mode
-    /// to `eager` and the cutoff to `sensitivity`, pushed to rustpotter in one
-    /// `update_detector_config` (via `set_sensitivity`, now that `calibrating` is
-    /// false again).
+    /// to `eager` and the cutoff to `sensitivity`, then rebuild the detector
+    /// (`set_sensitivity`, now that `calibrating` is false again, reconstructs it
+    /// cleanly — so the detector fires normally rather than sitting in the dead
+    /// live-update state).
     fn end_calibration(&mut self, sensitivity: f32, eager: bool) -> Result<(), VoiceError> {
         self.calibrating = false;
         self.calib_peak = 0.0;
@@ -526,12 +559,12 @@ impl WakeWordDetector for RustpotterWakeWordDetector {
     }
 
     /// Abort calibration: restore the `eager`/`threshold` saved at
-    /// `begin_calibration` so the detector is exactly as it was before.
+    /// `begin_calibration` and rebuild, so the detector is exactly as it was.
     fn cancel_calibration(&mut self) {
         self.calibrating = false;
         self.calib_peak = 0.0;
         self.config.detector.eager = self.saved_eager;
-        // set_sensitivity re-clamps + pushes the restored config to rustpotter.
+        // set_sensitivity re-clamps + rebuilds from the restored config.
         let _ = self.set_sensitivity(self.saved_threshold);
     }
 }
