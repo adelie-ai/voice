@@ -7,7 +7,9 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 adele-voice-core.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+# `rt` + `time` for the timed-mute auto-unmute task (voice#124: MuteFor spawns a
+# sleeper that re-enables voice); `sync` for the watch/mpsc control channels.
+tokio = { workspace = true, features = ["sync", "rt", "time"] }
 tracing.workspace = true
 zbus.workspace = true
 
@@ -15,8 +17,9 @@ zbus.workspace = true
 # Hermetic signal-emission test (voice#85): a peer-to-peer zbus connection pair
 # over an in-process socket, so we assert the signals actually go out without
 # touching the live session bus / daemon. `rt` to spawn the forwarder.
+# `test-util` drives the timed-mute unit tests' virtual clock (voice#124).
 zbus = { version = "5", default-features = false, features = ["tokio", "p2p"] }
-tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time", "net", "test-util"] }
 futures-util = "0.3"
 
 [lints]

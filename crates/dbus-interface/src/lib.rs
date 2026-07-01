@@ -1,9 +1,17 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use adele_voice_core::domain::State;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use zbus::object_server::SignalEmitter;
 use zbus::{fdo, interface};
+
+/// Upper bound on a timed mute (voice#124): 24 hours. Guards against a client
+/// passing an absurd `MuteFor` duration that would keep the mic closed far
+/// longer than any real "mute for this meeting" intent.
+const MAX_MUTE_SECONDS: u32 = 24 * 60 * 60;
 
 /// A request to the text-to-speech service backing `SayText` /
 /// `SynthesizeText`. Processed on a single task so requests serialize rather
@@ -138,6 +146,15 @@ pub enum StopRequest {
     Conversation,
 }
 
+/// A pending timed auto-unmute (voice#124). Holds the task that re-enables
+/// voice when the timer elapses and the deadline so `GetMuteSecondsRemaining`
+/// can report a live countdown. Superseded (aborted + replaced) whenever the
+/// mute state changes again — a later `MuteFor` or any `SetEnabled`.
+struct MuteTimer {
+    handle: JoinHandle<()>,
+    deadline: Instant,
+}
+
 /// D-Bus adapter exposing org.desktopAssistant.Voice.
 pub struct DbusVoiceAdapter {
     state_rx: watch::Receiver<State>,
@@ -155,6 +172,10 @@ pub struct DbusVoiceAdapter {
     /// Hands a wake-word calibration request to the pipeline (#121) and awaits
     /// the outcome. The CLI and the KCM both drive calibration through this.
     calibrate_tx: mpsc::Sender<CalibrationRequest>,
+    /// Pending timed auto-unmute, if any (voice#124). `MuteFor(secs > 0)` arms
+    /// it; `SetEnabled` and a later `MuteFor` cancel-and-replace it. Behind a
+    /// `Mutex` because the D-Bus methods take `&self`.
+    mute_timer: Arc<Mutex<Option<MuteTimer>>>,
 }
 
 impl DbusVoiceAdapter {
@@ -180,6 +201,22 @@ impl DbusVoiceAdapter {
             tts_tx,
             reload_tx,
             calibrate_tx,
+            mute_timer: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Cancel any pending timed auto-unmute (voice#124). Called before every
+    /// mute-state change so a stale timer can never later flip `enabled` back on
+    /// out from under a newer decision. Aborting an already-finished task is a
+    /// harmless no-op.
+    fn cancel_mute_timer(&self) {
+        if let Some(timer) = self
+            .mute_timer
+            .lock()
+            .expect("mute_timer mutex poisoned")
+            .take()
+        {
+            timer.handle.abort();
         }
     }
 }
@@ -193,6 +230,9 @@ impl DbusVoiceAdapter {
 
     /// Enable or disable voice processing.
     async fn set_enabled(&self, enabled: bool) -> fdo::Result<()> {
+        // A manual toggle is authoritative: it supersedes any pending timed
+        // auto-unmute (voice#124) so the timer can't later override it.
+        self.cancel_mute_timer();
         self.enabled_tx
             .send(enabled)
             .map_err(|e| fdo::Error::Failed(format!("failed to set enabled: {e}")))?;
@@ -203,6 +243,57 @@ impl DbusVoiceAdapter {
     /// Get whether voice processing is enabled.
     async fn get_enabled(&self) -> fdo::Result<bool> {
         Ok(*self.enabled_rx.borrow())
+    }
+
+    /// Mute voice processing now — close the microphone and stop wake-word
+    /// listening — optionally auto-unmuting after `seconds` (voice#124).
+    /// `seconds == 0` mutes indefinitely (until `SetEnabled(true)` or another
+    /// `MuteFor`); a positive value is clamped to a 24h ceiling. This is the
+    /// "inhibit voice for this meeting" control: it silences *passive* listening
+    /// so Adele won't answer other people on a call, while push-to-talk still
+    /// works (a PTT re-acquires the mic on demand). A pending auto-unmute from a
+    /// previous call is cancelled and replaced. Equivalent to `SetEnabled(false)`
+    /// for the indefinite case, but with an optional self-restoring timer.
+    async fn mute_for(&self, seconds: u32) -> fdo::Result<()> {
+        self.cancel_mute_timer();
+        self.enabled_tx
+            .send(false)
+            .map_err(|e| fdo::Error::Failed(format!("failed to mute: {e}")))?;
+        if seconds == 0 {
+            tracing::info!("voice muted (indefinite)");
+            return Ok(());
+        }
+        let secs = seconds.min(MAX_MUTE_SECONDS);
+        let deadline = Instant::now() + Duration::from_secs(secs as u64);
+        let enabled_tx = Arc::clone(&self.enabled_tx);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs as u64)).await;
+            // Best-effort: an error here just means every receiver is gone (the
+            // daemon is shutting down), in which case there's nothing to unmute.
+            let _ = enabled_tx.send(true);
+            tracing::info!("voice auto-unmuted (timed mute elapsed)");
+        });
+        *self.mute_timer.lock().expect("mute_timer mutex poisoned") =
+            Some(MuteTimer { handle, deadline });
+        tracing::info!(seconds = secs, "voice muted (timed)");
+        Ok(())
+    }
+
+    /// Seconds remaining until a timed mute auto-unmutes, or 0 when voice isn't
+    /// under a timed mute (it's enabled, or muted indefinitely). Lets a client
+    /// render a live "muted — N min left" countdown without tracking the
+    /// deadline itself or knowing when another client changed it.
+    async fn get_mute_seconds_remaining(&self) -> fdo::Result<u32> {
+        let guard = self.mute_timer.lock().expect("mute_timer mutex poisoned");
+        let remaining = guard
+            .as_ref()
+            .map(|t| {
+                t.deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_secs() as u32
+            })
+            .unwrap_or(0);
+        Ok(remaining)
     }
 
     /// Get the real capture (microphone) state (voice#103): "Capturing",
@@ -395,6 +486,13 @@ impl DbusVoiceAdapter {
     #[zbus(signal)]
     pub async fn state_changed(emitter: &SignalEmitter<'_>, state: &str) -> zbus::Result<()>;
 
+    /// Signal emitted whenever voice processing is enabled or disabled —
+    /// via `SetEnabled`, `MuteFor`, or a timed mute auto-unmuting (voice#124).
+    /// Lets clients reflect the muted state (and, crucially, the *automatic*
+    /// unmute) live instead of polling `GetEnabled`.
+    #[zbus(signal)]
+    pub async fn enabled_changed(emitter: &SignalEmitter<'_>, enabled: bool) -> zbus::Result<()>;
+
     /// Wake-word calibration progress (#121): `captured` of `total` utterances
     /// recorded, and the peak `score` of the most recent. A negative `score` is
     /// a prompt, not a measurement (`-1.0` = "say the next one now", `-2.0` =
@@ -427,6 +525,7 @@ impl DbusVoiceAdapter {
 pub async fn run_signal_forwarder(
     emitter: SignalEmitter<'static>,
     mut state_rx: watch::Receiver<State>,
+    mut enabled_rx: watch::Receiver<bool>,
     mut signal_rx: mpsc::Receiver<VoiceSignal>,
 ) {
     // Emit the initial state so a client that connects late learns the current
@@ -434,6 +533,10 @@ pub async fn run_signal_forwarder(
     // the borrow BEFORE awaiting (the watch guard isn't Send).
     let initial = *state_rx.borrow();
     emit_state(&emitter, initial).await;
+
+    // Track whether the enabled channel is still open so its select arm goes
+    // dormant (rather than busy-looping on `Err`) if the sender is ever dropped.
+    let mut enabled_open = true;
 
     loop {
         tokio::select! {
@@ -449,6 +552,19 @@ pub async fn run_signal_forwarder(
                 }
                 let state = *state_rx.borrow_and_update();
                 emit_state(&emitter, state).await;
+            }
+            // Enabled/mute transitions (voice#124): SetEnabled, MuteFor, or a
+            // timed mute auto-unmuting. Guarded so a dropped sender parks this
+            // arm instead of spinning.
+            changed = enabled_rx.changed(), if enabled_open => {
+                if changed.is_err() {
+                    enabled_open = false;
+                } else {
+                    let enabled = *enabled_rx.borrow_and_update();
+                    if let Err(e) = DbusVoiceAdapter::enabled_changed(&emitter, enabled).await {
+                        tracing::debug!(error = %e, "failed to emit EnabledChanged");
+                    }
+                }
             }
             event = signal_rx.recv() => {
                 match event {
@@ -491,5 +607,122 @@ pub async fn run_signal_forwarder(
 async fn emit_state(emitter: &SignalEmitter<'static>, state: State) {
     if let Err(e) = DbusVoiceAdapter::state_changed(emitter, &state.to_string()).await {
         tracing::debug!(error = %e, "failed to emit StateChanged");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an adapter wired to throwaway channels, returning it plus a live
+    /// receiver on the `enabled` watch so a test can observe mute/unmute. The
+    /// unused channel ends are dropped; these tests only exercise the mute path.
+    fn test_adapter() -> (DbusVoiceAdapter, watch::Receiver<bool>) {
+        let (_state_tx, state_rx) = watch::channel(State::Idle);
+        let (_cap_tx, cap_rx) = watch::channel(CaptureState::Capturing);
+        let (enabled_tx, enabled_rx) = watch::channel(true);
+        let (ptt_tx, _ptt_rx) = mpsc::channel(4);
+        let (stop_tx, _stop_rx) = mpsc::channel(4);
+        let (tts_tx, _tts_rx) = mpsc::channel(4);
+        let (reload_tx, _reload_rx) = mpsc::channel(4);
+        let (calibrate_tx, _cal_rx) = mpsc::channel(4);
+        let adapter = DbusVoiceAdapter::new(
+            state_rx,
+            cap_rx,
+            enabled_tx,
+            enabled_rx.clone(),
+            ptt_tx,
+            stop_tx,
+            tts_tx,
+            reload_tx,
+            calibrate_tx,
+        );
+        (adapter, enabled_rx)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mute_for_zero_mutes_indefinitely_with_no_countdown() {
+        let (adapter, mut enabled_rx) = test_adapter();
+        adapter.mute_for(0).await.unwrap();
+        assert!(!*enabled_rx.borrow_and_update(), "MuteFor(0) must mute");
+        assert_eq!(
+            adapter.get_mute_seconds_remaining().await.unwrap(),
+            0,
+            "an indefinite mute has no countdown"
+        );
+        // Time never auto-unmutes an indefinite mute.
+        tokio::time::advance(Duration::from_secs(48 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert!(!*enabled_rx.borrow(), "indefinite mute must persist");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_mute_auto_unmutes_after_its_duration() {
+        let (adapter, mut enabled_rx) = test_adapter();
+        adapter.mute_for(30).await.unwrap();
+        assert!(
+            !*enabled_rx.borrow_and_update(),
+            "MuteFor(30) must mute now"
+        );
+        assert_eq!(adapter.get_mute_seconds_remaining().await.unwrap(), 30);
+
+        // Just before the deadline: still muted.
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(!*enabled_rx.borrow(), "must stay muted before the deadline");
+
+        // Cross the deadline: the timer re-enables voice on its own.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        enabled_rx.changed().await.unwrap();
+        assert!(*enabled_rx.borrow(), "timed mute must auto-unmute");
+        assert_eq!(adapter.get_mute_seconds_remaining().await.unwrap(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn set_enabled_cancels_a_pending_timed_mute() {
+        let (adapter, mut enabled_rx) = test_adapter();
+        adapter.mute_for(60).await.unwrap();
+        assert!(!*enabled_rx.borrow_and_update());
+
+        // A manual re-enable is authoritative: it cancels the auto-unmute timer.
+        adapter.set_enabled(true).await.unwrap();
+        assert!(*enabled_rx.borrow_and_update());
+        assert_eq!(adapter.get_mute_seconds_remaining().await.unwrap(), 0);
+
+        // The stale timer must not fire and flip anything back later.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !enabled_rx.has_changed().unwrap(),
+            "a cancelled timer must not emit a spurious change"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_later_mute_for_replaces_the_prior_timer() {
+        let (adapter, mut enabled_rx) = test_adapter();
+        adapter.mute_for(10).await.unwrap();
+        let _ = enabled_rx.borrow_and_update();
+
+        // Extend the mute; the original 10s timer must be superseded.
+        adapter.mute_for(3600).await.unwrap();
+        assert_eq!(adapter.get_mute_seconds_remaining().await.unwrap(), 3600);
+
+        // Crossing the OLD (10s) deadline must not unmute.
+        tokio::time::advance(Duration::from_secs(15)).await;
+        tokio::task::yield_now().await;
+        assert!(!*enabled_rx.borrow(), "the replaced timer must not fire");
+        assert!(adapter.get_mute_seconds_remaining().await.unwrap() > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mute_for_clamps_an_absurd_duration() {
+        let (adapter, _enabled_rx) = test_adapter();
+        adapter.mute_for(u32::MAX).await.unwrap();
+        assert_eq!(
+            adapter.get_mute_seconds_remaining().await.unwrap(),
+            MAX_MUTE_SECONDS,
+            "an over-long mute is clamped to the ceiling"
+        );
     }
 }
