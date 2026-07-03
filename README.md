@@ -177,15 +177,31 @@ At startup the daemon registers three **client-side tools** with the orchestrato
 |---|---|---|
 | `stop_listening` | — | The user signalled they're done. End the session after the reply: return to wake-word-only Idle and clear the reuse-window id so the next "Hey Adele" starts fresh. |
 | `listen_for_more` | — | The reply expects an answer (e.g. it asked a question). Re-open the mic for a follow-up even outside conversation mode. |
-| `say_this` | `{ text }` | Speak this exact line aloud now — a brief LLM-driven progress note or aside, complementing the automatic progress narration. |
+| `say_this` | `{ text }` | Speak these exact words aloud — Adele's spoken channel in `on_demand` mode (the default), where the reply text is a silent record and this is the only route to the user's ears. Offered only in `on_demand` (see [Speech mode](#speech-mode-voice126)). |
 
-Disable any of them per-tool under `[assistant.client_tools]` (each defaults to `true`):
+Disable `stop_listening` or `listen_for_more` per-tool under `[assistant.client_tools]` (each defaults to `true`); `say_this` is governed by the speech mode below, not a toggle:
 
 ```toml
 [assistant.client_tools]
 stop_listening  = true
 listen_for_more = true
-say_this        = true
+```
+
+#### Speech mode (voice#126)
+
+`[assistant] speech_mode` decides what the user hears on each turn — and tells the model which mode is active, so there is exactly **one** speech route and a reply is never spoken twice:
+
+| `speech_mode` | Reply | `say_this` | The model is told |
+|---|---|---|---|
+| `on_demand` *(default)* | not auto-spoken | offered | "the user hears only what you `say_this`; your typed reply is a silent record" |
+| `always` | read aloud in full as it streams | withheld | "everything you write is read aloud — write plain, speakable prose" |
+| `off` | not spoken | withheld | (nothing) |
+
+In `on_demand`, Adele authors what she says aloud — a short spoken answer while the written reply can stay fuller — and a **silence backstop** narrates the reply only if she called `say_this` not at all this turn, so a missed call is never dead air. `always` is the classic "echo everything" mode (what the automatic reply and status narration above describe). `off` stays silent.
+
+```toml
+[assistant]
+speech_mode = "on_demand"
 ```
 
 ### Conversation reuse window (voice#53)

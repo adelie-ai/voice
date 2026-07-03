@@ -191,6 +191,10 @@ pub struct AssistantConfig {
     /// (voice#61). All on by default; flip one off to withhold that tool from
     /// the orchestrator's tool list.
     pub client_tools: ClientToolsConfig,
+    /// How the daemon decides what to speak and what it tells the model
+    /// (voice#126): `on_demand` (default) = Adele chooses via `say_this`;
+    /// `always` = read every reply aloud; `off` = stay silent.
+    pub speech_mode: SpeechMode,
     /// Transport used to reach the orchestrator: `"uds"` (the default — the
     /// local Unix socket), `"ws"` (a possibly-remote WebSocket), or `"dbus"`
     /// (legacy local D-Bus). The voice service runs wherever the microphone is,
@@ -221,8 +225,6 @@ pub struct ClientToolsConfig {
     pub stop_listening: bool,
     /// `listen_for_more` — keep listening when a reply expects a response.
     pub listen_for_more: bool,
-    /// `say_this` — speak a specific line immediately (LLM-driven narration).
-    pub say_this: bool,
 }
 
 impl Default for ClientToolsConfig {
@@ -230,9 +232,28 @@ impl Default for ClientToolsConfig {
         Self {
             stop_listening: true,
             listen_for_more: true,
-            say_this: true,
         }
     }
+}
+
+/// How the voice daemon decides what the user hears on an assistant turn, and
+/// what it tells the model about it — one speech route per mode, so a reply is
+/// never spoken twice (voice#126). Mirrors the clients' three-way `Adele:`
+/// output level; the daemon, being pure voice, mainly uses `OnDemand` and
+/// `Always` (`Off` simply stays silent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechMode {
+    /// Adele owns the spoken channel: nothing is auto-narrated and the `say_this`
+    /// tool is the only route to the user's ears. A silence backstop narrates the
+    /// reply only if she spoke nothing at all, so a missed call is never dead air.
+    #[default]
+    OnDemand,
+    /// Echo everything: the daemon reads the whole reply aloud, and `say_this` is
+    /// withheld (a second route is what caused double-speaking).
+    Always,
+    /// Stay silent: nothing is spoken and `say_this` is not offered.
+    Off,
 }
 
 impl Default for WakeWordConfig {
@@ -257,7 +278,8 @@ impl Default for AssistantConfig {
             followup_timeout_ms: 8000,
             conversation_reuse_window_ms: 600_000,
             client_tools: ClientToolsConfig::default(),
-            spoken_response_hint: "You are Adele, responding by voice. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. For a simple, quick question, just answer directly — do not preface it. But if the request will take real work (looking something up, using a tool, a multi-step task), open with a SHORT spoken acknowledgement that shows you understood — a handful of words, ending in a period so it can be read aloud immediately (e.g. 'Got it — checking that now.' or 'Sure, looking into your calendar.') — then do the work and answer. Keep that acknowledgement to one short clause; never restate the whole question. Only if a message is clearly garbled or you truly cannot tell what was meant should you briefly check (e.g. 'did you mean X?') or ask one short clarifying question. Your reply will be read aloud, so keep it brief, conversational, and relevant — never a monologue. Default to a few short sentences. If a full answer would be long, give only the most salient points, then ask whether they'd like more. If they ask for more, you may expand but stay under about ten sentences. Let the user lead — invite follow-ups and let them steer. Never use markdown or formatting of any kind — no asterisks, underscores, backticks, pound signs, bullet characters, or emoji. Speak in plain, natural prose. Write every reply as a script to be read aloud verbatim — exactly the words to be spoken. Spell out abbreviations and acronyms as full words (say 'for example' not 'e.g.', 'versus' not 'vs.', 'and so on' not 'etc.', 'approximately' not 'approx.'). Avoid symbols that do not read well aloud: write 'and' not '&', 'percent' not '%', 'number' not '#', 'dollars' not '$', and 'to' for a range rather than a dash. Never read out a URL, file path, or email address — describe it in words instead. Write numbers, dates, and times the way you would say them out loud. Punctuate for the ear, not the page: use commas and periods to control spoken pacing and where natural pauses fall. When spoken phrasing and strict grammar disagree, favor what sounds right read aloud — short clauses and sentences, with commas placed where a speaker would breathe.".into(),
+            speech_mode: SpeechMode::OnDemand,
+            spoken_response_hint: "You are Adele, in a spoken, voice-only conversation. The user can only HEAR you — they never see your typed reply, which is kept only as a written record. The ONLY way to reach the user is the say_this tool: whatever you pass to it is read aloud, and if you do not call it the user hears nothing at all. So say everything you want heard with say_this. The user's message was transcribed from speech, so expect occasional recognition errors and use your judgment. Actively manage the conversation with your tools: use say_this for everything the user should hear — your answer, a brief note before a slow step, or a clarifying question — and you may call it more than once (for example a short 'One moment.' before a lookup, then the answer). Call listen_for_more whenever you expect a reply, such as after a question or a choice, so the microphone reopens for their answer instead of the session ending. Call stop_listening when the conversation is over — they say goodbye, decline further help, or you ask 'Anything else?' and they say no. For a simple question just say the answer; for real work (a lookup, a tool, a multi-step task) say a short acknowledgement first so they know you're on it, then do the work and speak the result. Keep spoken replies brief, conversational, and relevant — never a monologue; default to a few short sentences, and if a full answer would be long, say the most useful part and offer to go on. Let the user lead — invite follow-ups and let them steer. Everything you pass to say_this is read aloud verbatim, so write it exactly as it should be spoken. Never use markdown or formatting of any kind — no asterisks, underscores, backticks, pound signs, bullet characters, or emoji. Spell out abbreviations and acronyms as full words (say 'for example' not 'e.g.', 'versus' not 'vs.', 'and so on' not 'etc.', 'approximately' not 'approx.'). Avoid symbols that do not read well aloud: say 'and' not '&', 'percent' not '%', 'number' not '#', 'dollars' not '$', and 'to' for a range rather than a dash. Never read out a URL, file path, or email address — describe it in words instead. Say numbers, dates, and times the way you would speak them. Punctuate for the ear, not the page: use commas and periods to control spoken pacing and where natural pauses fall. When spoken phrasing and strict grammar disagree, favor what sounds right read aloud — short clauses and sentences, with commas placed where a speaker would breathe.".into(),
             transport: "uds".into(),
             ws_url: None,
             socket_path: None,
@@ -804,15 +826,30 @@ stt_ms = 0
         // voice#61: each session-control tool defaults on and can be disabled
         // individually via [assistant.client_tools].
         let d = ClientToolsConfig::default();
-        assert!(d.stop_listening && d.listen_for_more && d.say_this);
+        assert!(d.stop_listening && d.listen_for_more);
 
-        let cfg: Config = toml::from_str("[assistant.client_tools]\nsay_this = false\n").unwrap();
+        let cfg: Config =
+            toml::from_str("[assistant.client_tools]\nlisten_for_more = false\n").unwrap();
         assert!(cfg.assistant.client_tools.stop_listening);
-        assert!(cfg.assistant.client_tools.listen_for_more);
         assert!(
-            !cfg.assistant.client_tools.say_this,
+            !cfg.assistant.client_tools.listen_for_more,
             "an explicitly-disabled tool must be off; unspecified ones stay on"
         );
+    }
+
+    #[test]
+    fn speech_mode_defaults_to_on_demand_and_parses() {
+        // voice#126: the daemon defaults to Adele-chooses (on_demand); the mode
+        // is settable via [assistant]. A stale [assistant.client_tools] say_this
+        // key from an older config is ignored, not rejected.
+        assert_eq!(AssistantConfig::default().speech_mode, SpeechMode::OnDemand);
+        let cfg: Config = toml::from_str("[assistant]\nspeech_mode = \"always\"\n").unwrap();
+        assert_eq!(cfg.assistant.speech_mode, SpeechMode::Always);
+        let cfg: Config = toml::from_str("[assistant]\nspeech_mode = \"off\"\n").unwrap();
+        assert_eq!(cfg.assistant.speech_mode, SpeechMode::Off);
+        // Back-compat: a removed toggle key doesn't break load.
+        let cfg: Config = toml::from_str("[assistant.client_tools]\nsay_this = true\n").unwrap();
+        assert_eq!(cfg.assistant.speech_mode, SpeechMode::OnDemand);
     }
 
     #[test]
