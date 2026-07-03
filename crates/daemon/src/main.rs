@@ -246,6 +246,7 @@ async fn main() -> Result<()> {
             listening_cue: config.wake_word.listening_cue,
             timeouts: turn_timeouts,
             client_tools: config.assistant.client_tools,
+            speech_mode: config.assistant.speech_mode,
         },
     )
     .with_signal_tx(signal_tx)

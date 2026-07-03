@@ -15,7 +15,7 @@ use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
 
 use crate::calibration;
-use crate::config::{self, ClientToolsConfig, Tunables, plan_reload};
+use crate::config::{self, ClientToolsConfig, SpeechMode, Tunables, plan_reload};
 use crate::cue::{self, ListeningCue};
 use crate::session::SessionGate;
 
@@ -59,6 +59,21 @@ const LIVENESS_PHRASES: &[&str] = &["One moment.", "Still working on it."];
 /// words; longer terminal sentences are the real answer and aren't flushed
 /// early (#58).
 const ACK_MAX_WORDS: usize = 8;
+
+/// System refinement sent in `Always` (echo-everything) mode: the whole reply
+/// is read aloud automatically, so the model just writes plain, speakable prose
+/// and never needs `say_this` (voice#126). The on-demand refinement is the
+/// configurable `spoken_response_hint`; off mode sends none.
+const ALWAYS_REFINEMENT: &str = "You are Adele, responding by voice. Everything you write is read \
+    aloud to the user in full, so write plain, speakable prose. The user's message was transcribed \
+    from speech, so expect occasional recognition errors and use your judgment. Keep replies brief \
+    and conversational — a few short sentences — and if a full answer would be long, give the most \
+    useful part and offer to go on. Never use markdown or formatting of any kind — no asterisks, \
+    underscores, backticks, pound signs, bullet characters, or emoji. Spell out abbreviations and \
+    acronyms as full words, avoid symbols that do not read well aloud (say 'and' not '&', 'percent' \
+    not '%', 'dollars' not '$'), never read out a URL, file path, or email address, and say \
+    numbers, dates, and times the way you would speak them. You do not need to call any tool to \
+    speak — your reply is spoken automatically.";
 
 /// The per-turn timeout bounds the pipeline applies (#58), grouped so the
 /// constructor's argument list stays manageable. `Duration::ZERO` disables an
@@ -120,6 +135,9 @@ pub struct PipelineConfig {
     pub timeouts: TurnTimeouts,
     /// Which session-control client tools to advertise (voice#61).
     pub client_tools: ClientToolsConfig,
+    /// How the daemon decides what to speak and what it tells the model
+    /// (voice#126).
+    pub speech_mode: SpeechMode,
 }
 
 /// Wrap a future in `timeout` unless `limit` is zero (zero = unbounded), mapping
@@ -224,7 +242,10 @@ pub const TOOL_SAY_THIS: &str = "say_this";
 /// tools (voice#61). The descriptions are written to guide the LLM on WHEN to
 /// call each — especially `stop_listening`, which must fire when the user
 /// signals they're finished. Returned in a stable order for deterministic tests.
-pub fn session_control_tools(toggles: ClientToolsConfig) -> Vec<ClientToolSpec> {
+pub fn session_control_tools(
+    toggles: ClientToolsConfig,
+    speech_mode: SpeechMode,
+) -> Vec<ClientToolSpec> {
     let no_args = || {
         serde_json::json!({
             "type": "object",
@@ -255,19 +276,25 @@ pub fn session_control_tools(toggles: ClientToolsConfig) -> Vec<ClientToolSpec> 
             input_schema: no_args(),
         });
     }
-    if toggles.say_this {
+    // `say_this` is Adele's spoken channel and is offered only in on-demand
+    // mode — the one mode where she authors what the user hears (voice#126). In
+    // `always` mode the reply is auto-narrated and in `off` mode nothing is
+    // spoken, so a second route would only double up.
+    if speech_mode == SpeechMode::OnDemand {
         tools.push(ClientToolSpec {
             name: TOOL_SAY_THIS.to_string(),
-            description: "Speak this exact line to the user out loud right now, before the rest \
-                of your reply. Use it for a brief spoken progress note or aside (e.g. \"One \
-                moment, checking that now.\") that should be read aloud verbatim."
+            description: "Speak these exact words to the user out loud — this is your ONLY voice. \
+                The user hears only what you pass here; your typed reply is silent and unseen. Use \
+                it for whatever the user should hear — your answer, a brief progress note, or a \
+                question — written exactly as it should be read aloud. You may call it more than \
+                once in a turn."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The exact line to speak aloud."
+                        "description": "The exact words to speak aloud."
                     }
                 },
                 "required": ["text"],
@@ -425,6 +452,9 @@ where
     /// Which session-control client tools to advertise to the orchestrator
     /// (voice#61).
     client_tools: ClientToolsConfig,
+    /// How the daemon decides what to speak and what it tells the model — one
+    /// speech route per mode, so a reply is never spoken twice (voice#126).
+    speech_mode: SpeechMode,
     /// Set within a turn when the LLM calls `stop_listening`: after this turn's
     /// reply is spoken the conversation ends and the next wake starts fresh.
     /// Reset at the start of each utterance (voice#61).
@@ -497,6 +527,7 @@ where
             listening_cue,
             timeouts,
             client_tools,
+            speech_mode,
         } = config;
         let mut speaker = Speaker::new(Arc::new(tts), Arc::clone(&sink));
         speaker.set_synth_timeout(timeouts.synth);
@@ -537,6 +568,7 @@ where
             narration_flush: timeouts.narration_flush,
             connect_timeout: timeouts.connect,
             client_tools,
+            speech_mode,
             session_end_requested: false,
             listen_for_more_requested: false,
             signal_tx: None,
@@ -638,6 +670,18 @@ where
         self.emit_signal(VoiceSignal::SpeakingText(text.to_string()));
         self.speaker.say(text).await?;
         Ok(())
+    }
+
+    /// The system refinement attached to this turn's prompt, which tells the
+    /// model the active speech mode and how to use its voice (voice#126):
+    /// on-demand → the configurable `spoken_response_hint` (speak via `say_this`);
+    /// always → a built-in "read aloud in full" instruction; off → nothing.
+    fn active_refinement(&self) -> &str {
+        match self.speech_mode {
+            SpeechMode::OnDemand => &self.spoken_response_hint,
+            SpeechMode::Always => ALWAYS_REFINEMENT,
+            SpeechMode::Off => "",
+        }
     }
 
     /// Decide, on a fresh wake (Idle→Listening, NOT an in-turn follow-up),
@@ -1127,7 +1171,7 @@ where
     /// tools (the user can stop by phrase / the follow-up timeout) — so it's
     /// logged and swallowed.
     async fn register_session_control_tools(&mut self) {
-        let tools = session_control_tools(self.client_tools);
+        let tools = session_control_tools(self.client_tools, self.speech_mode);
         if tools.is_empty() {
             tracing::info!("no session-control client tools enabled; skipping registration");
             return;
@@ -1859,7 +1903,7 @@ where
                 self.assistant.send_prompt_with_system_refinement(
                     &conversation_id,
                     &transcript.text,
-                    &self.spoken_response_hint,
+                    self.active_refinement(),
                 ),
             )
             .await;
@@ -1888,7 +1932,7 @@ where
                         self.assistant.send_prompt_with_system_refinement(
                             &fresh_id,
                             &transcript.text,
-                            &self.spoken_response_hint,
+                            self.active_refinement(),
                         ),
                     )
                     .await?
@@ -2032,6 +2076,13 @@ where
         let mut sentence_buf = SentenceBuffer::new(self.narration_flush);
         let flush_ticks = !self.narration_flush.is_zero();
         let mut first_chunk = true;
+        // Did this turn speak any real reply content yet (a narrated sentence,
+        // status, say_this line, or backstop) — as opposed to a liveness/stall
+        // filler? Drives the on-demand silence backstop and the liveness guard
+        // (voice#126).
+        let mut spoke_content = false;
+        // Echo-everything mode auto-narrates the reply; on-demand/off do not.
+        let auto_narrate = matches!(self.speech_mode, SpeechMode::Always);
         // Status narration rate-limit (#58): the first status always speaks;
         // later ones speak only after `status_narration_min_gap` has elapsed.
         let mut last_status_spoken_at: Option<TokioInstant> = None;
@@ -2058,6 +2109,14 @@ where
         let mut audio_alive = true;
 
         let stream_end = loop {
+            // Whether the turn still owes the user its first audio — the guard
+            // for the liveness filler (voice#126): the reply hasn't begun
+            // streaming, nothing was spoken (say_this or narration), and no
+            // status was narrated. Off never fills silence.
+            let awaiting_first_audio = !matches!(self.speech_mode, SpeechMode::Off)
+                && first_chunk
+                && !spoke_content
+                && last_status_spoken_at.is_none();
             // How long to wait for the NEXT event before declaring a stall: the
             // remaining slice of the stall window since the last event. The
             // 100 ms tick keeps the sentence-buffer flush responsive without
@@ -2092,54 +2151,101 @@ where
                     };
                     match event {
                         Some(AssistantEvent::Chunk { request_id: rid, text }) if rid == request_id => {
-                            if first_chunk && is_error_response(&text) {
-                                tracing::error!(chunk = %text, "assistant streamed an error message; speaking a short apology instead");
-                                self.apply(StateEvent::ResponseStarted);
-                                self.speaker.say(ERROR_APOLOGY).await?;
-                                break StreamEnd::Completed;
-                            }
-                            if first_chunk {
-                                first_chunk = false;
-                                self.apply(StateEvent::ResponseStarted);
-                            }
+                            // A chunk means the reply has begun — mark it so the
+                            // liveness filler stands down in every mode (voice#126),
+                            // even though on-demand/off don't SPEAK the chunk: the
+                            // typed reply is a silent record there (Adele speaks via
+                            // say_this, or not at all). The heartbeat reset above
+                            // already counted this as progress.
+                            let was_first = first_chunk;
+                            first_chunk = false;
+                            // Only echo-everything mode narrates the reply text as it
+                            // streams.
+                            if auto_narrate {
+                                if was_first && is_error_response(&text) {
+                                    tracing::error!(chunk = %text, "assistant streamed an error message; speaking a short apology instead");
+                                    self.apply(StateEvent::ResponseStarted);
+                                    self.speaker.say(ERROR_APOLOGY).await?;
+                                    break StreamEnd::Completed;
+                                }
+                                if was_first {
+                                    self.apply(StateEvent::ResponseStarted);
+                                }
 
-                            let sentences = sentence_buf.push(&text);
-                            for sentence in sentences {
-                                self.speak_reply(&sentence).await?;
-                            }
-                            // Speak a short leading ack the instant it looks
-                            // complete (a terminal opener like "Got it —
-                            // checking that now." that the boundary scan won't
-                            // split until the next token), without waiting (#58).
-                            if let Some(ack) = sentence_buf.take_leading_ack(ACK_MAX_WORDS) {
-                                self.speak_reply(&ack).await?;
+                                let sentences = sentence_buf.push(&text);
+                                for sentence in sentences {
+                                    self.speak_reply(&sentence).await?;
+                                    spoke_content = true;
+                                }
+                                // Speak a short leading ack the instant it looks
+                                // complete (a terminal opener like "Got it —
+                                // checking that now." that the boundary scan won't
+                                // split until the next token), without waiting (#58).
+                                if let Some(ack) = sentence_buf.take_leading_ack(ACK_MAX_WORDS) {
+                                    self.speak_reply(&ack).await?;
+                                    spoke_content = true;
+                                }
                             }
                         }
                         Some(AssistantEvent::Status { request_id: rid, message }) if rid == request_id => {
-                            // Progress status doubles as a heartbeat (the
-                            // timeout reset above already happened) and is
-                            // narrated SPARINGLY — the first one immediately,
-                            // later ones rate-limited (#58).
-                            self.maybe_narrate_status(&message, &mut last_status_spoken_at, &mut first_chunk).await?;
+                            // Progress status doubles as a heartbeat (the timeout
+                            // reset above already happened). It is auto-narrated
+                            // SPARINGLY — first immediately, later ones rate-limited
+                            // (#58) — but only in echo-everything mode; in on-demand
+                            // Adele narrates progress herself via say_this (voice#126).
+                            if auto_narrate
+                                && self
+                                    .maybe_narrate_status(&message, &mut last_status_spoken_at, &mut first_chunk)
+                                    .await?
+                            {
+                                spoke_content = true;
+                            }
                         }
                         Some(AssistantEvent::Complete { request_id: rid, full_response }) if rid == request_id => {
-                            if sentence_buf.has_content() {
-                                let remaining = sentence_buf.flush();
-                                if !remaining.is_empty() {
-                                    self.speak_reply(&remaining).await?;
+                            if auto_narrate {
+                                if sentence_buf.has_content() {
+                                    let remaining = sentence_buf.flush();
+                                    if !remaining.is_empty() {
+                                        self.speak_reply(&remaining).await?;
+                                    }
+                                } else if first_chunk && !full_response.trim().is_empty() {
+                                    // Nothing was streamed as chunks — e.g. a
+                                    // tool-using reply delivered as one final block.
+                                    self.apply(StateEvent::ResponseStarted);
+                                    if is_error_response(&full_response) {
+                                        // The orchestrator surfaces LLM failures as
+                                        // the reply text (so they show in chat);
+                                        // don't read the raw error aloud.
+                                        tracing::error!(response = %full_response, "assistant returned an error message; speaking a short apology instead");
+                                        self.speaker.say(ERROR_APOLOGY).await?;
+                                    } else {
+                                        // Speak the full response instead of dropping it.
+                                        let sentences = sentence_buf.push(&full_response);
+                                        for sentence in sentences {
+                                            self.speak_reply(&sentence).await?;
+                                        }
+                                        let remaining = sentence_buf.flush();
+                                        if !remaining.is_empty() {
+                                            self.speak_reply(&remaining).await?;
+                                        }
+                                    }
                                 }
-                            } else if first_chunk && !full_response.trim().is_empty() {
-                                // Nothing was streamed as chunks — e.g. a
-                                // tool-using reply delivered as one final block.
+                            } else if matches!(self.speech_mode, SpeechMode::OnDemand)
+                                && !spoke_content
+                                && !full_response.trim().is_empty()
+                            {
+                                // Silence backstop (voice#126): on-demand mode lets
+                                // Adele speak via say_this, but she didn't call it at
+                                // all this turn — don't leave the user in dead
+                                // silence. Narrate the reply as a fallback. Because
+                                // this runs only when nothing was spoken, it can
+                                // never double a say_this line. (Off stays silent.)
                                 self.apply(StateEvent::ResponseStarted);
                                 if is_error_response(&full_response) {
-                                    // The orchestrator surfaces LLM failures as
-                                    // the reply text (so they show in chat);
-                                    // don't read the raw error aloud.
                                     tracing::error!(response = %full_response, "assistant returned an error message; speaking a short apology instead");
                                     self.speaker.say(ERROR_APOLOGY).await?;
                                 } else {
-                                    // Speak the full response instead of dropping it.
+                                    tracing::info!("on-demand turn spoke nothing; narrating the reply as a silence backstop");
                                     let sentences = sentence_buf.push(&full_response);
                                     for sentence in sentences {
                                         self.speak_reply(&sentence).await?;
@@ -2149,8 +2255,9 @@ where
                                         self.speak_reply(&remaining).await?;
                                     }
                                 }
+                                spoke_content = true;
                             }
-                            tracing::info!(streamed = !first_chunk, "assistant response complete");
+                            tracing::info!(spoke = spoke_content, "assistant response complete");
                             break StreamEnd::Completed;
                         }
                         Some(AssistantEvent::Error { request_id: rid, error }) if rid == request_id => {
@@ -2165,14 +2272,20 @@ where
                         // and post the result back so the parked turn resumes; the
                         // turn continues streaming after.
                         Some(AssistantEvent::ClientToolCall { task_id, tool_call_id, tool_name, arguments }) => {
-                            self.handle_client_tool_call(&task_id, &tool_call_id, &tool_name, arguments).await;
+                            if self.handle_client_tool_call(&task_id, &tool_call_id, &tool_name, arguments).await {
+                                // say_this spoke — this is the turn's audio, so the
+                                // on-demand silence backstop and the liveness filler
+                                // both stand down (voice#126).
+                                spoke_content = true;
+                            }
                         }
                         None => {
                             tracing::warn!("assistant signal stream closed before completion");
-                            if first_chunk {
-                                // The reply stream dropped before any content
-                                // arrived (e.g. the orchestrator restarted
-                                // mid-turn) — don't leave the user in silence.
+                            if !spoke_content && !matches!(self.speech_mode, SpeechMode::Off) {
+                                // The reply stream dropped before we spoke anything
+                                // (e.g. the orchestrator restarted mid-turn) — don't
+                                // leave the user in silence. Off mode stays silent by
+                                // design (voice#126).
                                 self.apply(StateEvent::ResponseStarted);
                                 self.speaker.say(ERROR_APOLOGY).await?;
                             }
@@ -2265,7 +2378,7 @@ where
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if next_liveness_at.is_some() && first_chunk && last_status_spoken_at.is_none() => {
+                }, if next_liveness_at.is_some() && awaiting_first_audio => {
                     let phrase = LIVENESS_PHRASES[liveness_idx];
                     liveness_idx += 1;
                     // Re-arm for the next escalation step, or stop once the list
@@ -2353,8 +2466,12 @@ where
         tool_call_id: &str,
         tool_name: &str,
         arguments: serde_json::Value,
-    ) {
+    ) -> bool {
         tracing::info!(tool = %tool_name, %task_id, %tool_call_id, "client tool call (voice#61)");
+        // Whether the tool put real spoken content in front of the user (only
+        // `say_this` does) — the caller uses it to stand down the on-demand
+        // silence backstop and the liveness filler (voice#126).
+        let mut spoke = false;
         let result: Result<String, String> = match tool_name {
             TOOL_STOP_LISTENING => {
                 // End the session after this turn's reply is spoken; the run loop
@@ -2385,6 +2502,7 @@ where
                         tracing::warn!("say_this synthesis failed: {e}");
                         Err(format!("failed to speak: {e}"))
                     } else {
+                        spoke = true;
                         Ok("spoken".to_string())
                     }
                 }
@@ -2401,6 +2519,7 @@ where
         {
             tracing::warn!("failed to submit client tool result: {e}");
         }
+        spoke
     }
 }
 
@@ -3073,6 +3192,8 @@ mod tests {
         /// runs (voice#61): `(tool_name, arguments)`.
         inject_tool_call: Option<(String, serde_json::Value)>,
         client_tools: ClientToolsConfig,
+        /// The daemon's speech mode for the turn (voice#126).
+        speech_mode: SpeechMode,
         /// Hold each turn open so the test drives the signal stream (voice#82).
         hold_turn: bool,
         /// Allow mic speech to interrupt playback (barge-in). Defaults true here
@@ -3107,6 +3228,7 @@ mod tests {
                 listening_cue: ListeningCue::Off,
                 inject_tool_call: None,
                 client_tools: ClientToolsConfig::default(),
+                speech_mode: SpeechMode::OnDemand,
                 hold_turn: false,
                 cue_plays_audio: false,
                 mic_barge_in: true,
@@ -3249,6 +3371,7 @@ mod tests {
                 listening_cue: ListeningCue::Off,
                 timeouts: test_timeouts(),
                 client_tools: ClientToolsConfig::default(),
+                speech_mode: SpeechMode::OnDemand,
             },
         );
         let mut pipeline = pipeline;
@@ -3334,6 +3457,7 @@ mod tests {
                 listening_cue: ListeningCue::Off,
                 timeouts,
                 client_tools: ClientToolsConfig::default(),
+                speech_mode: SpeechMode::OnDemand,
             },
         );
         let mut pipeline = pipeline;
@@ -3710,6 +3834,9 @@ mod tests {
             response_stall: Duration::from_secs(10),
             ..test_timeouts()
         });
+        // Status narration (and thus its liveness-suppressing effect) is an
+        // echo-everything behaviour (voice#126).
+        p.speech_mode = SpeechMode::Always;
         let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
         let feeder = tokio::spawn(async move {
             // A step status arrives well before the liveness delay.
@@ -3893,6 +4020,7 @@ mod tests {
                 listening_cue: cfg.listening_cue,
                 timeouts: test_timeouts(),
                 client_tools: cfg.client_tools,
+                speech_mode: cfg.speech_mode,
             },
         );
         let handle = tokio::spawn(async move {
@@ -4738,13 +4866,160 @@ mod tests {
         );
     }
 
+    // --- Speech modes (voice#126) -----------------------------------------
+
+    fn chunk(text: &str) -> AssistantEvent {
+        AssistantEvent::Chunk {
+            request_id: "req".into(),
+            text: text.into(),
+        }
+    }
+    fn complete(full: &str) -> AssistantEvent {
+        AssistantEvent::Complete {
+            request_id: "req".into(),
+            full_response: full.into(),
+        }
+    }
+    fn say_this_call(text: &str) -> AssistantEvent {
+        AssistantEvent::ClientToolCall {
+            task_id: "task".into(),
+            tool_call_id: "call".into(),
+            tool_name: TOOL_SAY_THIS.into(),
+            arguments: serde_json::json!({ "text": text }),
+        }
+    }
+
+    /// Drive `stream_response` to completion over a fixed event script in the
+    /// given speech mode and return what was spoken (voice#126). Events are
+    /// queued on the signal channel in order; the `Complete` ends the turn.
+    async fn run_turn(mode: SpeechMode, events: Vec<AssistantEvent>) -> Vec<String> {
+        let (mut p, spoken) = build_pipeline_with(test_timeouts());
+        p.speech_mode = mode;
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        for e in events {
+            tx.send(e).unwrap();
+        }
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            p.stream_response(&mut rx, "req", &mut idle_audio_rx()),
+        )
+        .await
+        .expect("stream_response must return")
+        .expect("stream_response ok");
+        spoken.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn on_demand_does_not_narrate_streamed_reply() {
+        // voice#126: in on-demand mode the streamed/typed reply is a silent
+        // record — only what Adele passes to say_this is spoken. The say_this
+        // line also suppresses the silence backstop, so the reply text is never
+        // echoed: the user hears the say_this line ONCE, and nothing else.
+        let said = run_turn(
+            SpeechMode::OnDemand,
+            vec![
+                chunk("The answer is forty two."),
+                say_this_call("Forty two."),
+                complete("The answer is forty two."),
+            ],
+        )
+        .await;
+        assert_eq!(said, vec!["Forty two.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn on_demand_backstop_narrates_reply_when_nothing_spoken() {
+        // voice#126: if Adele never calls say_this, the silence backstop narrates
+        // the reply so the turn is never dead-silent.
+        let said = run_turn(
+            SpeechMode::OnDemand,
+            vec![chunk("Hello there."), complete("Hello there.")],
+        )
+        .await;
+        assert_eq!(said, vec!["Hello there.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn on_demand_no_backstop_when_say_this_spoke() {
+        // voice#126: the backstop fires ONLY when nothing was spoken. Here
+        // say_this spoke, so the (different, longer) written reply is not
+        // additionally narrated — no double-speaking.
+        let said = run_turn(
+            SpeechMode::OnDemand,
+            vec![
+                say_this_call("On it."),
+                complete("Here is the long written answer."),
+            ],
+        )
+        .await;
+        assert_eq!(said, vec!["On it.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn always_mode_narrates_the_streamed_reply() {
+        // voice#126: echo-everything mode reads the reply aloud as it streams,
+        // exactly as the pre-#126 behaviour.
+        let said = run_turn(
+            SpeechMode::Always,
+            vec![chunk("Hello there."), complete("Hello there.")],
+        )
+        .await;
+        assert_eq!(said, vec!["Hello there.".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn off_mode_speaks_nothing() {
+        // voice#126: off mode stays silent — no narration and no backstop.
+        let said = run_turn(
+            SpeechMode::Off,
+            vec![chunk("Hello there."), complete("Hello there.")],
+        )
+        .await;
+        assert!(
+            said.is_empty(),
+            "off mode must speak nothing; said: {said:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn liveness_fires_on_silent_on_demand_turn() {
+        // voice#126: an on-demand turn that produces no say_this and no reply for
+        // a while still gets a brief liveness line so it isn't dead-silent — the
+        // guard now keys on "spoke nothing", not on chunk arrival.
+        let (mut p, spoken) = build_pipeline_with(TurnTimeouts {
+            liveness_delay: Duration::from_millis(500),
+            response_stall: Duration::from_secs(30),
+            ..test_timeouts()
+        });
+        p.speech_mode = SpeechMode::OnDemand;
+        let (tx, mut rx) = mpsc::unbounded_channel::<AssistantEvent>();
+        // Complete only after the liveness window has elapsed.
+        let feeder = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            let _ = tx.send(complete("done"));
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            p.stream_response(&mut rx, "req", &mut idle_audio_rx()),
+        )
+        .await
+        .expect("stream_response must return")
+        .expect("stream_response ok");
+        feeder.await.unwrap();
+        let said = spoken.lock().unwrap().clone();
+        assert!(
+            said.iter().any(|s| LIVENESS_PHRASES.contains(&s.as_str())),
+            "a silent on-demand turn must speak a liveness line; said: {said:?}"
+        );
+    }
+
     // --- Session-control client tools (voice#61) --------------------------
 
     #[test]
     fn session_control_tools_carry_when_to_call_guidance() {
-        // All three tools are advertised by default, in a stable order, each
-        // with a description that guides the LLM on WHEN to call it.
-        let tools = session_control_tools(ClientToolsConfig::default());
+        // In on-demand mode all three tools are advertised, in a stable order,
+        // each with a description that guides the LLM on WHEN to call it.
+        let tools = session_control_tools(ClientToolsConfig::default(), SpeechMode::OnDemand);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(
             names,
@@ -4763,14 +5038,37 @@ mod tests {
 
     #[test]
     fn per_tool_toggles_withhold_disabled_tools() {
-        // A disabled tool is not advertised; the others still are.
-        let tools = session_control_tools(ClientToolsConfig {
-            stop_listening: true,
-            listen_for_more: false,
-            say_this: false,
-        });
+        // A disabled tool is not advertised; the others still are. Echo mode
+        // also withholds say_this, so only stop_listening remains here.
+        let tools = session_control_tools(
+            ClientToolsConfig {
+                stop_listening: true,
+                listen_for_more: false,
+            },
+            SpeechMode::Always,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec![TOOL_STOP_LISTENING]);
+    }
+
+    #[test]
+    fn say_this_is_offered_only_in_on_demand_mode() {
+        // voice#126: say_this is Adele's spoken channel and appears only in
+        // on-demand mode — never in echo (auto-narrated) or off (silent).
+        let has_say = |mode| {
+            session_control_tools(ClientToolsConfig::default(), mode)
+                .iter()
+                .any(|t| t.name == TOOL_SAY_THIS)
+        };
+        assert!(
+            has_say(SpeechMode::OnDemand),
+            "on-demand must offer say_this"
+        );
+        assert!(
+            !has_say(SpeechMode::Always),
+            "echo-everything must withhold say_this"
+        );
+        assert!(!has_say(SpeechMode::Off), "off must withhold say_this");
     }
 
     #[tokio::test]
@@ -5299,6 +5597,7 @@ mod tests {
                 listening_cue: ListeningCue::Off,
                 timeouts: test_timeouts(),
                 client_tools: ClientToolsConfig::default(),
+                speech_mode: SpeechMode::OnDemand,
             },
         );
         let handle = tokio::spawn(pipeline.run());
@@ -5533,6 +5832,7 @@ mod tests {
                 listening_cue: ListeningCue::Off,
                 timeouts: test_timeouts(),
                 client_tools: ClientToolsConfig::default(),
+                speech_mode: SpeechMode::OnDemand,
             },
         )
         .with_session_gate(gate)
@@ -5785,15 +6085,20 @@ mod tests {
             .expect("events channel open")
     }
 
-    /// Push a chunk so the held turn moves Processing -> Speaking, and mark the
-    /// sink as playing so barge-in/stop see outstanding playback.
+    /// Drive the held turn to Speaking and mark the sink as playing so
+    /// barge-in/stop see outstanding playback. Uses `say_this` because that is
+    /// how audio starts in the default on-demand mode — a bare reply chunk is a
+    /// silent record there (voice#126); the interrupt logic under test is the
+    /// same however playback began.
     async fn enter_speaking(h: &Harness, events: &mpsc::UnboundedSender<AssistantEvent>) {
         h.sink_playing
             .store(true, std::sync::atomic::Ordering::SeqCst);
         events
-            .send(AssistantEvent::Chunk {
-                request_id: "req".into(),
-                text: "Let me tell you a long story.".into(),
+            .send(AssistantEvent::ClientToolCall {
+                task_id: "task".into(),
+                tool_call_id: "call".into(),
+                tool_name: TOOL_SAY_THIS.into(),
+                arguments: serde_json::json!({ "text": "Let me tell you a long story." }),
             })
             .unwrap();
         let mut rx = h.state_rx.clone();
@@ -5802,7 +6107,7 @@ mod tests {
             rx.wait_for(|s| *s == State::Speaking),
         )
         .await
-        .expect("chunk -> Speaking")
+        .expect("say_this -> Speaking")
         .unwrap();
     }
 
@@ -6077,6 +6382,12 @@ mod tests {
         });
         let events = start_held_turn(&mut h).await;
         enter_speaking(&h, &events).await;
+        // enter_speaking reaches Speaking via say_this, which submits its own Ok
+        // result — drain it so we assert on the POST-interrupt call below (voice#126).
+        let _ = tokio::time::timeout(Duration::from_secs(2), h.tool_result_rx.recv())
+            .await
+            .expect("enter_speaking's say_this result must be submitted")
+            .expect("tool-result channel open");
 
         // Interrupt.
         h.stop_tx.send(StopRequest::Speaking).await.unwrap();
