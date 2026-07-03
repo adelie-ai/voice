@@ -73,6 +73,23 @@ pub trait AssistantGateway: Send + Sync {
         result: Result<String, String>,
     ) -> impl std::future::Future<Output = Result<(), VoiceError>> + Send;
 
+    /// Try to serve a client-tool call from a client-hosted MCP server, when the
+    /// gateway has one wired to it (desktop-assistant#464). Returns `true` when a
+    /// hosted tool handled the call AND its result was already submitted to the
+    /// orchestrator — so the caller must NOT also dispatch it as a built-in tool
+    /// or submit a second result. The default hosts nothing and returns `false`,
+    /// so a gateway with no MCP host (and every test double) keeps the built-in
+    /// session-control dispatch as the only path.
+    fn try_serve_hosted_tool_call(
+        &self,
+        _task_id: &str,
+        _tool_call_id: &str,
+        _tool_name: &str,
+        _arguments: &serde_json::Value,
+    ) -> impl std::future::Future<Output = bool> + Send {
+        async { false }
+    }
+
     /// Create a new conversation with optional tags, returning its ID.
     fn create_conversation(
         &self,

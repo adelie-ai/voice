@@ -9,13 +9,21 @@ license = "AGPL-3.0-or-later"
 # WebSocket, or D-Bus — instead of a bespoke zbus proxy.
 [dependencies]
 adele-voice-core.workspace = true
-desktop-assistant-client-common.workspace = true
+# `mcp-host`: the client-side MCP host (desktop-assistant#464) — spawn local MCP
+# servers configured for the `voice` surface and advertise their tools to the
+# orchestrator as client-side tools. It pulls the MCP client WITHOUT the remote
+# HTTP/OAuth transport (`reqwest`), which stays off the edge (desktop-assistant#475).
+desktop-assistant-client-common = { workspace = true, features = ["mcp-host"] }
 # The `ClientToolRegistration` wire type the orchestrator expects (voice#61);
 # client-common doesn't re-export it, so reach it directly via the sibling
 # api-model path-dep.
 desktop-assistant-api-model.workspace = true
 tokio = { workspace = true, features = ["sync", "rt"] }
 tracing.workspace = true
+# The `AssistantGateway::try_serve_hosted_tool_call` signature names
+# `serde_json::Value` (the tool arguments), and we clone it into the MCP host
+# dispatch (desktop-assistant#464).
+serde_json.workspace = true
 # Per-turn idempotency keys (#39): a random v4 key so a retry after a dropped
 # connection de-duplicates against the original turn at the orchestrator.
 uuid = { version = "1", features = ["v4"] }

@@ -1171,22 +1171,22 @@ where
     /// tools (the user can stop by phrase / the follow-up timeout) — so it's
     /// logged and swallowed.
     async fn register_session_control_tools(&mut self) {
+        // The session-control tools (voice#61) PLUS any client-hosted MCP tools the
+        // gateway merges in (desktop-assistant#464). We always delegate — even with
+        // no session-control tools enabled — so configured MCP host tools are still
+        // advertised; the gateway registers the merged set (the daemon replaces the
+        // whole set per call).
         let tools = session_control_tools(self.client_tools, self.speech_mode);
-        if tools.is_empty() {
-            tracing::info!("no session-control client tools enabled; skipping registration");
-            return;
-        }
-        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-        match self.assistant.register_client_tools(tools.clone()).await {
+        let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        match self.assistant.register_client_tools(tools).await {
             Ok(count) => tracing::info!(
                 count,
                 ?names,
-                "registered session-control client tools (voice#61)"
+                "registered client tools (session-control + any client-hosted MCP)"
             ),
             Err(e) => tracing::warn!(
                 ?names,
-                "failed to register session-control client tools (voice still works without \
-                 them): {e}"
+                "failed to register client tools (voice still works without them): {e}"
             ),
         }
     }
@@ -2468,6 +2468,19 @@ where
         arguments: serde_json::Value,
     ) -> bool {
         tracing::info!(tool = %tool_name, %task_id, %tool_call_id, "client tool call (voice#61)");
+        // A client-hosted MCP tool takes precedence (desktop-assistant#464): if the
+        // gateway's MCP host owns this tool name it runs the tool and submits the
+        // result itself, so we're done — nothing was spoken. Otherwise fall through
+        // to the built-in session-control tools below. Host tool names are
+        // namespaced (`{ns}__{tool}`), so they never collide with the bare built-in
+        // names (`say_this` / `stop_listening` / `listen_for_more`).
+        if self
+            .assistant
+            .try_serve_hosted_tool_call(task_id, tool_call_id, tool_name, &arguments)
+            .await
+        {
+            return false;
+        }
         // Whether the tool put real spoken content in front of the user (only
         // `say_this` does) — the caller uses it to stand down the on-demand
         // silence backstop and the liveness filler (voice#126).
@@ -2920,6 +2933,12 @@ mod tests {
         /// Each `subscribe` publishes the freshly-created event sender here so the
         /// harness (hence the test) can drive the held-open turn (voice#82).
         subscribed_tx: mpsc::UnboundedSender<mpsc::UnboundedSender<AssistantEvent>>,
+        /// Tool names this fake gateway pretends its client-side MCP host serves
+        /// (desktop-assistant#464). `try_serve_hosted_tool_call` returns `true` for
+        /// these — standing in for a real [`McpHost`] so a test can assert the
+        /// pipeline routes a hosted tool to the host instead of the built-in
+        /// dispatch. Empty for every existing test (host serves nothing).
+        hosted_tools: std::collections::HashSet<String>,
     }
     impl FakeAssistant {
         /// Shared recording + immediate-completion path for both send
@@ -2983,6 +3002,19 @@ mod tests {
                 result,
             });
             Ok(())
+        }
+        async fn try_serve_hosted_tool_call(
+            &self,
+            _task_id: &str,
+            _tool_call_id: &str,
+            tool_name: &str,
+            _arguments: &serde_json::Value,
+        ) -> bool {
+            // Stand in for a real MCP host: "serve" (and thus short-circuit the
+            // built-in dispatch) exactly the tool names the test configured. A real
+            // gateway would also submit the result here; the routing decision is
+            // what this fake exercises.
+            self.hosted_tools.contains(tool_name)
         }
         async fn create_conversation(
             &self,
@@ -3309,6 +3341,16 @@ mod tests {
     /// (voice#61). Mirrors `build_pipeline_with` but keeps the tool-result
     /// receiver instead of dropping it.
     fn build_pipeline_for_tools(reuse_window: Duration) -> (FakePipeline, ToolHarness) {
+        build_pipeline_for_tools_hosted(reuse_window, std::collections::HashSet::new())
+    }
+
+    /// Like [`build_pipeline_for_tools`] but seeds the fake gateway's client-hosted
+    /// MCP tool names (desktop-assistant#464), so a test can assert the pipeline
+    /// routes a hosted tool to the host instead of the built-in dispatch.
+    fn build_pipeline_for_tools_hosted(
+        reuse_window: Duration,
+        hosted_tools: std::collections::HashSet<String>,
+    ) -> (FakePipeline, ToolHarness) {
         let (_audio_tx, audio_rx) = mpsc::channel::<Vec<f32>>(1);
         let (_enabled_tx, enabled_rx) = watch::channel(true);
         let (_ptt_tx, ptt_rx) = mpsc::channel(1);
@@ -3347,6 +3389,7 @@ mod tests {
                 fail: false,
                 hold_turn: false,
                 subscribed_tx: mpsc::unbounded_channel().0,
+                hosted_tools,
             },
             Arc::new(FakeSource {
                 rx: StdMutex::new(Some(audio_rx)),
@@ -3432,6 +3475,7 @@ mod tests {
                 fail: false,
                 hold_turn: false,
                 subscribed_tx: mpsc::unbounded_channel().0,
+                hosted_tools: std::collections::HashSet::new(),
             },
             Arc::new(FakeSource {
                 rx: StdMutex::new(Some(audio_rx)),
@@ -3998,6 +4042,7 @@ mod tests {
                 fail: cfg.assistant_fails,
                 hold_turn: cfg.hold_turn,
                 subscribed_tx,
+                hosted_tools: std::collections::HashSet::new(),
             },
             Arc::new(source),
             Arc::new(sink),
@@ -5192,6 +5237,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hosted_mcp_tool_routes_to_host_and_skips_builtin_dispatch() {
+        // desktop-assistant#464: a namespaced client-hosted MCP tool is served by
+        // the gateway's MCP host, which submits the result itself. The pipeline must
+        // route it there FIRST and NOT fall through to the built-in dispatch — so it
+        // neither treats the name as unknown nor submits a second result of its own.
+        let (mut p, mut th) = build_pipeline_for_tools_hosted(
+            Duration::ZERO,
+            std::collections::HashSet::from(["fs__read_file".to_string()]),
+        );
+        let spoke = p
+            .handle_client_tool_call("task-1", "call-1", "fs__read_file", serde_json::json!({}))
+            .await;
+        // The host served it: nothing was spoken, no session intent was set, and the
+        // built-in path submitted no result (the gateway/host owns submission).
+        assert!(
+            !spoke,
+            "a hosted MCP tool speaks nothing through the pipeline"
+        );
+        assert!(!p.session_end_requested && !p.listen_for_more_requested);
+        assert!(
+            th.tool_result_rx.try_recv().is_err(),
+            "the built-in dispatch must not run for a hosted tool (no second submit)"
+        );
+        assert!(
+            th.spoken.lock().unwrap().is_empty(),
+            "a hosted tool must not queue speech via the built-in say_this path"
+        );
+    }
+
+    #[tokio::test]
     async fn stop_listening_during_a_turn_ends_to_idle_and_clears_reuse_id() {
         // voice#61/#59 end-to-end through the run loop: when the LLM calls
         // stop_listening mid-turn (even in conversation mode), the turn ends to
@@ -5569,6 +5644,7 @@ mod tests {
                 fail: false,
                 hold_turn: false,
                 subscribed_tx: mpsc::unbounded_channel().0,
+                hosted_tools: std::collections::HashSet::new(),
             },
             Arc::new(FlakySource {
                 rxs: StdMutex::new(audio_rxs),
@@ -5806,6 +5882,7 @@ mod tests {
                 fail: false,
                 hold_turn: false,
                 subscribed_tx: mpsc::unbounded_channel().0,
+                hosted_tools: std::collections::HashSet::new(),
             },
             Arc::new(CountingSource {
                 starts: Arc::clone(&starts),

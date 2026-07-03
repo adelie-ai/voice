@@ -16,8 +16,16 @@ use std::sync::{Arc, Mutex};
 use adele_voice_core::VoiceError;
 use adele_voice_core::ports::assistant::{AssistantEvent, AssistantGateway, ClientToolSpec};
 use desktop_assistant_api_model::ClientToolRegistration;
+use desktop_assistant_client_common::mcp_host::{
+    ClientMcpConfig, McpHost, default_client_mcp_path, dispatch_client_tool_call,
+    merge_registrations,
+};
 use desktop_assistant_client_common::{Connector, SignalEvent};
 use tokio::sync::mpsc;
+
+/// The client-side MCP host surface this gateway hosts tools for (client-mcp.toml
+/// `[surfaces.voice]`, falling back to `[surfaces.default]`).
+const MCP_SURFACE: &str = "voice";
 
 // Re-export so the daemon can build a connection config without depending on
 // client-common directly.
@@ -51,6 +59,40 @@ pub use desktop_assistant_client_common::{ConnectionConfig, TransportMode};
 pub struct ConnectorAssistantGateway {
     config: ConnectionConfig,
     connector: Mutex<Option<Arc<Connector>>>,
+    /// Client-hosted MCP servers for the `voice` surface (desktop-assistant#464).
+    /// Started once at construction and held for the gateway's whole life: its
+    /// tools are merged into every [`register_client_tools`] call, and an incoming
+    /// `ClientToolCall` for a hosted tool is routed here (see
+    /// [`try_serve_hosted_tool_call`]). `None` when no MCP servers are configured
+    /// for `voice`. The host is independent of the orchestrator link — it stays up
+    /// across the Connector's in-place reconnects — and its server processes are
+    /// killed when this drops (`McpClient` kills its child on drop), which for the
+    /// durable voice gateway means at daemon shutdown.
+    ///
+    /// [`register_client_tools`]: AssistantGateway::register_client_tools
+    /// [`try_serve_hosted_tool_call`]: AssistantGateway::try_serve_hosted_tool_call
+    mcp_host: Option<McpHost>,
+}
+
+/// Start the client-side MCP host for the `voice` surface, if any servers are
+/// configured for it (desktop-assistant#464). Returns `None` when nothing is
+/// configured — the gateway then advertises only the built-in session-control
+/// tools. Never fails: a server that can't start is logged and skipped inside
+/// [`McpHost::start`], so a bad entry can't stop the voice daemon.
+async fn start_voice_mcp_host() -> Option<McpHost> {
+    let servers: Vec<_> = ClientMcpConfig::load(&default_client_mcp_path())
+        .resolved_servers(MCP_SURFACE)
+        .into_iter()
+        .cloned()
+        .collect();
+    if servers.is_empty() {
+        return None;
+    }
+    tracing::info!(
+        count = servers.len(),
+        "starting client-side MCP host for the voice surface"
+    );
+    Some(McpHost::start(&servers).await)
 }
 
 impl ConnectorAssistantGateway {
@@ -62,6 +104,7 @@ impl ConnectorAssistantGateway {
         Ok(Self {
             config: config.clone(),
             connector: Mutex::new(Some(Arc::new(connector))),
+            mcp_host: start_voice_mcp_host().await,
         })
     }
 
@@ -85,6 +128,7 @@ impl ConnectorAssistantGateway {
         Self {
             config: config.clone(),
             connector: Mutex::new(connector),
+            mcp_host: start_voice_mcp_host().await,
         }
     }
 
@@ -312,7 +356,7 @@ impl AssistantGateway for ConnectorAssistantGateway {
     }
 
     async fn register_client_tools(&self, tools: Vec<ClientToolSpec>) -> Result<usize, VoiceError> {
-        let registrations = tools
+        let builtins: Vec<ClientToolRegistration> = tools
             .into_iter()
             .map(|t| ClientToolRegistration {
                 name: t.name,
@@ -320,11 +364,63 @@ impl AssistantGateway for ConnectorAssistantGateway {
                 input_schema: t.input_schema,
             })
             .collect();
+        // Merge the built-in session-control tools with any client-hosted MCP
+        // tools into the single set the daemon expects — it replaces the whole
+        // set per call, so both must be sent together (desktop-assistant#464). A
+        // built-in wins on a name clash.
+        let registrations = match &self.mcp_host {
+            Some(host) => merge_registrations(builtins, host.registrations()),
+            None => builtins,
+        };
         self.current()
             .await?
             .register_client_tools(registrations)
             .await
             .map_err(|e| VoiceError::Assistant(format!("register_client_tools failed: {e}")))
+    }
+
+    async fn try_serve_hosted_tool_call(
+        &self,
+        task_id: &str,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> bool {
+        // Only a hosted tool is served here (desktop-assistant#464). Checking
+        // `handles` first avoids dialing the orchestrator for a built-in tool name
+        // the host doesn't own.
+        let Some(host) = self.mcp_host.as_ref() else {
+            return false;
+        };
+        if !host.handles(tool_name) {
+            return false;
+        }
+        // The host owns this tool: run it and submit the result via the inner
+        // `Connector` sink so the daemon's parked turn resumes. Report `true` even
+        // if we momentarily have no live connection to submit through — the tool
+        // is ours, so the caller must not fall back to its built-in dispatch and
+        // answer "unknown tool".
+        match self.current().await {
+            Ok(connector) => {
+                dispatch_client_tool_call(
+                    host,
+                    connector.as_ref(),
+                    task_id,
+                    tool_call_id,
+                    tool_name,
+                    arguments.clone(),
+                )
+                .await
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool = %tool_name,
+                    "client MCP tool call arrived but the orchestrator connection is \
+                     unavailable; cannot submit its result: {e}"
+                );
+                true
+            }
+        }
     }
 
     async fn submit_client_tool_result(
