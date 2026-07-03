@@ -41,15 +41,18 @@ use adele_voice_core::sentence_buffer::SentenceBuffer;
 /// was [`AdeleOutput::OnDemand`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AdeleOutput {
-    /// Never speaks (the default). A `say_this` aside downgrades to inline text.
+    /// Never speaks (the default). A `say_this` aside downgrades to shown text.
     #[default]
     Disabled,
-    /// Speaks replies only while `You == Enabled` (conversing by voice), shaped
-    /// for the ear; speaks `say_this` asides regardless of `You`. The model's
-    /// `request_voice` selects this.
+    /// Adele speaks **on demand**: the written reply is shown as text and is
+    /// *not* auto-narrated — `say_this` is her sole spoken channel, so she
+    /// chooses what to voice. Independent of `You`; the model's `request_voice`
+    /// selects this. (Mirrors the voice daemon's `on_demand` speech mode.)
     OnDemand,
     /// Reads every reply aloud in full (made speakable, not shortened) —
-    /// accessibility. Independent of `You`.
+    /// accessibility. A `say_this` aside is *not* separately spoken here (the
+    /// whole reply already is), so it downgrades to shown text. Independent of
+    /// `You`. (Mirrors the voice daemon's `always` speech mode.)
     Always,
 }
 
@@ -73,26 +76,26 @@ impl AdeleOutput {
         }
     }
 
-    /// Whether a *reply* is spoken: `Always` always, `OnDemand` only while the
-    /// conversation also has voice **input** enabled (`You == Enabled`, i.e. the
-    /// user is conversing by voice), `Disabled` never. `voice_in` is that
-    /// `You == Enabled` flag for the same conversation.
+    /// Whether a *reply* is auto-narrated in full: `Always` only. `OnDemand`
+    /// does *not* auto-narrate — its spoken channel is `say_this` — and
+    /// `Disabled` never speaks. Decoupled from voice **input** (`You`): the
+    /// `Adele:` level alone governs her output, so a conversation whose `Adele:`
+    /// reads "off" can never talk (voice#126 — avoids the "Adele is off but
+    /// she's talking!" bug).
     ///
     /// This is the reply-narration gate the clients consult, keyed by the
     /// *originating* conversation of the reply.
-    pub fn narrates_reply(self, voice_in: bool) -> bool {
-        match self {
-            Self::Always => true,
-            Self::OnDemand => voice_in,
-            Self::Disabled => false,
-        }
+    pub fn narrates_reply(self) -> bool {
+        matches!(self, Self::Always)
     }
 
-    /// Whether a `say_this` aside is spoken: spoken iff the level is `OnDemand`
-    /// or `Always` (independent of `You`); `Disabled` downgrades the aside to
-    /// inline text. Keyed by the *call's* conversation.
+    /// Whether a `say_this` aside is spoken aloud: `OnDemand` only — there
+    /// `say_this` is Adele's sole spoken channel. `Always` already reads every
+    /// reply in full (a separate aside would double-speak) and `Disabled` is
+    /// silent, so both downgrade the aside to shown text. Keyed by the *call's*
+    /// conversation (voice#126).
     pub fn speaks_aside(self) -> bool {
-        !matches!(self, Self::Disabled)
+        matches!(self, Self::OnDemand)
     }
 
     /// The system refinement to attach on the next send for a conversation at
@@ -110,17 +113,20 @@ impl AdeleOutput {
 
 /// System refinement attached on send while `Adele == OnDemand`.
 ///
-/// Replies are spoken only while conversing by voice, so shape them **for the
-/// ear**: brief, conversational, no markdown, symbols/acronyms spelled out.
-/// Deliberately free of markdown markers so it can't itself leak formatting.
-/// Refines the system prompt for that turn only — never stored, never in the
-/// transcript.
-pub const ON_DEMAND_SYSTEM_REFINEMENT: &str = "This reply will be read aloud, so write it to be spoken, not read. Keep it brief and \
-     conversational, a few short sentences at most. Use no markdown or formatting of any kind, \
-     and no emoji. Spell out acronyms and abbreviations as full words and avoid symbols that do \
-     not read well aloud (say 'and' not an ampersand, 'percent' not a percent sign, 'dollars' not \
-     a dollar sign). Do not read out URLs, file paths, or email addresses; describe them in words \
-     instead, and write numbers, dates, and times the way you would say them.";
+/// In on-demand mode the written reply is shown to the user as text and is
+/// *not* read aloud — `say_this` is Adele's only spoken channel. So this tells
+/// the model to call `say_this` with whatever it wants voiced, kept brief and
+/// shaped **for the ear**. Deliberately free of markdown markers so it can't
+/// itself leak formatting. Refines the system prompt for that turn only — never
+/// stored, never in the transcript.
+pub const ON_DEMAND_SYSTEM_REFINEMENT: &str = "You are in on-demand voice mode: your written reply is shown to the user as text and is \
+     not read aloud, so anything you want said out loud you must speak by calling the say_this \
+     tool. Keep whatever you speak brief and conversational, a few short sentences at most, \
+     written to be heard rather than read. In spoken text use no markdown or formatting of any \
+     kind and no emoji, spell out acronyms and abbreviations as full words, and avoid symbols \
+     that do not read well aloud (say 'and' not an ampersand, 'percent' not a percent sign, \
+     'dollars' not a dollar sign). Do not speak URLs, file paths, or email addresses; describe \
+     them in words instead, and write numbers, dates, and times the way you would say them.";
 
 /// System refinement attached on send while `Adele == Always`.
 ///
@@ -198,23 +204,22 @@ mod tests {
 
     #[test]
     fn reply_narration_gate() {
-        // Always narrates regardless of voice input.
-        assert!(AdeleOutput::Always.narrates_reply(false));
-        assert!(AdeleOutput::Always.narrates_reply(true));
-        // OnDemand only narrates while conversing by voice (You == Enabled).
-        assert!(!AdeleOutput::OnDemand.narrates_reply(false));
-        assert!(AdeleOutput::OnDemand.narrates_reply(true));
-        // Disabled never narrates.
-        assert!(!AdeleOutput::Disabled.narrates_reply(false));
-        assert!(!AdeleOutput::Disabled.narrates_reply(true));
+        // Only Always auto-narrates the full reply. OnDemand does not (its
+        // spoken channel is say_this); Disabled is silent. Decoupled from
+        // voice input (`You`) — no argument any more (voice#126).
+        assert!(AdeleOutput::Always.narrates_reply());
+        assert!(!AdeleOutput::OnDemand.narrates_reply());
+        assert!(!AdeleOutput::Disabled.narrates_reply());
     }
 
     #[test]
     fn say_this_aside_gate() {
-        // Asides are spoken whenever output isn't Disabled, independent of You.
-        assert!(!AdeleOutput::Disabled.speaks_aside());
+        // say_this is spoken only in OnDemand (its sole spoken channel).
+        // Always already narrates the whole reply and Disabled is silent, so
+        // both downgrade the aside to shown text (voice#126).
         assert!(AdeleOutput::OnDemand.speaks_aside());
-        assert!(AdeleOutput::Always.speaks_aside());
+        assert!(!AdeleOutput::Always.speaks_aside());
+        assert!(!AdeleOutput::Disabled.speaks_aside());
     }
 
     #[test]
