@@ -1026,6 +1026,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1340,13 +1341,16 @@ dependencies = [
  "async-trait",
  "desktop-assistant-api-model",
  "desktop-assistant-frame-codec",
+ "desktop-assistant-mcp-client",
  "futures",
  "reqwest",
  "rustls",
  "rustls-pki-types",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "tracing",
  "uuid",
  "zbus",
@@ -1375,6 +1379,21 @@ name = "desktop-assistant-frame-codec"
 version = "0.1.0"
 dependencies = [
  "tokio",
+]
+
+[[package]]
+name = "desktop-assistant-mcp-client"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "desktop-assistant-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
