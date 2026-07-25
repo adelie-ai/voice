@@ -4,6 +4,31 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
+[features]
+# Load ONNX Runtime at RUNTIME (dlopen) instead of linking it at build time.
+#
+# Why this exists: `ort` publishes no prebuilt ONNX Runtime for
+# `x86_64-apple-darwin`, so the default (link-time) path fails outright there:
+#
+#   error: ort does not provide prebuilt binaries for the target
+#          `x86_64-apple-darwin` with feature set (no features)
+#
+# Because `adele-voice-module` depends on this crate unconditionally, that error
+# blocks *every* consumer — an Intel Mac cannot even `cargo test` adele-tui, let
+# alone touch voice code. `load-dynamic` sidesteps it: nothing is linked at
+# build time, and the library is resolved from the system at first use.
+#
+# **Off by default on purpose.** Every existing (Linux) consumer keeps the
+# current link-time behaviour byte-for-byte; only a target that opts in changes.
+# The trade is that an opted-in build needs `libonnxruntime` present at runtime
+# (e.g. `brew install onnxruntime`, or `ORT_DYLIB_PATH`), and will fail when the
+# VAD is first used rather than at build time.
+#
+# This is a stopgap for the build blocker, not the destination — see
+# adelie-ai/voice#132 (make backends optional so a consumer can skip `ort`
+# entirely) and #133 (native macOS VAD/STT via Apple's Speech framework).
+load-dynamic = ["ort/load-dynamic"]
+
 [dependencies]
 adele-voice-core.workspace = true
 anyhow.workspace = true
