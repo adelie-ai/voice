@@ -7,6 +7,26 @@ license = "AGPL-3.0-or-later"
 [dependencies]
 adele-voice-core.workspace = true
 anyhow.workspace = true
+# 3.0.2 (2023-10-01) is the newest published rustpotter, and it requires
+# candle-core/candle-nn ^0.2.2. candle 0.2 in turn requires memmap2 ^0.7 and
+# pulls the unmaintained `paste` proc-macro in through candle-gemm, so two
+# informational RustSec advisories stay in `cargo audit` output and no lockfile
+# bump can clear them. Both are accepted, not suppressed, so they stay visible
+# in every scan (voice#135):
+#
+#   RUSTSEC-2026-0186 - memmap2 0.7.1, unsound. Affects only
+#     `[unchecked_]advise_range` and `flush[_async]_range`. candle-core 0.2.2
+#     touches memmap2 in one place (safetensors.rs, `MmapOptions::map`) and
+#     calls none of them; candle-nn and rustpotter do not use memmap2 at all.
+#     The shipped `hey-adele.rpw` (from `rustpotter-cli build`) also loads on
+#     rustpotter's reference path, so `add_wakeword_from_file` never reaches the
+#     candle-backed `WakewordModel` branch at runtime either.
+#   RUSTSEC-2024-0436 - paste 1.0.15, unmaintained. A build-time proc-macro
+#     under candle-gemm, with no successor reachable inside candle 0.2.
+#
+# Revisit when rustpotter publishes a release built on a current candle;
+# upgrading candle any earlier means forking or vendoring rustpotter, which is
+# a far larger risk than either advisory carries here.
 rustpotter = "3"
 tracing.workspace = true
 
