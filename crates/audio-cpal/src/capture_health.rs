@@ -95,8 +95,10 @@ struct CaptureHealthInner {
     fatal: AtomicBool,
     /// Recoverable errors since the capture thread last reported them.
     pending: AtomicUsize,
-    /// Whether a recoverable error has already been reported, so an error storm
-    /// is counted rather than written to the journal line by line.
+    /// Whether a recoverable error has been reported in this summary window, so
+    /// an error storm is counted rather than written to the journal line by
+    /// line. Cleared by [`CaptureHealth::take_transient`] so a failure that
+    /// starts later still gets one line of its own.
     reported: AtomicBool,
 }
 
@@ -120,16 +122,19 @@ impl CaptureHealth {
         self.0.fatal.load(Ordering::SeqCst)
     }
 
-    /// Record a recoverable error. Returns `true` for the first one only, so a
-    /// storm is counted rather than logged line by line.
+    /// Record a recoverable error. Returns `true` for the first one in the
+    /// current summary window, so a storm is counted rather than logged line by
+    /// line.
     fn record_transient(&self) -> bool {
         self.0.pending.fetch_add(1, Ordering::Relaxed);
         !self.0.reported.swap(true, Ordering::SeqCst)
     }
 
     /// Read and clear the recoverable-error count, so the capture thread's
-    /// periodic summary does not double-count.
+    /// periodic summary does not double-count. Opens the next reporting window:
+    /// the first error after this one is logged in full again.
     pub(crate) fn take_transient(&self) -> usize {
+        self.0.reported.store(false, Ordering::SeqCst);
         self.0.pending.swap(0, Ordering::Relaxed)
     }
 

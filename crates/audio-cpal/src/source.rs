@@ -693,6 +693,9 @@ impl AudioSource for CpalAudioSource {
                         tracing::error!(
                             timeout_s = CAPTURE_STALL_TIMEOUT.as_secs(),
                             device = %dev_name,
+                            // Names the ALSA case: a storm of errors it could
+                            // not classify, ending in silence.
+                            recoverable_errors = health.take_transient(),
                             "input device delivered no audio for the stall timeout — presuming \
                              capture is dead and stopping so it can be re-opened"
                         );
