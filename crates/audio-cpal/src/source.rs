@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use adele_voice_core::VoiceError;
 use adele_voice_core::domain::SAMPLE_RATE;
@@ -11,6 +12,10 @@ use ringbuf::traits::{Consumer, Producer, Split};
 use rubato::Resampler;
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use tokio::sync::mpsc;
+
+use crate::capture_health::{
+    CAPTURE_STALL_TIMEOUT, CaptureHealth, StallWatchdog, on_stream_error, restart_backoff,
+};
 
 /// Chunk size sent through the channel: 20ms of audio at 16kHz.
 const CHUNK_FRAMES: usize = SAMPLE_RATE as usize / 50;
@@ -529,6 +534,10 @@ impl AudioSource for CpalAudioSource {
                 // counter; the drain thread logs and resets it (V-8).
                 let overflow = OverflowCounter::new();
                 let overflow_cb = overflow.clone();
+                // Health of this stream: the error callback records, the drain
+                // loop below logs and acts (#140).
+                let health = CaptureHealth::new();
+                let health_cb = health.clone();
                 let stream = match device.build_input_stream_raw(
                     &stream_config,
                     fmt.format,
@@ -567,9 +576,7 @@ impl AudioSource for CpalAudioSource {
                         // nothing was dropped (V-8).
                         overflow_cb.add(scratch.len() - written);
                     },
-                    move |err| {
-                        tracing::error!("input stream error: {err}");
-                    },
+                    move |err| on_stream_error(&health_cb, &err),
                     None,
                 ) {
                     Ok(s) => s,
@@ -600,6 +607,7 @@ impl AudioSource for CpalAudioSource {
                     ))));
                     return;
                 }
+                let started_at = Instant::now();
 
                 running_clone.store(true, Ordering::SeqCst);
                 // From here on the `running` latch must track the THREAD's
@@ -619,7 +627,13 @@ impl AudioSource for CpalAudioSource {
                 // persistently overrun mic logs without the RT callback ever
                 // touching tracing (V-8). ~1s / 20ms tick = 50 ticks.
                 let mut ticks_since_overflow_log: u32 = 0;
-                'drain: while running_clone.load(Ordering::SeqCst) {
+                // Backstop for a stream that stops delivering without reporting
+                // a fatal error (#140).
+                let mut watchdog = StallWatchdog::new(Instant::now(), CAPTURE_STALL_TIMEOUT);
+                // Whether we are leaving because the stream is dead (as opposed
+                // to an explicit stop()), so the pipeline should re-open it.
+                let mut presumed_dead = false;
+                'drain: while health.keep_draining(running_clone.load(Ordering::SeqCst)) {
                     std::thread::sleep(std::time::Duration::from_millis(20));
 
                     ticks_since_overflow_log += 1;
@@ -632,13 +646,25 @@ impl AudioSource for CpalAudioSource {
                                 "input ring buffer overflow (drain lagging capture)"
                             );
                         }
+                        // The error callback counts recoverable stream errors
+                        // instead of logging each one (an ALSA error storm would
+                        // flood the journal); report the tally out of band.
+                        let errors = health.take_transient();
+                        if errors > 0 {
+                            tracing::warn!(
+                                errors,
+                                "recoverable input stream errors (capture continuing)"
+                            );
+                        }
                     }
 
+                    let mut got_data = false;
                     loop {
                         let popped = consumer.pop_slice(&mut read_buf);
                         if popped == 0 {
                             break;
                         }
+                        got_data = true;
                         let out = match resampler.as_mut() {
                             Some(r) => match r.push(&read_buf[..popped]) {
                                 Ok(o) => o,
@@ -656,10 +682,46 @@ impl AudioSource for CpalAudioSource {
                             break; // ring buffer drained for now
                         }
                     }
+
+                    // Timed after the sends above: a long turn can hold
+                    // `blocking_send` for many seconds, and a busy pipeline is
+                    // not a dead microphone.
+                    let now = Instant::now();
+                    if got_data {
+                        watchdog.saw_data(now);
+                    } else if watchdog.is_stalled(now) {
+                        tracing::error!(
+                            timeout_s = CAPTURE_STALL_TIMEOUT.as_secs(),
+                            device = %dev_name,
+                            "input device delivered no audio for the stall timeout — presuming \
+                             capture is dead and stopping so it can be re-opened"
+                        );
+                        presumed_dead = true;
+                        break 'drain;
+                    }
                 }
 
-                // Stream is dropped here, stopping capture
+                if health.is_fatal() {
+                    presumed_dead = true;
+                    tracing::error!(
+                        device = %dev_name,
+                        "input capture stopping after a fatal stream error so the device can be \
+                         re-opened"
+                    );
+                }
+
+                // Stream is dropped here, stopping capture and releasing the
+                // device.
                 drop(stream);
+                if presumed_dead {
+                    // Dropping `tx` (when this thread ends) is what tells the
+                    // pipeline capture died, so a stream that failed instantly
+                    // would otherwise spin the open/die/open loop.
+                    let backoff = restart_backoff(started_at.elapsed());
+                    if !backoff.is_zero() {
+                        std::thread::sleep(backoff);
+                    }
+                }
                 tracing::info!("input capture thread exiting");
             })
             .map_err(|e| VoiceError::Audio(format!("failed to spawn capture thread: {e}")))?;

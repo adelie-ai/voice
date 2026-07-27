@@ -61,6 +61,7 @@
 //! - Raw cards remain selectable as a fallback (e.g. a headless box with no
 //!   sound server), and the picker / `list-devices` flag them as exclusive.
 
+mod capture_health;
 mod sink;
 mod source;
 
