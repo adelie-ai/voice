@@ -25,12 +25,62 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Longest capture may deliver nothing before the stream is presumed dead.
+/// Long enough that only a stopped device trips it, short enough that the user
+/// is not left talking to a deaf assistant.
 pub(crate) const CAPTURE_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The cpal input-stream error callback: record the error, report it once.
+/// Shortest a capture stream may live before its death propagates to the
+/// pipeline. Death travels by the capture thread ending, so a device that opens
+/// cleanly and then fails immediately would otherwise spin the pipeline's
+/// open/die/open loop as fast as the OS allows. Holding the dead thread until
+/// the stream has existed this long caps the retry rate; a stream that ran
+/// longer is unaffected.
+const MIN_CAPTURE_LIFETIME: Duration = Duration::from_secs(1);
+
+/// How the capture thread must treat a [`cpal::StreamError`].
+#[derive(Clone, Copy, Debug)]
+enum StreamFault {
+    /// The stream can never produce audio again; capture has to be torn down
+    /// and the device re-opened.
+    Fatal,
+    /// A glitch the backend recovers from on its own; audio keeps flowing.
+    Transient,
+}
+
+/// Classify a stream error.
+///
+/// Only the two variants that state the stream is finished are treated as
+/// death. An xrun is a dropped-samples glitch the backend re-prepares from, and
+/// a backend-specific error is unclassifiable by construction — ALSA reports a
+/// USB unplug that way, but also transient read failures — so it is counted and
+/// left to the stall watchdog, which sees the difference: a dead device stops
+/// delivering, a recovered one does not.
+fn classify_stream_error(err: &cpal::StreamError) -> StreamFault {
+    match err {
+        cpal::StreamError::DeviceNotAvailable | cpal::StreamError::StreamInvalidated => {
+            StreamFault::Fatal
+        }
+        cpal::StreamError::BufferUnderrun | cpal::StreamError::BackendSpecific { .. } => {
+            StreamFault::Transient
+        }
+    }
+}
+
+/// The cpal input-stream error callback: classify, record, and report once.
 pub(crate) fn on_stream_error(health: &CaptureHealth, err: &cpal::StreamError) {
-    if health.record_transient() {
-        tracing::error!("input stream error: {err}");
+    match classify_stream_error(err) {
+        StreamFault::Fatal => {
+            if health.mark_fatal() {
+                tracing::error!("input stream error (fatal): {err}");
+            }
+        }
+        StreamFault::Transient => {
+            if health.record_transient() {
+                tracing::warn!(
+                    "input stream error (recoverable): {err} — repeats are counted, not logged"
+                );
+            }
+        }
     }
 }
 
@@ -57,6 +107,12 @@ impl CaptureHealth {
             pending: AtomicUsize::new(0),
             reported: AtomicBool::new(false),
         }))
+    }
+
+    /// Record that the stream is finished. Returns `true` for the first caller
+    /// only, so an error storm is reported once.
+    fn mark_fatal(&self) -> bool {
+        !self.0.fatal.swap(true, Ordering::SeqCst)
     }
 
     /// Whether the stream is known to be finished.
@@ -90,11 +146,15 @@ impl CaptureHealth {
 /// decision is pure.
 pub(crate) struct StallWatchdog {
     last_data: Instant,
+    timeout: Duration,
 }
 
 impl StallWatchdog {
-    pub(crate) fn new(now: Instant, _timeout: Duration) -> Self {
-        Self { last_data: now }
+    pub(crate) fn new(now: Instant, timeout: Duration) -> Self {
+        Self {
+            last_data: now,
+            timeout,
+        }
     }
 
     /// Note that audio was captured. Called after a drain tick that read
@@ -106,16 +166,15 @@ impl StallWatchdog {
 
     /// Whether capture has been quiet long enough to presume the device is gone.
     pub(crate) fn is_stalled(&self, now: Instant) -> bool {
-        let _quiet_for = now.duration_since(self.last_data);
-        false
+        now.duration_since(self.last_data) >= self.timeout
     }
 }
 
 /// How long a capture thread that has presumed its stream dead must wait before
-/// letting the pipeline re-open the device. `lifetime` is how long the stream
-/// ran.
-pub(crate) fn restart_backoff(_lifetime: Duration) -> Duration {
-    Duration::ZERO
+/// letting the pipeline re-open the device (see [`MIN_CAPTURE_LIFETIME`]).
+/// `lifetime` is how long the stream ran.
+pub(crate) fn restart_backoff(lifetime: Duration) -> Duration {
+    MIN_CAPTURE_LIFETIME.saturating_sub(lifetime)
 }
 
 #[cfg(test)]
