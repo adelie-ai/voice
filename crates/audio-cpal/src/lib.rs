@@ -51,6 +51,21 @@
 //!    captures via the shared route instead and logs a warning. `default` is
 //!    left untouched — it's already the system's chosen (shared) input.
 //!
+//! ## When the device goes away
+//!
+//! A capture stream can die under a running daemon: the mic is unplugged, the
+//! sound server restarts, the card is handed to another session. cpal reports
+//! some of that through the stream's error callback and none of it reliably —
+//! on ALSA even an unplug arrives as an opaque backend-specific error, repeated
+//! in a tight loop. The pipeline, meanwhile, learns that capture died only when
+//! the audio channel closes.
+//!
+//! So the capture thread ends itself — which drops the sender and closes that
+//! channel — when either the error callback reports a fatal error or nothing
+//! has been captured for a few seconds (see `capture_health`). The pipeline
+//! then re-opens the device, or reports capture as unavailable if it cannot.
+//! Silence is never mistaken for health.
+//!
 //! ## Guidance
 //!
 //! - **Set `input_device` to `default` (or `pipewire`/`pulse`).** This shares
@@ -61,6 +76,7 @@
 //! - Raw cards remain selectable as a fallback (e.g. a headless box with no
 //!   sound server), and the picker / `list-devices` flag them as exclusive.
 
+mod capture_health;
 mod sink;
 mod source;
 
