@@ -312,6 +312,21 @@ mod tests {
     }
 
     #[test]
+    fn error_reporting_reopens_once_the_tally_is_drained() {
+        // Flood control must not blind the operator for the life of a stream
+        // that runs for days: a different failure hours later still reaches the
+        // journal, at most once per summary window.
+        let health = CaptureHealth::new();
+        assert!(health.record_transient(), "the first error reports");
+        assert!(!health.record_transient(), "an immediate repeat does not");
+        assert_eq!(health.take_transient(), 2, "both are counted");
+        assert!(
+            health.record_transient(),
+            "the next window reports its first error again"
+        );
+    }
+
+    #[test]
     fn healthy_capture_reports_no_faults() {
         let health = CaptureHealth::new();
         assert!(!health.is_fatal());
