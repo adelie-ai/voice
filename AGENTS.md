@@ -49,6 +49,27 @@ GitHub Issues on `github.com/adelie-ai/voice`, together with the shared `adelie-
 board. Manage entries with the `gh` CLI (`gh issue create`, `gh issue list`, `gh issue edit`,
 `gh pr create`). The board states in use are In Progress, In Review, and Done.
 
+### Platform, not a single product (addition)
+
+Adele is a platform, not one product. Solve for the general case at every seam that is
+plural by domain: storage backends, LLM providers, transports, clients, MCP servers, speech
+engines. When a requirement names two of something, ask whether the real requirement is N
+of them, and build that one instead.
+
+Put the abstraction at the port. Keep the conditional compilation and the selection in one
+factory, so a new implementation costs a crate, a feature, and one arm - not an edit to
+every implementation that already exists. A hand-rolled `AnyX` enum with a variant per
+implementation is the shape that fails this test: it re-dispatches every trait method by
+hand and grows with the set.
+
+Base rule 7.3 still holds inside a component. Do not invent indirection that a single call
+site does not need. It does not licence the narrow build at a platform seam, because there
+the plurality is the product, and the seam is already past the three-call-site test.
+
+Fail loudly and by name when a configured selection is not compiled in, or is unavailable.
+Name what was asked for and what is actually present. Silent degradation to a lesser
+backend hides the problem from the one person who could fix it.
+
 ### Capability-based degradation (addition)
 
 Every reliance on an optional operating-system or desktop service - logind, the screen lock,
