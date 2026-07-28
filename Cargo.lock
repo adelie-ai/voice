@@ -2622,7 +2622,7 @@ dependencies = [
 [[package]]
 name = "mcp-core"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/mcp-core?rev=448b0e4a3e4dbfb04d56423d41077f0b114e6143#448b0e4a3e4dbfb04d56423d41077f0b114e6143"
+source = "git+https://github.com/adelie-ai/mcp-core?rev=be1bbcf45b4f67498051d9571aefec7119f1e2a0#be1bbcf45b4f67498051d9571aefec7119f1e2a0"
 dependencies = [
  "async-trait",
  "clap",
