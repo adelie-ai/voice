@@ -1,2 +1,5 @@
 /target
 /wake-samples/
+
+# Gate and build output, never committed.
+*.log
