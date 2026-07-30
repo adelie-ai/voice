@@ -17,6 +17,16 @@ pub trait WakeWordDetector: Send {
         Ok(())
     }
 
+    /// After a [`Self::detect`] call that returned `true`, the match score of
+    /// that fire — consumed on read (returns `None` until the next fire). Lets
+    /// the caller label a wake by how strongly it matched, for online
+    /// sensitivity adaptation (#121). `detect` reports only a bool, so the score
+    /// rustpotter computes at the fire would otherwise be lost. Default: not
+    /// tracked (`None`), so detectors that can't report a score simply opt out.
+    fn take_last_fire_score(&mut self) -> Option<f32> {
+        None
+    }
+
     /// Enter a calibration session: the detector should run so that the *running
     /// peak match score* of an utterance can be read out via [`Self::peak_score`]
     /// (e.g. at a very low threshold so a partial always forms). Default no-op.
