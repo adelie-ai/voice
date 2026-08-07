@@ -4,8 +4,9 @@ default:
     @just --list
 
 # --- Local verification ("local CI") ---
-# Run locally instead of GitHub Actions. `install-hooks` wires `check` into a
-# git pre-push hook so it runs automatically before every push.
+# Run locally instead of GitHub Actions. `install-hooks` wires `check-all` into
+# a git pre-push hook so both configurations below run automatically before
+# every push.
 check: fmt-check lint build test
 fmt-check:
     cargo fmt --all --check
@@ -19,10 +20,26 @@ test:
     cargo test --workspace
 test-integration:
     cargo test --workspace -- --ignored
+
+# --- otel feature (adelie-telemetry, adelie-ai/mcp-core#38) ---
+# Only `adele-voice` (and its `adele-voice-module` dependency) touch
+# adelie-telemetry, so these are package-scoped rather than --workspace: no
+# other member declares (or needs) an `otel` feature.
+check-otel: lint-otel build-otel test-otel
+lint-otel:
+    cargo clippy -p adele-voice --features otel --all-targets -- -D warnings
+build-otel:
+    cargo build -p adele-voice --features otel
+test-otel:
+    cargo test -p adele-voice --features otel
+
+# Both configurations. This is what the pre-push hook runs.
+check-all: check check-otel
+
 premerge:
     git fetch origin
     git rebase origin/main
-    just check
+    just check-all
 install-hooks:
     git config core.hooksPath .githooks
     @echo "pre-push hook active — bypass once with: git push --no-verify"

@@ -53,17 +53,30 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // `adele-voice --telemetry-probe`: log at a few levels/targets, then
-    // exit, without touching D-Bus or an audio device. Exists so a test can
-    // run this binary as a real subprocess and inspect where a genuine
-    // `adelie_telemetry::init` call routes its output — something that can't
-    // be observed in-process, since the console layer writes straight to the
-    // OS-level stderr file descriptor and `init` may only be claimed once per
-    // process (voice#158).
+    // `adele-voice --telemetry-probe`: exercise all three signals (a log
+    // line, a span, and a metric), then exit, without touching D-Bus or an
+    // audio device. Exists so a test — or an operator pointing
+    // OTEL_EXPORTER_OTLP_ENDPOINT at a collector — can run this binary as a
+    // real subprocess and inspect where a genuine `adelie_telemetry::init`
+    // call routes its output. That can't be observed in-process: the console
+    // layer writes straight to the OS-level stderr file descriptor, and
+    // `init` may only be claimed once per process (voice#158).
     if std::env::args().skip(1).any(|a| a == "--telemetry-probe") {
         tracing::info!("probe: info line");
         tracing::debug!("probe: debug line");
         tracing::event!(target: "ort", tracing::Level::INFO, "probe: ort info line");
+        {
+            let span = tracing::info_span!("probe_span");
+            let _entered = span.enter();
+            tracing::info!("probe: inside span");
+        }
+        adelie_telemetry::metrics::increment(
+            "probe.count",
+            &[adelie_telemetry::metrics::Label::new(
+                "source",
+                "telemetry-probe",
+            )],
+        );
         return Ok(());
     }
 
