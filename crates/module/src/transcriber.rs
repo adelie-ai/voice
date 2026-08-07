@@ -48,15 +48,29 @@ impl<S: SpeechToText> Transcriber<S> {
     /// Energy-gate then transcribe. Returns `None` when the capture is below the
     /// speech floor (noise/echo) or the transcript comes back empty — i.e.
     /// "nothing worth sending on."
+    ///
+    /// This is the pipeline's `stt_transcribe` boundary (voice#158): a span
+    /// covers the whole gate-then-transcribe call, `samples` is skipped from
+    /// it (D10 — no audio buffer as a span field), and the STT call's own
+    /// duration feeds the `voice.pipeline.stt_transcribe` histogram. A
+    /// capture the energy gate drops counts against `voice.energy_gate.dropped`.
+    #[tracing::instrument(name = "stt_transcribe", skip(self, samples))]
     pub async fn transcribe(&self, samples: &[f32]) -> Result<Option<Transcript>, VoiceError> {
         let level = rms(samples);
         tracing::info!(rms = level, samples = samples.len(), "utterance captured");
         if level < self.min_rms {
             tracing::info!(rms = level, "discarding near-silent capture (no speech)");
+            adelie_telemetry::metrics::increment("voice.energy_gate.dropped", &[]);
             return Ok(None);
         }
 
+        let started = std::time::Instant::now();
         let transcript = self.stt.transcribe(samples).await?;
+        adelie_telemetry::metrics::record_duration(
+            "voice.pipeline.stt_transcribe",
+            started.elapsed(),
+            &[],
+        );
         if transcript.text.is_empty() {
             tracing::debug!("empty transcript, skipping");
             return Ok(None);

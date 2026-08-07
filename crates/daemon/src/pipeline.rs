@@ -13,6 +13,7 @@ use adele_voice_core::sentence_buffer::SentenceBuffer;
 use adele_voice_dbus_interface::{CalibrationRequest, CaptureState, StopRequest, VoiceSignal};
 use adele_voice_module::{Endpoint, Endpointer, PreBuffer, Speaker, Transcriber};
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 
 use crate::calibration;
 use crate::config::{self, ClientToolsConfig, SpeechMode, Tunables, plan_reload};
@@ -487,6 +488,21 @@ where
     /// accumulated across turns in the reuse window and used by the post-session
     /// LLM triage task to judge whether the conversation is worth keeping.
     session_transcripts: Vec<String>,
+    /// The open `vad_segment` span plus when it started, from the moment
+    /// speech begins until the endpointer closes the utterance (voice#158).
+    /// Lives on `self` because the segment spans many `run()` loop
+    /// iterations (one per audio chunk), not one function call.
+    vad_segment: Option<(tracing::Span, Instant)>,
+    /// The open root span for the turn in progress, if any (voice#158, epic
+    /// D12/D13 shape only — no propagation to the daemon yet). Opened at VAD
+    /// segment close (`Endpoint::Complete`); closed generically in `apply`
+    /// whenever the state machine leaves Processing/Speaking, which is
+    /// wherever *this* pipeline currently considers a turn over — a
+    /// single-shot reply ends it via `TurnEnded` the instant the last
+    /// sentence is queued for playback, not once the audio hardware has
+    /// actually finished sounding, so "closes when TTS finishes playing" is
+    /// only as precise as the state machine already is.
+    turn_span: Option<tracing::Span>,
 }
 
 impl<W, V, S, T, A> Pipeline<W, V, S, T, A>
@@ -579,6 +595,8 @@ where
             // harmless no-op until `with_capture_state` wires the real channel.
             capture_state_tx: watch::channel(CaptureState::Capturing).0,
             session_transcripts: Vec::new(),
+            vad_segment: None,
+            turn_span: None,
         }
     }
 
@@ -593,9 +611,21 @@ where
         match self.state.transition(&event) {
             Some(next) => {
                 if next != self.state {
+                    let leaving_turn = matches!(self.state, State::Processing | State::Speaking)
+                        && !matches!(next, State::Processing | State::Speaking);
                     self.state = next;
                     let _ = self.state_tx.send(next);
                     tracing::info!(state = %next, ?event, "state changed");
+                    // Close the turn's root span (voice#158) wherever this
+                    // pipeline currently considers the turn over — every
+                    // event that leaves Processing/Speaking for Idle or
+                    // Listening: PlaybackComplete, TurnEnded, RelistenArmed,
+                    // BargeIn, or an explicit Stopped mid-turn. Dropping the
+                    // span here, rather than only where it was opened,
+                    // covers every one of those without enumerating them.
+                    if leaving_turn {
+                        self.turn_span = None;
+                    }
                 }
                 true
             }
@@ -613,6 +643,58 @@ where
                 false
             }
         }
+    }
+
+    /// Arm the conversation and the endpointer after a positive wake-word
+    /// detection: clear any stale push-to-talk target, honour the
+    /// conversation reuse window, play the listening cue, and arm the
+    /// endpointer with the same-breath preroll.
+    ///
+    /// This is the pipeline's `wake_detection` boundary (voice#158) — the
+    /// span covers the hand-off from hearing the wake word to being armed
+    /// and ready to listen, which is the latency a person actually
+    /// experiences as "did it hear me". It precedes the turn's root span
+    /// (opened later, at VAD segment close) rather than nesting inside it,
+    /// since nothing has been said yet when this runs.
+    #[tracing::instrument(name = "wake_detection", skip_all)]
+    async fn on_wake_word_detected(&mut self, audio_rx: &mut mpsc::Receiver<Vec<f32>>) {
+        let started = Instant::now();
+        // Wake word always uses the daemon's own session; clear any
+        // push-to-talk target left over from a session ended via
+        // StopSpeaking so this utterance can't leak into a previously
+        // dictated conversation.
+        self.ptt_conversation_override = None;
+        // Honour the reuse window (voice#53): keep the recent conversation
+        // if this wake is within it, else start fresh.
+        self.expire_stale_conversation_on_wake();
+        // Capture the same-breath preroll NOW (#50) — the audio spoken right
+        // after the wake word, before the cue sounds — so "hey adele
+        // <command>" in one breath keeps the command.
+        let preroll = self.prebuffer.take();
+        self.vad.reset();
+        // Audible "Listening" cue (#51) — instant ding by default, optional
+        // spoken phrase, or off.
+        let cue_played = self.play_listening_cue().await;
+        // V-7/#87: the cue plays INTO the open mic, so its audio (especially
+        // a spoken "How can I help?") would otherwise be endpointed as the
+        // user's utterance. Wait the cue out and drop the echo it queued
+        // before arming — matching the relisten path. Arming AFTER the cue
+        // also starts the lead-in from when the user can actually speak, not
+        // from before the cue (which a ~1 s phrase would otherwise burn
+        // through, timing out the turn). The preroll captured above is still
+        // seeded into the buffer, so only post-cue echo is dropped. Only
+        // drain when a cue actually played: with the cue Off there's no
+        // echo, and draining would eat same-breath speech already queued.
+        if cue_played {
+            self.drain_playback_echo(audio_rx).await;
+        }
+        self.endpointer
+            .arm_with_preroll(Some(self.followup_timeout), &preroll);
+        adelie_telemetry::metrics::record_duration(
+            "voice.pipeline.wake_detection",
+            started.elapsed(),
+            &[],
+        );
     }
 
     /// Attach the D-Bus signal sink so the pipeline emits `TranscriptReady` /
@@ -1558,46 +1640,9 @@ where
                             // Feed to wake word detector
                             if self.wake.detect(&chunk)? {
                                 tracing::info!("wake word detected");
+                                adelie_telemetry::metrics::increment("voice.wake.detections", &[]);
                                 if self.apply(StateEvent::WakeWordDetected) {
-                                    // Wake word always uses the daemon's own
-                                    // session; clear any push-to-talk target
-                                    // left over from a session ended via
-                                    // StopSpeaking so this utterance can't leak
-                                    // into a previously dictated conversation.
-                                    self.ptt_conversation_override = None;
-                                    // Honour the reuse window (voice#53): keep the
-                                    // recent conversation if this wake is within
-                                    // it, else start fresh.
-                                    self.expire_stale_conversation_on_wake();
-                                    // Capture the same-breath preroll NOW (#50) —
-                                    // the audio spoken right after the wake word,
-                                    // before the cue sounds — so "hey adele
-                                    // <command>" in one breath keeps the command.
-                                    let preroll = self.prebuffer.take();
-                                    self.vad.reset();
-                                    // Audible "Listening" cue (#51) — instant ding
-                                    // by default, optional spoken phrase, or off.
-                                    let cue_played = self.play_listening_cue().await;
-                                    // V-7/#87: the cue plays INTO the open mic, so
-                                    // its audio (especially a spoken "How can I
-                                    // help?") would otherwise be endpointed as the
-                                    // user's utterance. Wait the cue out and drop
-                                    // the echo it queued before arming — matching
-                                    // the relisten path. Arming AFTER the cue also
-                                    // starts the lead-in from when the user can
-                                    // actually speak, not from before the cue
-                                    // (which a ~1 s phrase would otherwise burn
-                                    // through, timing out the turn). The preroll
-                                    // captured above is still seeded into the
-                                    // buffer, so only post-cue echo is dropped.
-                                    // Only drain when a cue actually played: with
-                                    // the cue Off there's no echo, and draining
-                                    // would eat same-breath speech already queued.
-                                    if cue_played {
-                                        self.drain_playback_echo(&mut audio_rx).await;
-                                    }
-                                    self.endpointer
-                                        .arm_with_preroll(Some(self.followup_timeout), &preroll);
+                                    self.on_wake_word_detected(&mut audio_rx).await;
                                 }
                             }
                         }
@@ -1609,10 +1654,45 @@ where
                             match self.endpointer.push(&chunk, prob) {
                                 Endpoint::SpeechStarted => {
                                     tracing::info!(prob, "speech detected, recording");
+                                    // The pipeline's `vad_segment` boundary
+                                    // (voice#158): opens here, closes at
+                                    // `Endpoint::Complete` below. No audio
+                                    // buffer or transcript text goes on it
+                                    // (D10) — it exists purely to measure how
+                                    // long the daemon spent accumulating the
+                                    // utterance.
+                                    self.vad_segment =
+                                        Some((tracing::info_span!("vad_segment"), Instant::now()));
                                 }
                                 Endpoint::Accumulating => {}
                                 Endpoint::Complete(samples) => {
+                                    let segment_span = self
+                                        .vad_segment
+                                        .take()
+                                        .inspect(|(_, started)| {
+                                            adelie_telemetry::metrics::record_duration(
+                                                "voice.pipeline.vad_segment",
+                                                started.elapsed(),
+                                                &[],
+                                            );
+                                        })
+                                        .map(|(span, _)| span);
+                                    // The turn's root span (voice#158, epic
+                                    // D12/D13 shape only): opens here, at VAD
+                                    // segment close — "the person stopped
+                                    // speaking" — which is exactly the start
+                                    // of the gap this ticket exists to make
+                                    // visible. `conversation_id` is recorded
+                                    // on it once `process_utterance` resolves
+                                    // one.
+                                    let turn_span =
+                                        tracing::info_span!("voice_turn", conversation_id = tracing::field::Empty);
+                                    if let Some(segment_span) = segment_span {
+                                        turn_span.follows_from(&segment_span);
+                                    }
+                                    self.turn_span = Some(turn_span.clone());
                                     self.handle_utterance_complete(samples, &mut audio_rx)
+                                        .instrument(turn_span)
                                         .await;
                                 }
                                 Endpoint::Timeout => {
@@ -1825,7 +1905,10 @@ where
             Some(t) => t,
             None => return Ok(UtteranceOutcome::Continue),
         };
-        tracing::info!(text = %transcript.text, "transcribed");
+        // D10: INFO carries counts, never content. The transcript itself is a
+        // DEBUG-only line (voice#158, closes #143).
+        tracing::info!(chars = transcript.text.len(), "transcribed");
+        tracing::debug!(text = %transcript.text, "transcribed");
         // Let clients (the KDE widget) show what was heard without polling
         // (voice#85).
         self.emit_signal(VoiceSignal::TranscriptReady(transcript.text.clone()));
@@ -1835,7 +1918,8 @@ where
         // apology lines. Acting on it would start a fresh turn that speaks
         // another canned line and loops. Discard it like a near-silent capture.
         if is_self_echo(&transcript.text) {
-            tracing::info!(text = %transcript.text, "discarding self-echo of a canned spoken line");
+            tracing::info!("discarding self-echo of a canned spoken line");
+            tracing::debug!(text = %transcript.text, "discarding self-echo of a canned spoken line");
             return Ok(UtteranceOutcome::Continue);
         }
 
@@ -1843,7 +1927,8 @@ where
         // ends the conversation hands-free: acknowledge briefly and return to
         // wake-word idle instead of sending it to the assistant.
         if is_stop_phrase(&transcript.text) {
-            tracing::info!(text = %transcript.text, "stop phrase — ending conversation");
+            tracing::info!("stop phrase — ending conversation");
+            tracing::debug!(text = %transcript.text, "stop phrase — ending conversation");
             self.apply(StateEvent::ResponseStarted);
             self.speaker.say("Okay.").await?;
             return Ok(UtteranceOutcome::EndConversation);
@@ -1877,6 +1962,10 @@ where
             }
             self.conversation_id.as_ref().unwrap().clone()
         };
+        // D13: a conversation is not a trace: this is an attribute on the
+        // turn's root span, not a shared trace id, so one query returns
+        // every turn in a conversation without any of them sharing a trace.
+        tracing::Span::current().record("conversation_id", conversation_id.as_str());
 
         // Subscribe to response signals (bounded — #58).
         let mut signal_rx = bounded(
@@ -2163,7 +2252,10 @@ where
                             // streams.
                             if auto_narrate {
                                 if was_first && is_error_response(&text) {
-                                    tracing::error!(chunk = %text, "assistant streamed an error message; speaking a short apology instead");
+                                    tracing::error!(
+                                        "assistant streamed an error message; speaking a short apology instead"
+                                    );
+                                    tracing::debug!(chunk = %text, "assistant streamed an error message");
                                     self.apply(StateEvent::ResponseStarted);
                                     self.speaker.say(ERROR_APOLOGY).await?;
                                     break StreamEnd::Completed;
@@ -2216,7 +2308,10 @@ where
                                         // The orchestrator surfaces LLM failures as
                                         // the reply text (so they show in chat);
                                         // don't read the raw error aloud.
-                                        tracing::error!(response = %full_response, "assistant returned an error message; speaking a short apology instead");
+                                        tracing::error!(
+                                            "assistant returned an error message; speaking a short apology instead"
+                                        );
+                                        tracing::debug!(response = %full_response, "assistant returned an error message");
                                         self.speaker.say(ERROR_APOLOGY).await?;
                                     } else {
                                         // Speak the full response instead of dropping it.
@@ -2242,7 +2337,10 @@ where
                                 // never double a say_this line. (Off stays silent.)
                                 self.apply(StateEvent::ResponseStarted);
                                 if is_error_response(&full_response) {
-                                    tracing::error!(response = %full_response, "assistant returned an error message; speaking a short apology instead");
+                                    tracing::error!(
+                                        "assistant returned an error message; speaking a short apology instead"
+                                    );
+                                    tracing::debug!(response = %full_response, "assistant returned an error message");
                                     self.speaker.say(ERROR_APOLOGY).await?;
                                 } else {
                                     tracing::info!("on-demand turn spoke nothing; narrating the reply as a silence backstop");
@@ -2628,6 +2726,7 @@ mod tests {
     //! still captures and transcribes an utterance while "Hey Adele" is off.
     use super::*;
     use adele_voice_core::domain::Transcript;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
@@ -6562,5 +6661,347 @@ mod tests {
         .expect("ok");
         driver.await.unwrap();
         assert_eq!(end, StreamEnd::Stopped(StopRequest::Conversation));
+    }
+
+    // --- voice#158: telemetry adoption ------------------------------------
+    //
+    // `cargo test` runs every test for this crate in one process, and most of
+    // the ~130 tests above run the pipeline with no subscriber installed at
+    // all. `tracing` caches a per-callsite "is anyone interested" verdict
+    // process-wide the first time a callsite fires (that is the whole point
+    // of the cache: a hot log line costs nothing when nobody is listening),
+    // so by the time a voice#158 test runs, every callsite the pipeline
+    // touches is very likely already cached as "never". Installing a *new*
+    // subscriber per test via `tracing::subscriber::set_default` does not
+    // reliably invalidate that cache for callsites it did not itself
+    // register interest for.
+    //
+    // The fix used here — and the one `tracing-test` and similar crates use
+    // for the same reason — is to install exactly one, maximally permissive
+    // subscriber for the whole test binary (so every callsite's cached
+    // interest is decided once, by a subscriber that is always listening,
+    // and stays that way for the rest of the process), then route each
+    // event and span to the right test through a thread-local. `#[tokio::test]`
+    // defaults to the current-thread runtime, so a test and everything it
+    // `tokio::spawn`s share one OS thread, which is exactly what the
+    // thread-local needs.
+
+    thread_local! {
+        static TEST_CAPTURE: RefCell<Option<TestCapture>> = const { RefCell::new(None) };
+    }
+
+    /// A span this capture saw created: its name, every field it was given,
+    /// and its parent's name (the span that was "current" on this thread
+    /// when it was created — `None` for a span with no open parent, which is
+    /// the deliberate case for `wake_detection` and `vad_segment`; see
+    /// `turn_pipeline_emits_spans`).
+    type CapturedSpan = (&'static str, Vec<(String, String)>, Option<&'static str>);
+
+    #[derive(Default)]
+    struct TestCapture {
+        /// One formatted line per event at or below this test's chosen level
+        /// (lower `tracing::Level` values are more severe — `INFO < DEBUG`),
+        /// approximating what `RUST_LOG=<level>` would let through to the
+        /// console.
+        max_level: Option<tracing::Level>,
+        log_lines: Vec<String>,
+        /// One entry per span created while this test's capture was active.
+        spans: Vec<CapturedSpan>,
+        /// Names of every span that closed (its last handle dropped) while
+        /// this test's capture was active — proof a span did not just open,
+        /// but also closed, which is what makes its duration measurable.
+        closed: Vec<&'static str>,
+    }
+
+    struct FieldRecorder<'a>(&'a mut Vec<(String, String)>);
+    impl tracing::field::Visit for FieldRecorder<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// The one subscriber layer installed for the whole test binary. Always
+    /// interested (no `enabled`/`register_callsite` override), so callsite
+    /// interest caches as "always" rather than "never" the first time each
+    /// one fires — the thread-local check in each callback is where this
+    /// crate's tests actually decide whether to capture.
+    struct RoutingLayer;
+
+    impl<S> tracing_subscriber::layer::Layer<S> for RoutingLayer
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            TEST_CAPTURE.with_borrow_mut(|slot| {
+                let Some(capture) = slot.as_mut() else {
+                    return;
+                };
+                let Some(max_level) = capture.max_level else {
+                    return;
+                };
+                if *event.metadata().level() > max_level {
+                    return; // more verbose than this test's filter
+                }
+                let mut fields = Vec::new();
+                event.record(&mut FieldRecorder(&mut fields));
+                let rendered = fields
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                capture.log_lines.push(format!(
+                    "{} {} {rendered}",
+                    event.metadata().level(),
+                    event.metadata().name()
+                ));
+            });
+        }
+
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // The parent is whichever span was current on this thread when
+            // this one was created — exactly the relationship `.instrument()`
+            // and `#[tracing::instrument]` establish, and exactly what makes
+            // `stt_transcribe` / `tts_synthesize` children of `voice_turn`
+            // (voice#158, epic D12/D13).
+            let parent_name = ctx
+                .span(id)
+                .and_then(|span| span.parent().map(|parent| parent.name()));
+            TEST_CAPTURE.with_borrow_mut(|slot| {
+                let Some(capture) = slot.as_mut() else {
+                    return;
+                };
+                let mut fields = Vec::new();
+                attrs.record(&mut FieldRecorder(&mut fields));
+                capture
+                    .spans
+                    .push((attrs.metadata().name(), fields, parent_name));
+            });
+        }
+
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let Some(name) = ctx.span(&id).map(|span| span.name()) else {
+                return;
+            };
+            TEST_CAPTURE.with_borrow_mut(|slot| {
+                let Some(capture) = slot.as_mut() else {
+                    return;
+                };
+                capture.closed.push(name);
+            });
+        }
+    }
+
+    /// Install the one global subscriber for this test binary, the first
+    /// time any voice#158 test calls this. Every later call is a cheap
+    /// `OnceLock` check, and does not reinstall anything (a second
+    /// `set_global_default` would error).
+    fn ensure_global_capture_subscriber() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber = tracing_subscriber::registry().with(RoutingLayer);
+            // Ignore the error: another test (or, in the full test run, the
+            // adelie-telemetry consumer tests) may have already installed a
+            // global subscriber first, in which case `RUST_LOG`-gated tests
+            // running under it also work, since that subscriber's own filter
+            // is `info` or more permissive by default.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// Run `body` (a full pipeline turn) with this thread's events and spans
+    /// captured, and return what was captured. `max_level` is the deepest
+    /// level to keep in `log_lines`, approximating `RUST_LOG=<level>`;
+    /// spans are captured regardless of level, matching how a span itself
+    /// has no level-gated content, only its fields.
+    async fn capture_tracing<F, Fut>(max_level: tracing::Level, body: F) -> TestCapture
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        ensure_global_capture_subscriber();
+        TEST_CAPTURE.set(Some(TestCapture {
+            max_level: Some(max_level),
+            ..Default::default()
+        }));
+        body().await;
+        TEST_CAPTURE.with_borrow_mut(|slot| slot.take()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_transcript_or_reply_at_info() {
+        // Regression guard for #143: a full voice turn at RUST_LOG=info must
+        // emit neither the transcribed utterance nor the spoken reply.
+        // FakeAssistant's canned completion is the literal text "hello" (see
+        // `record_and_complete`); the transcript below is deliberately
+        // distinctive so a leak can't hide behind an everyday word.
+        const TRANSCRIPT: &str = "xyzzy the launch codes are wobble";
+
+        let capture = capture_tracing(tracing::Level::INFO, || async {
+            let h = spawn_pipeline(Cfg {
+                wake_detects: true,
+                stt_text: TRANSCRIPT.to_string(),
+                ..Default::default()
+            });
+            send_chunk(&h).await; // wakes (wake_detects=true), arms the endpointer
+            // `state_rx` starts at Idle, so a wait for Idle right away would
+            // resolve instantly against that starting value instead of
+            // against the turn actually finishing. Confirm the turn has left
+            // Idle first, so the later wait is for a real transition back.
+            wait_state(&h, State::Listening, "wake triggers Listening").await;
+            send_chunk(&h).await; // speech (vad 0.9)
+            send_chunk(&h).await; // silence (vad 0.0) -> Processing -> transcribe -> reply
+            wait_state(&h, State::Idle, "turn completes").await;
+            h.handle.abort();
+        })
+        .await;
+
+        let log = capture.log_lines.join("\n");
+        assert!(
+            !log.contains(TRANSCRIPT),
+            "the transcript must not reach an INFO line: {log}"
+        );
+        assert!(
+            !log.contains("hello"),
+            "the spoken reply must not reach an INFO line: {log}"
+        );
+        // Sanity: prove the gate moved the content, not the whole event.
+        assert!(
+            log.contains("transcribed"),
+            "the transcribed event must still fire (without its text): {log}"
+        );
+        assert!(
+            log.contains("speaking"),
+            "the speaking event must still fire (without its text): {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_pipeline_emits_spans() {
+        // Each of the four pipeline-stage boundaries (voice#158 step 5) must
+        // produce a span for a full turn: wake detection, the VAD segment,
+        // STT transcribe, and TTS synthesize.
+        let capture = capture_tracing(tracing::Level::TRACE, || async {
+            let h = spawn_pipeline(Cfg {
+                wake_detects: true,
+                ..Default::default()
+            });
+            send_chunk(&h).await; // wakes
+            // See the matching comment in `no_transcript_or_reply_at_info`:
+            // `state_rx` starts at Idle, so confirm the turn has left it
+            // before waiting for it to return.
+            wait_state(&h, State::Listening, "wake triggers Listening").await;
+            send_chunk(&h).await; // speech
+            send_chunk(&h).await; // silence -> Processing -> transcribe -> reply
+            wait_state(&h, State::Idle, "turn completes").await;
+            h.handle.abort();
+        })
+        .await;
+
+        let names: Vec<&'static str> = capture.spans.iter().map(|(name, ..)| *name).collect();
+        for expected in [
+            "wake_detection",
+            "vad_segment",
+            "stt_transcribe",
+            "tts_synthesize",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "expected a {expected:?} span; got {names:?}"
+            );
+        }
+
+        // D12/D13: the turn is rooted by a voice_turn span, not just the four
+        // pipeline-stage spans. Assert what that root actually needs to be
+        // true, not only that its name appears somewhere:
+        assert!(
+            names.contains(&"voice_turn"),
+            "expected a voice_turn root span; got {names:?}"
+        );
+        assert!(
+            capture.closed.contains(&"voice_turn"),
+            "voice_turn must close (not just open) once the turn ends: closed = {:?}",
+            capture.closed
+        );
+        // stt_transcribe and tts_synthesize run inside
+        // handle_utterance_complete(...).instrument(turn_span), so voice_turn
+        // must be their parent — that is what makes them children of the
+        // root rather than peers of it (voice#158 step 5 / epic D12).
+        for child in ["stt_transcribe", "tts_synthesize"] {
+            let parent = capture
+                .spans
+                .iter()
+                .find(|(name, ..)| *name == child)
+                .and_then(|(_, _, parent)| *parent);
+            assert_eq!(
+                parent,
+                Some("voice_turn"),
+                "{child} must be a child of voice_turn; got parent {parent:?}"
+            );
+        }
+        // wake_detection and vad_segment are deliberately NOT children of
+        // voice_turn: wake_detection precedes the root span entirely (it
+        // runs before the person has said anything this turn), and
+        // vad_segment is already closed by the time voice_turn opens at
+        // Endpoint::Complete, so it cannot be a child of a span that does
+        // not exist yet.
+        for sibling in ["wake_detection", "vad_segment"] {
+            let parent = capture
+                .spans
+                .iter()
+                .find(|(name, ..)| *name == sibling)
+                .and_then(|(_, _, parent)| *parent);
+            assert_ne!(
+                parent,
+                Some("voice_turn"),
+                "{sibling} is documented as preceding voice_turn, not nesting inside it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spans_do_not_record_transcript_text() {
+        // No span field anywhere in the turn may carry the transcript (or the
+        // reply — FakeAssistant always completes with "hello").
+        const TRANSCRIPT: &str = "xyzzy the launch codes are wobble";
+        let capture = capture_tracing(tracing::Level::TRACE, || async {
+            let h = spawn_pipeline(Cfg {
+                wake_detects: true,
+                stt_text: TRANSCRIPT.to_string(),
+                ..Default::default()
+            });
+            send_chunk(&h).await; // wakes
+            // See the matching comment in `no_transcript_or_reply_at_info`:
+            // `state_rx` starts at Idle, so confirm the turn has left it
+            // before waiting for it to return.
+            wait_state(&h, State::Listening, "wake triggers Listening").await;
+            send_chunk(&h).await; // speech
+            send_chunk(&h).await; // silence -> Processing -> transcribe -> reply
+            wait_state(&h, State::Idle, "turn completes").await;
+            h.handle.abort();
+        })
+        .await;
+
+        for (name, fields, _parent) in &capture.spans {
+            for (field, value) in fields {
+                assert!(
+                    !value.contains(TRANSCRIPT) && !value.contains("hello"),
+                    "span {name:?} field {field:?} carried content: {value:?}"
+                );
+            }
+        }
     }
 }

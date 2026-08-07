@@ -316,6 +316,88 @@ The desktop-assistant daemon must be running and exposing `org.desktopAssistant.
 
 **Running as a service.** `systemd/adele-voice.service` is D-Bus-activatable (`Type=dbus`): once installed it starts on demand when anything calls `org.desktopAssistant.Voice`, and also at login. Make it on-demand-only with `systemctl --user disable adele-voice`, or turn it off entirely with `systemctl --user mask adele-voice` (after which calls fail cleanly — the service simply isn't there). Set `idle_exit_timeout_ms` in the config to have the daemon exit when idle (wake word off, nothing playing) so it isn't resident between uses — activation restarts it on the next call. The session activation file is `systemd/dbus-1/org.desktopAssistant.Voice.service` (install to `~/.local/share/dbus-1/services/`).
 
+## Logging
+
+`adele-voice` sets up logging, metrics, and tracing through the shared
+[`adelie-telemetry`](https://github.com/adelie-ai/adelie-telemetry) crate, the
+same way every Adelie Rust binary does.
+
+**Console output.** Logs go to stderr, never stdout, in plain text. `RUST_LOG`
+sets the filter through the usual `EnvFilter` syntax:
+
+```sh
+RUST_LOG=debug adele-voice
+RUST_LOG=info,adele_voice=debug adele-voice
+```
+
+The default filter, when `RUST_LOG` is unset or unparseable, is
+`info,ort=warn`. `ort` (the onnxruntime binding used by Whisper, Silero, and
+Kokoro) logs allocator and arena activity at INFO, which floods the journal
+during a Kokoro session; keeping it at WARN removes that noise without
+touching anything else.
+
+**What may appear at each level.** This is a contract, not a preference.
+
+| Level | Carries |
+|---|---|
+| INFO | ids, counts, durations, model names, state transitions. **Never content.** |
+| DEBUG | the transcribed utterance and the exact text spoken back. |
+
+For this service, "content" means a transcript or a spoken reply. Every site
+that used to log one at INFO logs a count there instead, with the text itself
+moved to a DEBUG-only line beside it. `RUST_LOG=debug` therefore means
+conversation content reaches wherever the logs go, including a configured
+OTLP collector — deliberately, and why the default stays at `info`.
+
+**Spans on the turn pipeline.** Four boundaries are instrumented, because
+latency there is what actually gets debugged:
+
+- `wake_detection` — from hearing the wake word to being armed and ready to
+  listen (cue playback, echo drain).
+- `vad_segment` — from the first speech frame to the endpointer closing the
+  utterance on silence.
+- `stt_transcribe` — the Whisper call.
+- `tts_synthesize` — one speech-backend synthesis call (Kokoro, Piper, or
+  Polly).
+
+A `voice_turn` span roots each spoken turn: it opens at VAD segment close —
+the moment a person stops speaking, which is where the gap between "they
+finished talking" and "the daemon started thinking" begins — and closes
+wherever the pipeline's own state machine considers the turn over. For a
+single-shot reply that is the instant the last sentence is queued for
+playback, not confirmed audio-hardware completion; the span is only as
+precise as the state machine already is. It carries `conversation_id` as an
+attribute, not as a shared trace id, so one query returns every turn in a
+conversation without an unbounded trace joining them. No audio buffer or
+transcript text is ever attached to a span, at any level.
+
+**Metrics**, through the `adelie_telemetry::metrics` facade only:
+
+| Metric | Kind | Meaning |
+|---|---|---|
+| `voice.pipeline.wake_detection` | duration | wake-to-armed hand-off time |
+| `voice.pipeline.vad_segment` | duration | how long an utterance took to accumulate |
+| `voice.pipeline.stt_transcribe` | duration | the Whisper call |
+| `voice.pipeline.tts_synthesize` | duration | one synthesis call |
+| `voice.wake.detections` | counter | wake-word detections |
+| `voice.energy_gate.dropped` | counter | captures dropped as near-silent before STT |
+
+These accumulate in an in-process registry and print a periodic summary to
+stderr whether or not a collector is configured, so a default `cargo install`
+build still shows real numbers in `journalctl`.
+
+**OTLP export** is off by default, behind the `otel` Cargo feature
+(`cargo build --features otel`, or `just check-otel` for the gate). With it
+off, the process resolves no `opentelemetry` crate at all. With it on, traces,
+metrics, and logs export to a collector configured entirely through the
+standard `OTEL_*` environment variables — `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc`, `http/protobuf`, or `http/json`), the
+per-signal `_TRACES_` / `_METRICS_` / `_LOGS_` overrides, `_HEADERS`,
+`_TIMEOUT`, and `OTEL_RESOURCE_ATTRIBUTES`. There are no `adele-voice`-specific
+flags or variables for any of this; see the
+[`adelie-telemetry` README](https://github.com/adelie-ai/adelie-telemetry#opentelemetry-export)
+for the full list and what each transport needs from the host.
+
 ## Status
 
 Early but functional: the full pipeline (wake → VAD → STT → assistant → streamed TTS, with barge-in and push-to-talk) is implemented. Active work is tracked on the [Adelie AI Roadmap](https://github.com/orgs/adelie-ai/projects) board — provisioning, the "Enable 'Hey Adele'" / record controls in the clients, on-demand activation, a `SayText` accessibility service, continuous conversation, and TTS voice selection.

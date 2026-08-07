@@ -66,13 +66,22 @@ impl<T: TextToSpeech> Speaker<T> {
     /// here. If sanitizing leaves nothing speakable (e.g. a "sentence" that was
     /// just `---` or a stray `**` from a SentenceBuffer split), synthesis is
     /// skipped entirely so the engine is never fed empty text.
+    ///
+    /// This is the pipeline's `tts_synthesize` boundary (voice#158): a span
+    /// covers the synth call, and its duration feeds the
+    /// `voice.pipeline.tts_synthesize` histogram. `text` is skipped from the
+    /// span (D10 — no spoken content as a span field); the sanitized text
+    /// itself is logged at DEBUG only, never INFO.
+    #[tracing::instrument(name = "tts_synthesize", skip(self, text))]
     pub async fn say(&self, text: &str) -> Result<(), VoiceError> {
         let spoken = strip_markdown_for_speech(text);
         if spoken.is_empty() {
             tracing::debug!(original = %text, "nothing to speak after markdown strip; skipping synthesis");
             return Ok(());
         }
-        tracing::info!(text = %spoken, "speaking");
+        tracing::info!(chars = spoken.len(), "speaking");
+        tracing::debug!(text = %spoken, "speaking");
+        let started = std::time::Instant::now();
         let synth = self.tts.synthesize(&spoken);
         let samples = if self.synth_timeout.is_zero() {
             synth.await?
@@ -87,6 +96,11 @@ impl<T: TextToSpeech> Speaker<T> {
                 }
             }
         };
+        adelie_telemetry::metrics::record_duration(
+            "voice.pipeline.tts_synthesize",
+            started.elapsed(),
+            &[],
+        );
         if !samples.is_empty() {
             self.sink.play(samples)?;
         }

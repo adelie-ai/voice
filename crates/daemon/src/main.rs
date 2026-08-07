@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing_subscriber::EnvFilter;
 
 mod calibration;
 mod config;
@@ -25,13 +24,19 @@ const DBUS_VOICE_PATH: &str = "/org/desktopAssistant/Voice";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    // Every adelie-ai binary sets up telemetry the same way (adelie-ai/mcp-core#38):
+    // one `adelie_telemetry::init` call, its guard held for the life of `main` so
+    // the metrics summary and (with `--features otel`) the three OTLP pipelines
+    // flush on every exit path, including the early returns below. A second call
+    // anywhere in this process (there is none) would be a safe no-op (D5), not a
+    // panic.
+    let _telemetry = adelie_telemetry::init(
+        adelie_telemetry::Config::new("adele-voice").with_default_filter(
             // `ort` logs onnxruntime's allocator/arena activity at INFO (very
             // noisy for the Kokoro session); keep it at warn by default.
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,ort=warn".into()),
-        )
-        .init();
+            "info,ort=warn",
+        ),
+    )?;
 
     let config = config::load()?;
 
@@ -45,6 +50,33 @@ async fn main() -> Result<()> {
 
     if std::env::args().skip(1).any(|a| a == "list-devices") {
         list_devices();
+        return Ok(());
+    }
+
+    // `adele-voice --telemetry-probe`: exercise all three signals (a log
+    // line, a span, and a metric), then exit, without touching D-Bus or an
+    // audio device. Exists so a test — or an operator pointing
+    // OTEL_EXPORTER_OTLP_ENDPOINT at a collector — can run this binary as a
+    // real subprocess and inspect where a genuine `adelie_telemetry::init`
+    // call routes its output. That can't be observed in-process: the console
+    // layer writes straight to the OS-level stderr file descriptor, and
+    // `init` may only be claimed once per process (voice#158).
+    if std::env::args().skip(1).any(|a| a == "--telemetry-probe") {
+        tracing::info!("probe: info line");
+        tracing::debug!("probe: debug line");
+        tracing::event!(target: "ort", tracing::Level::INFO, "probe: ort info line");
+        {
+            let span = tracing::info_span!("probe_span");
+            let _entered = span.enter();
+            tracing::info!("probe: inside span");
+        }
+        adelie_telemetry::metrics::increment(
+            "probe.count",
+            &[adelie_telemetry::metrics::Label::new(
+                "source",
+                "telemetry-probe",
+            )],
+        );
         return Ok(());
     }
 
@@ -613,5 +645,45 @@ mod tests {
     #[test]
     fn rejects_missing_binary() {
         assert!(!binary_resolves("definitely-not-a-real-binary-xyzzy"));
+    }
+
+    // --- voice#158: telemetry adoption ------------------------------------
+
+    #[test]
+    fn telemetry_init_is_idempotent() {
+        // D5: a second `init` in one process is a no-op, not a panic.
+        let first = adelie_telemetry::init(adelie_telemetry::Config::new("adele-voice-test"))
+            .expect("the first install must succeed");
+        let second = adelie_telemetry::init(adelie_telemetry::Config::new("adele-voice-test"))
+            .expect("a second install must be a no-op, not a panic");
+        drop(first);
+        drop(second);
+    }
+
+    // `logs_go_to_stderr_not_stdout` and `ort_stays_at_warn_when_rust_log_is_unset`
+    // live in `tests/telemetry_probe.rs`: they run `adele-voice --telemetry-probe`
+    // as a subprocess, which needs `CARGO_BIN_EXE_adele-voice`. Cargo sets that
+    // env var reliably for integration tests; this crate has no `[lib]` target,
+    // so a unit test in this file (compiled as the bin's own `--test` harness)
+    // does not trigger the plain bin artifact to be built alongside it, and
+    // the variable is absent.
+
+    #[test]
+    fn default_build_pulls_no_opentelemetry() {
+        // AC2 (epic mcp-core#38): a default-feature build resolves no
+        // opentelemetry crate at all.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let output = std::process::Command::new(cargo)
+            .args(["tree", "--edges", "normal", "--manifest-path"])
+            .arg(format!("{manifest_dir}/Cargo.toml"))
+            .output()
+            .expect("cargo tree must run");
+        assert!(output.status.success(), "cargo tree failed: {output:?}");
+        let tree = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !tree.contains("opentelemetry"),
+            "a default-feature build must resolve no opentelemetry crate:\n{tree}"
+        );
     }
 }
