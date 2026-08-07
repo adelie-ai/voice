@@ -6690,6 +6690,13 @@ mod tests {
         static TEST_CAPTURE: RefCell<Option<TestCapture>> = const { RefCell::new(None) };
     }
 
+    /// A span this capture saw created: its name, every field it was given,
+    /// and its parent's name (the span that was "current" on this thread
+    /// when it was created — `None` for a span with no open parent, which is
+    /// the deliberate case for `wake_detection` and `vad_segment`; see
+    /// `turn_pipeline_emits_spans`).
+    type CapturedSpan = (&'static str, Vec<(String, String)>, Option<&'static str>);
+
     #[derive(Default)]
     struct TestCapture {
         /// One formatted line per event at or below this test's chosen level
@@ -6698,9 +6705,12 @@ mod tests {
         /// console.
         max_level: Option<tracing::Level>,
         log_lines: Vec<String>,
-        /// One entry per span created while this test's capture was active:
-        /// its name, and every field it was given.
-        spans: Vec<(&'static str, Vec<(String, String)>)>,
+        /// One entry per span created while this test's capture was active.
+        spans: Vec<CapturedSpan>,
+        /// Names of every span that closed (its last handle dropped) while
+        /// this test's capture was active — proof a span did not just open,
+        /// but also closed, which is what makes its duration measurable.
+        closed: Vec<&'static str>,
     }
 
     struct FieldRecorder<'a>(&'a mut Vec<(String, String)>);
@@ -6758,16 +6768,38 @@ mod tests {
         fn on_new_span(
             &self,
             attrs: &tracing::span::Attributes<'_>,
-            _id: &tracing::span::Id,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
+            id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
+            // The parent is whichever span was current on this thread when
+            // this one was created — exactly the relationship `.instrument()`
+            // and `#[tracing::instrument]` establish, and exactly what makes
+            // `stt_transcribe` / `tts_synthesize` children of `voice_turn`
+            // (voice#158, epic D12/D13).
+            let parent_name = ctx
+                .span(id)
+                .and_then(|span| span.parent().map(|parent| parent.name()));
             TEST_CAPTURE.with_borrow_mut(|slot| {
                 let Some(capture) = slot.as_mut() else {
                     return;
                 };
                 let mut fields = Vec::new();
                 attrs.record(&mut FieldRecorder(&mut fields));
-                capture.spans.push((attrs.metadata().name(), fields));
+                capture
+                    .spans
+                    .push((attrs.metadata().name(), fields, parent_name));
+            });
+        }
+
+        fn on_close(&self, id: tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let Some(name) = ctx.span(&id).map(|span| span.name()) else {
+                return;
+            };
+            TEST_CAPTURE.with_borrow_mut(|slot| {
+                let Some(capture) = slot.as_mut() else {
+                    return;
+                };
+                capture.closed.push(name);
             });
         }
     }
@@ -6879,7 +6911,7 @@ mod tests {
         })
         .await;
 
-        let names: Vec<&'static str> = capture.spans.iter().map(|(name, _)| *name).collect();
+        let names: Vec<&'static str> = capture.spans.iter().map(|(name, ..)| *name).collect();
         for expected in [
             "wake_detection",
             "vad_segment",
@@ -6889,6 +6921,53 @@ mod tests {
             assert!(
                 names.contains(&expected),
                 "expected a {expected:?} span; got {names:?}"
+            );
+        }
+
+        // D12/D13: the turn is rooted by a voice_turn span, not just the four
+        // pipeline-stage spans. Assert what that root actually needs to be
+        // true, not only that its name appears somewhere:
+        assert!(
+            names.contains(&"voice_turn"),
+            "expected a voice_turn root span; got {names:?}"
+        );
+        assert!(
+            capture.closed.contains(&"voice_turn"),
+            "voice_turn must close (not just open) once the turn ends: closed = {:?}",
+            capture.closed
+        );
+        // stt_transcribe and tts_synthesize run inside
+        // handle_utterance_complete(...).instrument(turn_span), so voice_turn
+        // must be their parent — that is what makes them children of the
+        // root rather than peers of it (voice#158 step 5 / epic D12).
+        for child in ["stt_transcribe", "tts_synthesize"] {
+            let parent = capture
+                .spans
+                .iter()
+                .find(|(name, ..)| *name == child)
+                .and_then(|(_, _, parent)| *parent);
+            assert_eq!(
+                parent,
+                Some("voice_turn"),
+                "{child} must be a child of voice_turn; got parent {parent:?}"
+            );
+        }
+        // wake_detection and vad_segment are deliberately NOT children of
+        // voice_turn: wake_detection precedes the root span entirely (it
+        // runs before the person has said anything this turn), and
+        // vad_segment is already closed by the time voice_turn opens at
+        // Endpoint::Complete, so it cannot be a child of a span that does
+        // not exist yet.
+        for sibling in ["wake_detection", "vad_segment"] {
+            let parent = capture
+                .spans
+                .iter()
+                .find(|(name, ..)| *name == sibling)
+                .and_then(|(_, _, parent)| *parent);
+            assert_ne!(
+                parent,
+                Some("voice_turn"),
+                "{sibling} is documented as preceding voice_turn, not nesting inside it"
             );
         }
     }
@@ -6916,7 +6995,7 @@ mod tests {
         })
         .await;
 
-        for (name, fields) in &capture.spans {
+        for (name, fields, _parent) in &capture.spans {
             for (field, value) in fields {
                 assert!(
                     !value.contains(TRANSCRIPT) && !value.contains("hello"),
