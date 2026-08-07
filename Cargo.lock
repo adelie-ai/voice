@@ -179,7 +179,7 @@ dependencies = [
 [[package]]
 name = "adelie-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/adelie-telemetry?rev=59c152db11f22281ea2ae8f1c67e00389dbf74f8#59c152db11f22281ea2ae8f1c67e00389dbf74f8"
+source = "git+https://github.com/adelie-ai/adelie-telemetry?rev=1b8166ab483174e76aa23079858b8a31aaa52ae1#1b8166ab483174e76aa23079858b8a31aaa52ae1"
 dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -810,7 +810,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2362,15 +2362,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "itertools"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
-dependencies = [
- "either",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3317,7 +3308,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -3623,9 +3614,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reqwest"
-version = "0.13.1"
+version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04e9018c9d814e5f30cc16a0f03271aeab3571e609612d9fe78c1aa8d11c2f62"
+checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
  "base64",
  "bytes",
@@ -3661,7 +3652,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -4219,7 +4209,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -4501,6 +4491,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls-native-certs",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -4509,7 +4500,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
- "webpki-roots 1.0.9",
 ]
 
 [[package]]

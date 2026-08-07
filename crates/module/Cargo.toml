@@ -22,7 +22,7 @@ adele-voice-tts-kokoro.workspace = true
 # feature passthrough needed: the facade records into the shared registry
 # with or without export, and whether export is compiled in is the daemon's
 # call (its `otel` feature unifies this crate's copy too).
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "59c152db11f22281ea2ae8f1c67e00389dbf74f8" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
 dirs.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["sync"] }
