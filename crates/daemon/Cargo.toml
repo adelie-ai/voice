@@ -20,6 +20,10 @@ adele-voice-tts-kokoro.workspace = true
 adele-voice-assistant-connector.workspace = true
 adele-voice-dbus-interface.workspace = true
 adele-voice-module.workspace = true
+# Shared telemetry setup (traces, metrics, logs) for every Adelie Rust binary
+# (adelie-ai/mcp-core#38): subscriber construction, the OTLP pipelines, the
+# metrics facade, and the shutdown guard. Pinned by revision.
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "59c152db11f22281ea2ae8f1c67e00389dbf74f8" }
 anyhow.workspace = true
 dirs.workspace = true
 futures-util = "0.3"
@@ -32,6 +36,14 @@ toml_edit.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 zbus.workspace = true
+
+[features]
+# Off by default. Turns on adelie-telemetry's three OTLP export pipelines
+# (traces, metrics, logs), added beside the console logger rather than in
+# place of it, so an exporting build still prints locally. A default build
+# resolves no opentelemetry crate at all (see the `default_build_pulls_no_opentelemetry`
+# test in `main.rs`).
+otel = ["adelie-telemetry/otel"]
 
 [dev-dependencies]
 # `test-util` enables the paused-time test clock (#58) so the heartbeat / stall
