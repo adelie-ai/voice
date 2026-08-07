@@ -23,7 +23,7 @@ adele-voice-module.workspace = true
 # Shared telemetry setup (traces, metrics, logs) for every Adelie Rust binary
 # (adelie-ai/mcp-core#38): subscriber construction, the OTLP pipelines, the
 # metrics facade, and the shutdown guard. Pinned by revision.
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "5c762eca14e43295dd27c5d5adaa658924f5f133" }
 anyhow.workspace = true
 dirs.workspace = true
 futures-util = "0.3"
