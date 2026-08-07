@@ -2628,6 +2628,7 @@ mod tests {
     //! still captures and transcribes an utterance while "Hey Adele" is off.
     use super::*;
     use adele_voice_core::domain::Transcript;
+    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
@@ -6562,5 +6563,263 @@ mod tests {
         .expect("ok");
         driver.await.unwrap();
         assert_eq!(end, StreamEnd::Stopped(StopRequest::Conversation));
+    }
+
+    // --- voice#158: telemetry adoption ------------------------------------
+    //
+    // `cargo test` runs every test for this crate in one process, and most of
+    // the ~130 tests above run the pipeline with no subscriber installed at
+    // all. `tracing` caches a per-callsite "is anyone interested" verdict
+    // process-wide the first time a callsite fires (that is the whole point
+    // of the cache: a hot log line costs nothing when nobody is listening),
+    // so by the time a voice#158 test runs, every callsite the pipeline
+    // touches is very likely already cached as "never". Installing a *new*
+    // subscriber per test via `tracing::subscriber::set_default` does not
+    // reliably invalidate that cache for callsites it did not itself
+    // register interest for.
+    //
+    // The fix used here — and the one `tracing-test` and similar crates use
+    // for the same reason — is to install exactly one, maximally permissive
+    // subscriber for the whole test binary (so every callsite's cached
+    // interest is decided once, by a subscriber that is always listening,
+    // and stays that way for the rest of the process), then route each
+    // event and span to the right test through a thread-local. `#[tokio::test]`
+    // defaults to the current-thread runtime, so a test and everything it
+    // `tokio::spawn`s share one OS thread, which is exactly what the
+    // thread-local needs.
+
+    thread_local! {
+        static TEST_CAPTURE: RefCell<Option<TestCapture>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Default)]
+    struct TestCapture {
+        /// One formatted line per event at or below this test's chosen level
+        /// (lower `tracing::Level` values are more severe — `INFO < DEBUG`),
+        /// approximating what `RUST_LOG=<level>` would let through to the
+        /// console.
+        max_level: Option<tracing::Level>,
+        log_lines: Vec<String>,
+        /// One entry per span created while this test's capture was active:
+        /// its name, and every field it was given.
+        spans: Vec<(&'static str, Vec<(String, String)>)>,
+    }
+
+    struct FieldRecorder<'a>(&'a mut Vec<(String, String)>);
+    impl tracing::field::Visit for FieldRecorder<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// The one subscriber layer installed for the whole test binary. Always
+    /// interested (no `enabled`/`register_callsite` override), so callsite
+    /// interest caches as "always" rather than "never" the first time each
+    /// one fires — the thread-local check in each callback is where this
+    /// crate's tests actually decide whether to capture.
+    struct RoutingLayer;
+
+    impl<S> tracing_subscriber::layer::Layer<S> for RoutingLayer
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            TEST_CAPTURE.with_borrow_mut(|slot| {
+                let Some(capture) = slot.as_mut() else {
+                    return;
+                };
+                let Some(max_level) = capture.max_level else {
+                    return;
+                };
+                if *event.metadata().level() > max_level {
+                    return; // more verbose than this test's filter
+                }
+                let mut fields = Vec::new();
+                event.record(&mut FieldRecorder(&mut fields));
+                let rendered = fields
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                capture.log_lines.push(format!(
+                    "{} {} {rendered}",
+                    event.metadata().level(),
+                    event.metadata().name()
+                ));
+            });
+        }
+
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            TEST_CAPTURE.with_borrow_mut(|slot| {
+                let Some(capture) = slot.as_mut() else {
+                    return;
+                };
+                let mut fields = Vec::new();
+                attrs.record(&mut FieldRecorder(&mut fields));
+                capture.spans.push((attrs.metadata().name(), fields));
+            });
+        }
+    }
+
+    /// Install the one global subscriber for this test binary, the first
+    /// time any voice#158 test calls this. Every later call is a cheap
+    /// `OnceLock` check, and does not reinstall anything (a second
+    /// `set_global_default` would error).
+    fn ensure_global_capture_subscriber() {
+        static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        INIT.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            let subscriber = tracing_subscriber::registry().with(RoutingLayer);
+            // Ignore the error: another test (or, in the full test run, the
+            // adelie-telemetry consumer tests) may have already installed a
+            // global subscriber first, in which case `RUST_LOG`-gated tests
+            // running under it also work, since that subscriber's own filter
+            // is `info` or more permissive by default.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+    }
+
+    /// Run `body` (a full pipeline turn) with this thread's events and spans
+    /// captured, and return what was captured. `max_level` is the deepest
+    /// level to keep in `log_lines`, approximating `RUST_LOG=<level>`;
+    /// spans are captured regardless of level, matching how a span itself
+    /// has no level-gated content, only its fields.
+    async fn capture_tracing<F, Fut>(max_level: tracing::Level, body: F) -> TestCapture
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        ensure_global_capture_subscriber();
+        TEST_CAPTURE.set(Some(TestCapture {
+            max_level: Some(max_level),
+            ..Default::default()
+        }));
+        body().await;
+        TEST_CAPTURE.with_borrow_mut(|slot| slot.take()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_transcript_or_reply_at_info() {
+        // Regression guard for #143: a full voice turn at RUST_LOG=info must
+        // emit neither the transcribed utterance nor the spoken reply.
+        // FakeAssistant's canned completion is the literal text "hello" (see
+        // `record_and_complete`); the transcript below is deliberately
+        // distinctive so a leak can't hide behind an everyday word.
+        const TRANSCRIPT: &str = "xyzzy the launch codes are wobble";
+
+        let capture = capture_tracing(tracing::Level::INFO, || async {
+            let h = spawn_pipeline(Cfg {
+                wake_detects: true,
+                stt_text: TRANSCRIPT.to_string(),
+                ..Default::default()
+            });
+            send_chunk(&h).await; // wakes (wake_detects=true), arms the endpointer
+            // `state_rx` starts at Idle, so a wait for Idle right away would
+            // resolve instantly against that starting value instead of
+            // against the turn actually finishing. Confirm the turn has left
+            // Idle first, so the later wait is for a real transition back.
+            wait_state(&h, State::Listening, "wake triggers Listening").await;
+            send_chunk(&h).await; // speech (vad 0.9)
+            send_chunk(&h).await; // silence (vad 0.0) -> Processing -> transcribe -> reply
+            wait_state(&h, State::Idle, "turn completes").await;
+            h.handle.abort();
+        })
+        .await;
+
+        let log = capture.log_lines.join("\n");
+        assert!(
+            !log.contains(TRANSCRIPT),
+            "the transcript must not reach an INFO line: {log}"
+        );
+        assert!(
+            !log.contains("hello"),
+            "the spoken reply must not reach an INFO line: {log}"
+        );
+        // Sanity: prove the gate moved the content, not the whole event.
+        assert!(
+            log.contains("transcribed"),
+            "the transcribed event must still fire (without its text): {log}"
+        );
+        assert!(
+            log.contains("speaking"),
+            "the speaking event must still fire (without its text): {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_pipeline_emits_spans() {
+        // Each of the four pipeline-stage boundaries (voice#158 step 5) must
+        // produce a span for a full turn: wake detection, the VAD segment,
+        // STT transcribe, and TTS synthesize.
+        let capture = capture_tracing(tracing::Level::TRACE, || async {
+            let h = spawn_pipeline(Cfg {
+                wake_detects: true,
+                ..Default::default()
+            });
+            send_chunk(&h).await; // wakes
+            // See the matching comment in `no_transcript_or_reply_at_info`:
+            // `state_rx` starts at Idle, so confirm the turn has left it
+            // before waiting for it to return.
+            wait_state(&h, State::Listening, "wake triggers Listening").await;
+            send_chunk(&h).await; // speech
+            send_chunk(&h).await; // silence -> Processing -> transcribe -> reply
+            wait_state(&h, State::Idle, "turn completes").await;
+            h.handle.abort();
+        })
+        .await;
+
+        let names: Vec<&'static str> = capture.spans.iter().map(|(name, _)| *name).collect();
+        for expected in [
+            "wake_detection",
+            "vad_segment",
+            "stt_transcribe",
+            "tts_synthesize",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "expected a {expected:?} span; got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spans_do_not_record_transcript_text() {
+        // No span field anywhere in the turn may carry the transcript (or the
+        // reply — FakeAssistant always completes with "hello").
+        const TRANSCRIPT: &str = "xyzzy the launch codes are wobble";
+        let capture = capture_tracing(tracing::Level::TRACE, || async {
+            let h = spawn_pipeline(Cfg {
+                wake_detects: true,
+                stt_text: TRANSCRIPT.to_string(),
+                ..Default::default()
+            });
+            send_chunk(&h).await; // wakes
+            // See the matching comment in `no_transcript_or_reply_at_info`:
+            // `state_rx` starts at Idle, so confirm the turn has left it
+            // before waiting for it to return.
+            wait_state(&h, State::Listening, "wake triggers Listening").await;
+            send_chunk(&h).await; // speech
+            send_chunk(&h).await; // silence -> Processing -> transcribe -> reply
+            wait_state(&h, State::Idle, "turn completes").await;
+            h.handle.abort();
+        })
+        .await;
+
+        for (name, fields) in &capture.spans {
+            for (field, value) in fields {
+                assert!(
+                    !value.contains(TRANSCRIPT) && !value.contains("hello"),
+                    "span {name:?} field {field:?} carried content: {value:?}"
+                );
+            }
+        }
     }
 }
