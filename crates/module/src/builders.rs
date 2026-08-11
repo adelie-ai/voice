@@ -7,15 +7,26 @@
 //! because it shares one sink between spoken replies and on-demand SayText.
 
 use std::sync::Arc;
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
 use std::time::Duration;
 
-use adele_voice_audio_cpal::{CpalAudioSink, CpalAudioSource};
+use adele_voice_audio_cpal::CpalAudioSink;
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
+use adele_voice_audio_cpal::CpalAudioSource;
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
 use adele_voice_core::VoiceError;
-use adele_voice_core::ports::audio::{AudioSink, AudioSource};
+use adele_voice_core::ports::audio::AudioSink;
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
+use adele_voice_core::ports::audio::AudioSource;
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
 use adele_voice_stt_whisper::WhisperStt;
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
 use adele_voice_vad_silero::SileroVad;
 
-use crate::config::{AudioConfig, SttConfig, TtsConfig, VadConfig};
+use crate::config::{AudioConfig, TtsConfig};
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
+use crate::config::{SttConfig, VadConfig};
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
 use crate::dictation::{Dictation, DictationOptions};
 use crate::speaker::Speaker;
 use crate::tts_backend::TtsBackend;
@@ -35,6 +46,13 @@ use crate::tts_backend::TtsBackend;
 /// Both must play through the same output device for the guard to be accurate;
 /// sharing one [`Speaker`]'s [`sink`](crate::speaker::Speaker::sink) guarantees
 /// that. Without the chained guard, dictation is playback-unaware as before.
+///
+/// Needs the `vad-silero` and `stt-whisper` features, which name the concrete
+/// adapters in the returned type. A consumer that selects neither has no
+/// dictation to build; it can still wire [`Dictation`] by hand from its own
+/// [`VoiceActivityDetector`](adele_voice_core::ports::vad::VoiceActivityDetector)
+/// and [`SpeechToText`](adele_voice_core::ports::stt::SpeechToText).
+#[cfg(all(feature = "vad-silero", feature = "stt-whisper"))]
 pub fn build_dictation(
     audio: &AudioConfig,
     vad: &VadConfig,

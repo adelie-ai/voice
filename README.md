@@ -96,6 +96,20 @@ speaker.say(&reply).await?;
 
 `build_dictation` / `build_speaker` take the same `[audio]` / `[vad]` / `[stt]` / `[tts]` config the daemon uses (re-exported as `adele_voice_module::config`), so a client gets the local-first backend selection (Kokoro → Piper fallback, **never** auto cloud) for free. The lower-level `Dictation` / `Speaker` / `Endpointer` / `Transcriber` / `TtsBackend` types are public too, for clients that manage their own audio devices. A client typically exposes this behind a config toggle (embedded vs. the daemon path), so a machine with no daemon still gets dictation and playback.
 
+**Choosing backends at build time.** Which adapter crates the module compiles in is a Cargo feature choice. The `default` set is every backend, so a client that says nothing gets all of them:
+
+```toml
+# All backends (the default).
+adele-voice-module = { path = "../voice/crates/module" }
+
+# Speech input and cloud TTS, with no ONNX Runtime in the graph.
+adele-voice-module = { path = "../voice/crates/module", default-features = false, features = ["stt-whisper", "tts-polly"] }
+```
+
+The features are `vad-silero`, `stt-whisper`, `tts-polly`, and `tts-kokoro`. The reason to opt out is `ort` (ONNX Runtime), which `vad-silero` and `tts-kokoro` bring in and which has no prebuilt binary for every target — notably `x86_64-apple-darwin`, where an unwanted `ort` fails the whole build. Piper is not a feature: it is always compiled in, because it is the local backend the TTS selection falls back to.
+
+Opting out narrows the API rather than changing it. `build_dictation` needs `vad-silero` and `stt-whisper`, since it names both adapters in its return type; without them a client wires `Dictation` from its own implementations of the `core` ports. `build_speaker` is always available. Asking for a backend the build does not contain is reported at error level, naming the backend, the feature that would add it, and what is available — then it falls back to Piper. Run `just matrix` to check the combinations.
+
 **Dependency approach.** Clients **path-dep** the voice crates for now (mirroring the existing adele-gtk ↔ desktop-assistant path-dep); a published or git dependency can follow once the API settles.
 
 ### Reaching the orchestrator
