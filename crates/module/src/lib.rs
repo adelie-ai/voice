@@ -25,11 +25,12 @@
 //! prebuilt binary for every target the clients run on.
 //!
 //! Opting out narrows the API rather than changing it. Each feature also
-//! re-exports the adapter it compiles in — [`SileroVad`] with `vad-silero`,
-//! [`WhisperStt`] with `stt-whisper` — so a consumer can wire [`Dictation`]
+//! re-exports the adapter it compiles in — `SileroVad` with `vad-silero`,
+//! `WhisperStt` with `stt-whisper` — so a consumer can wire [`Dictation`]
 //! from one selected adapter and one of its own. That is the case a macOS
 //! consumer needs: a platform VAD paired with Whisper, with no ONNX Runtime in
-//! the graph.
+//! the graph. Wiring it by hand also needs the port traits and `VoiceError`
+//! from `adele-voice-core`, which carries no ONNX Runtime dependency.
 //!
 //! `build_dictation` is the convenience for the case where both are selected,
 //! and needs both features because it names both adapters in its return type.

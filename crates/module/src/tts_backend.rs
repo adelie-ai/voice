@@ -127,10 +127,14 @@ impl TtsBackend {
 /// config says `kokoro`, the voice is Piper's, and no other line connects them.
 ///
 /// A build with every backend selected has no caller for this, which is the
-/// point: there is then no configured backend it can fail to contain. It is
-/// `allow(dead_code)` rather than `cfg`-gated on the absence of some backend,
-/// because that condition is a hand-written list of every optional backend, and
-/// the next one added would compile its caller but not this function.
+/// point: there is then no configured backend it can fail to contain. Hence
+/// `allow(dead_code)` rather than a `cfg` naming every optional backend, which
+/// would stop compiling the function while still compiling its callers the
+/// next time a backend is added.
+///
+/// The `allow` costs the accidental signal that deleting a call site used to
+/// give, so the report has a test of its own instead - see
+/// `an_absent_backend_is_reported_at_error_level_with_backend_feature_and_available`.
 #[allow(dead_code)]
 fn report_not_compiled_in(backend: &str, feature: &str) {
     tracing::error!(
@@ -235,13 +239,20 @@ mod tests {
     /// A name on the listing must be one `from_config` recognizes. It cannot
     /// assert which backend comes back: a compiled-in backend still falls back
     /// to Piper when its models are absent, which is a provisioning state, not
-    /// a build one. What it can assert is that no listed name takes the
+    /// a build one. What it can assert is that no listed local name takes the
     /// unknown-backend path, which is the way a listing and the selection drift
     /// apart in practice.
     #[test]
-    fn no_listed_backend_is_treated_as_unknown() {
+    fn no_listed_local_backend_is_treated_as_unknown() {
         let unknown_warning = "unknown tts.backend";
         for backend in COMPILED_IN_TTS_BACKENDS {
+            // Polly is excluded, not overlooked. Selecting it constructs a real
+            // AWS client, which walks the credential chain and reaches IMDS on
+            // a machine with no AWS config - a live network call in a unit test.
+            // Its entry on the listing is covered by the two `polly_is_*` tests.
+            if *backend == "polly" {
+                continue;
+            }
             let cfg = TtsConfig {
                 backend: (*backend).into(),
                 ..TtsConfig::default()
@@ -287,12 +298,27 @@ mod tests {
 
     /// Captures tracing events so a test can assert on the report an operator
     /// reads, rather than only on the backend the call returns.
+    ///
+    /// One global subscriber for the whole test binary, with a per-thread slot
+    /// that decides whether the current test is recording. A subscriber
+    /// installed and dropped per test instead (`with_default`) is flaky under
+    /// the default multi-threaded test runner: `tracing` caches each callsite's
+    /// interest process-wide and rebuilds it whenever the subscriber set
+    /// changes, so a concurrent test swapping its own subscriber in and out can
+    /// make this one's event vanish. Installing once means the cache is built
+    /// once and never invalidated.
     mod capture {
-        use std::sync::{Arc, Mutex};
+        use std::cell::RefCell;
+        use std::sync::{Mutex, OnceLock, PoisonError};
 
-        pub type Events = Arc<Mutex<Vec<(tracing::Level, Vec<(String, String)>)>>>;
+        pub type Captured = Vec<(tracing::Level, Vec<(String, String)>)>;
 
-        pub struct Layer(pub Events);
+        thread_local! {
+            /// `Some` while this thread is inside `while_capturing`.
+            static SLOT: RefCell<Option<Captured>> = const { RefCell::new(None) };
+        }
+
+        struct Layer;
 
         struct Recorder<'a>(&'a mut Vec<(String, String)>);
 
@@ -316,26 +342,41 @@ mod tests {
                 event: &tracing::Event<'_>,
                 _ctx: tracing_subscriber::layer::Context<'_, S>,
             ) {
-                let mut fields = Vec::new();
-                event.record(&mut Recorder(&mut fields));
-                self.0
-                    .lock()
-                    .expect("capture mutex")
-                    .push((*event.metadata().level(), fields));
+                SLOT.with_borrow_mut(|slot| {
+                    let Some(events) = slot.as_mut() else {
+                        return; // this thread is not recording
+                    };
+                    let mut fields = Vec::new();
+                    event.record(&mut Recorder(&mut fields));
+                    events.push((*event.metadata().level(), fields));
+                });
             }
         }
 
-        /// Run `body` with the capture installed for this thread, and return
-        /// what it logged.
-        pub fn while_capturing(
-            body: impl FnOnce(),
-        ) -> Vec<(tracing::Level, Vec<(String, String)>)> {
-            use tracing_subscriber::layer::SubscriberExt as _;
-            let events: Events = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = tracing_subscriber::registry().with(Layer(events.clone()));
-            tracing::subscriber::with_default(subscriber, body);
-            let captured = events.lock().expect("capture mutex");
-            captured.clone()
+        /// Run `body` with this thread recording, and return what it logged.
+        ///
+        /// Serialized process-wide, and the interest cache is rebuilt on the
+        /// way in. Two guards for two races that both showed up as the event
+        /// simply going missing under the parallel test runner: another test
+        /// emitting while this thread's slot is open, and a callsite first
+        /// reached before any subscriber existed, which caches "nobody is
+        /// interested" and keeps suppressing the event afterwards.
+        pub fn while_capturing(body: impl FnOnce()) -> Captured {
+            static INSTALLED: OnceLock<()> = OnceLock::new();
+            static SERIALIZE: Mutex<()> = Mutex::new(());
+
+            let _guard = SERIALIZE.lock().unwrap_or_else(PoisonError::into_inner);
+
+            INSTALLED.get_or_init(|| {
+                use tracing_subscriber::layer::SubscriberExt as _;
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Layer))
+                    .expect("no other global subscriber in this test binary");
+            });
+            tracing::callsite::rebuild_interest_cache();
+
+            SLOT.with_borrow_mut(|slot| *slot = Some(Vec::new()));
+            body();
+            SLOT.with_borrow_mut(|slot| slot.take().unwrap_or_default())
         }
     }
 
