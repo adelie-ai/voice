@@ -7,14 +7,37 @@ license = "AGPL-3.0-or-later"
 # The embeddable voice module: on-demand dictation + speech playback, with no
 # wake word, no D-Bus, and no orchestrator/assistant coupling. Depends only on
 # the domain (`core`) and the adapter crates it wires for the concrete builders.
+
+# Which adapter crates are compiled in. `default` is every backend, so a
+# consumer that says nothing gets exactly what it got before these features
+# existed; only a consumer that opts out sees a change.
+#
+# The reason to opt out is `ort` (ONNX Runtime), which `vad-silero` and
+# `tts-kokoro` pull in. `ort` publishes no prebuilt binary for
+# x86_64-apple-darwin, so while those two were unconditional the whole crate
+# failed to build there, and with it every consumer - `cargo test` on an Intel
+# Mac was unavailable for work nowhere near voice.
+#
+# Piper is not optional. It is the local backend the TTS selection falls back
+# to, so making it optional would let a build exist with no fallback left and
+# force `from_config` to become fallible for every consumer. It costs almost
+# nothing to keep: it shells out to the `piper` binary and pulls no native
+# dependency of its own.
+[features]
+default = ["vad-silero", "stt-whisper", "tts-polly", "tts-kokoro"]
+vad-silero = ["dep:adele-voice-vad-silero"]
+stt-whisper = ["dep:adele-voice-stt-whisper"]
+tts-polly = ["dep:adele-voice-tts-polly"]
+tts-kokoro = ["dep:adele-voice-tts-kokoro"]
+
 [dependencies]
 adele-voice-core.workspace = true
 adele-voice-audio-cpal.workspace = true
-adele-voice-vad-silero.workspace = true
-adele-voice-stt-whisper.workspace = true
 adele-voice-tts-piper.workspace = true
-adele-voice-tts-polly.workspace = true
-adele-voice-tts-kokoro.workspace = true
+adele-voice-vad-silero = { workspace = true, optional = true }
+adele-voice-stt-whisper = { workspace = true, optional = true }
+adele-voice-tts-polly = { workspace = true, optional = true }
+adele-voice-tts-kokoro = { workspace = true, optional = true }
 # The metrics facade (adelie-ai/mcp-core#38): duration histograms for STT
 # transcribe / TTS synthesize and the energy-gate drop counter. `Transcriber`
 # and `Speaker` are the single chokepoints each backend flows through, so the
@@ -31,6 +54,11 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
 toml.workspace = true
+# Captures the tracing events a test asserts on. The report for a backend that
+# is not compiled in is the only thing that tells an operator why the configured
+# backend is not the one speaking, so its level and its fields are behaviour,
+# not decoration, and a test has to be able to read them back.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

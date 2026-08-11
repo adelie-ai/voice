@@ -33,8 +33,15 @@ build-otel:
 test-otel:
     cargo test -p adele-voice --features otel
 
+# --- module backend features (voice#132) ---
+# The module selects its adapter crates with features, so it has arrangements
+# the default build never compiles. The script also asserts that a consumer
+# which selects no ONNX-Runtime backend gets no `ort` in its graph.
+matrix:
+    ./scripts/feature-matrix.sh
+
 # Both configurations. This is what the pre-push hook runs.
-check-all: check check-otel
+check-all: check check-otel matrix
 
 premerge:
     git fetch origin
