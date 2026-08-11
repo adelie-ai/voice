@@ -54,6 +54,11 @@ tracing.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "sync", "test-util", "time"] }
 toml.workspace = true
+# Captures the tracing events a test asserts on. The report for a backend that
+# is not compiled in is the only thing that tells an operator why the configured
+# backend is not the one speaking, so its level and its fields are behaviour,
+# not decoration, and a test has to be able to read them back.
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -1,4 +1,4 @@
-//! Concrete wiring for embedding clients: build a [`Dictation`] or [`Speaker`]
+//! Concrete wiring for embedding clients: build a `Dictation` or [`Speaker`]
 //! from [`config`](crate::config) using the local adapter crates (cpal mic +
 //! Silero VAD + Whisper STT; the configured TTS backend → cpal sink).
 //!
@@ -69,8 +69,13 @@ pub fn build_dictation(
     Ok(Dictation::new(source, vad_adapter, stt_adapter, opts))
 }
 
-/// Wire a [`Speaker`] from config: the configured TTS backend (with the
-/// local-first Kokoro→Piper fallback) playing to the cpal output device.
+/// Wire a [`Speaker`] from config: the configured TTS backend playing to the
+/// cpal output device.
+///
+/// Backend selection is local-first. A configured backend that cannot start,
+/// or that this build does not contain, falls back to Piper, never to the
+/// billable cloud backend. Which backends the build contains is
+/// [`COMPILED_IN_TTS_BACKENDS`](crate::COMPILED_IN_TTS_BACKENDS).
 pub async fn build_speaker(tts: &TtsConfig, audio: &AudioConfig) -> Speaker<TtsBackend> {
     let backend = TtsBackend::from_config(tts).await;
     let sink: Arc<dyn AudioSink> = Arc::new(CpalAudioSink::new(&audio.output_device));

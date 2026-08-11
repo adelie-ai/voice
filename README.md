@@ -102,13 +102,17 @@ speaker.say(&reply).await?;
 # All backends (the default).
 adele-voice-module = { path = "../voice/crates/module" }
 
-# Speech input and cloud TTS, with no ONNX Runtime in the graph.
+# Whisper STT and cloud TTS, with no ONNX Runtime in the graph.
 adele-voice-module = { path = "../voice/crates/module", default-features = false, features = ["stt-whisper", "tts-polly"] }
 ```
 
 The features are `vad-silero`, `stt-whisper`, `tts-polly`, and `tts-kokoro`. The reason to opt out is `ort` (ONNX Runtime), which `vad-silero` and `tts-kokoro` bring in and which has no prebuilt binary for every target — notably `x86_64-apple-darwin`, where an unwanted `ort` fails the whole build. Piper is not a feature: it is always compiled in, because it is the local backend the TTS selection falls back to.
 
-Opting out narrows the API rather than changing it. `build_dictation` needs `vad-silero` and `stt-whisper`, since it names both adapters in its return type; without them a client wires `Dictation` from its own implementations of the `core` ports. `build_speaker` is always available. Asking for a backend the build does not contain is reported at error level, naming the backend, the feature that would add it, and what is available — then it falls back to Piper. Run `just matrix` to check the combinations.
+Opting out narrows the API rather than changing it. Each feature re-exports the adapter it compiles in (`SileroVad` with `vad-silero`, `WhisperStt` with `stt-whisper`), so name the type from the module rather than path-depping the adapter crate — a direct path-dep puts that crate's dependencies back in your graph and undoes the opt-out.
+
+`build_dictation` is a convenience for the case where both `vad-silero` and `stt-whisper` are selected, and exists only then, since it names both adapters in its return type. **The second example above therefore has no `build_dictation`**: a client selecting `stt-whisper` alone pairs it with a VAD of its own and constructs `Dictation::new` directly, which is the intended shape on macOS until [#133](https://github.com/adelie-ai/voice/issues/133) lands a native VAD. `build_speaker` is always available.
+
+Asking for a TTS backend the build does not contain is reported at error level, naming the backend, the feature that would add it, and what is available (`COMPILED_IN_TTS_BACKENDS`) — then it falls back to Piper. Run `just matrix` to lint and run every combination.
 
 **Dependency approach.** Clients **path-dep** the voice crates for now (mirroring the existing adele-gtk ↔ desktop-assistant path-dep); a published or git dependency can follow once the API settles.
 
