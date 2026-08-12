@@ -6,3 +6,4 @@
 
 # Gate and build output, never committed.
 *.log
+*.status
